@@ -188,6 +188,36 @@ struct Extractor {
     uses: Vec<RawUse>,
     /// Candidate enum state transitions, resolved to edges in [`Extractor::finish`].
     transitions: Vec<RawTransition>,
+    /// Candidate `impl Trait for Type` realizations, resolved in [`Extractor::finish`].
+    impls: Vec<RawImplements>,
+    /// Candidate type associations from a field type, resolved in [`Extractor::finish`].
+    associates: Vec<RawAssociates>,
+}
+
+/// One candidate realization: an `impl Trait for Type` block. Both the type and trait names are
+/// resolved to local nodes in [`Extractor::finish`]; if either is external the candidate is dropped.
+struct RawImplements {
+    /// The `Self` type name/path exactly as written (bare or `crate::`/`self::`/`super::`).
+    type_path: String,
+    /// The implemented trait name/path exactly as written.
+    trait_path: String,
+    /// The module the impl block lives in, used to resolve bare names.
+    module: String,
+    /// Where the impl block is written.
+    span: SourceSpan,
+}
+
+/// One candidate association: a field's owning type and the inner type it references. The inner
+/// name is resolved to a local node in [`Extractor::finish`]; external/primitive/generic drop.
+struct RawAssociates {
+    /// The owning type node's id (already absolute).
+    owner_id: String,
+    /// The inner type name/path exactly as written, after unwrapping wrappers and references.
+    inner_path: String,
+    /// The owning type's module, used to resolve bare names.
+    module: String,
+    /// Where the field is written.
+    span: SourceSpan,
 }
 
 /// One candidate state transition: two variant *names* of the same enum, resolved to actual
@@ -235,6 +265,8 @@ impl Extractor {
             seen_files: BTreeSet::new(),
             uses: Vec::new(),
             transitions: Vec::new(),
+            impls: Vec::new(),
+            associates: Vec::new(),
         }
     }
 
@@ -323,6 +355,73 @@ impl Extractor {
                 ordinal: None,
             });
         }
+
+        // Type view (SPEC 3.2). Both endpoints must resolve to nodes this extractor emitted, so
+        // external traits/types (`Display`, `String`) and generic params emit nothing.
+        let type_ids: BTreeSet<String> = self
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::Struct | NodeKind::Enum))
+            .map(|n| n.id.as_str().to_string())
+            .collect();
+        let trait_ids: BTreeSet<String> = self
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Trait)
+            .map(|n| n.id.as_str().to_string())
+            .collect();
+
+        // Implements: from the local type node to the local trait node. Deduped by (from, to).
+        let mut implements: BTreeMap<(String, String), SourceSpan> = BTreeMap::new();
+        for i in &self.impls {
+            let Some(from) =
+                resolve_local(&i.type_path, &i.module).filter(|id| type_ids.contains(id))
+            else {
+                continue;
+            };
+            let Some(to) =
+                resolve_local(&i.trait_path, &i.module).filter(|id| trait_ids.contains(id))
+            else {
+                continue;
+            };
+            implements
+                .entry((from, to))
+                .or_insert_with(|| i.span.clone());
+        }
+        for ((from, to), span) in implements {
+            self.graph.edges.push(Edge {
+                from: StableId::new(from),
+                to: StableId::new(to),
+                kind: EdgeKind::Implements,
+                span,
+                ordinal: None,
+            });
+        }
+
+        // Associates: from the owning type node to the field's inner local type/trait node.
+        let mut associates: BTreeMap<(String, String), SourceSpan> = BTreeMap::new();
+        for a in &self.associates {
+            let Some(to) = resolve_local(&a.inner_path, &a.module)
+                .filter(|id| type_ids.contains(id) || trait_ids.contains(id))
+            else {
+                continue;
+            };
+            associates
+                .entry((a.owner_id.clone(), to))
+                .or_insert_with(|| a.span.clone());
+        }
+        for ((from, to), span) in associates {
+            self.graph.edges.push(Edge {
+                from: StableId::new(from),
+                to: StableId::new(to),
+                kind: EdgeKind::Associates,
+                span,
+                ordinal: None,
+            });
+        }
+
         self.graph.normalize();
         Ok(self.graph)
     }
@@ -432,7 +531,8 @@ impl Extractor {
                 if let Some(name) = child_name(node, src) {
                     let id = format!("{mod_path}::{name}");
                     let fp = struct_fingerprint(node, src, doc);
-                    self.push(id, NodeKind::Struct, span_of(node, file), Some(fp));
+                    self.push(id.clone(), NodeKind::Struct, span_of(node, file), Some(fp));
+                    self.collect_struct_associates(node, &id, mod_path, file, src);
                 }
             }
             "enum_item" => {
@@ -441,6 +541,7 @@ impl Extractor {
                     let fp = enum_fingerprint(node, src, doc);
                     self.push(id.clone(), NodeKind::Enum, span_of(node, file), Some(fp));
                     self.emit_variants(node, &id, file, src);
+                    self.collect_enum_associates(node, &id, mod_path, file, src);
                 }
             }
             "trait_item" => {
@@ -474,10 +575,24 @@ impl Extractor {
     /// transitions are collected and resolved against the emitted variant set in [`Self::finish`].
     /// The impl's `Self` type is assumed to live in the impl's own module (`mod_path`).
     fn analyze_impl(&mut self, node: TsNode, ctx: &FileCtx, mod_path: &str) {
-        let src = ctx.src;
+        let (src, file) = (ctx.src, ctx.file);
         let Some(ty) = node.child_by_field_name("type") else {
             return;
         };
+        // `impl Trait for Type`: collect a realization candidate. Inherent impls have no `trait`
+        // field and emit nothing. Resolution to local nodes happens in `finish`.
+        if let Some(tr) = node.child_by_field_name("trait") {
+            let type_path = type_path_text(ty, src);
+            let trait_path = type_path_text(tr, src);
+            if !type_path.is_empty() && !trait_path.is_empty() {
+                self.impls.push(RawImplements {
+                    type_path,
+                    trait_path,
+                    module: mod_path.to_string(),
+                    span: span_of(node, file),
+                });
+            }
+        }
         let enum_name = last_ident(ty, src);
         if enum_name.is_empty() {
             return;
@@ -599,6 +714,92 @@ impl Extractor {
                 let id = format!("{enum_id}::{name}");
                 self.push(id, NodeKind::Variant, span_of(variant, file), None);
             }
+        }
+    }
+
+    /// Collect association candidates from a struct's fields (named or tuple).
+    fn collect_struct_associates(
+        &mut self,
+        node: TsNode,
+        owner_id: &str,
+        mod_path: &str,
+        file: &str,
+        src: &[u8],
+    ) {
+        if let Some(list) = child_kind(node, "field_declaration_list") {
+            let mut cursor = list.walk();
+            for field in list.named_children(&mut cursor) {
+                if field.kind() != "field_declaration" {
+                    continue;
+                }
+                if let Some(ty) = field.child_by_field_name("type") {
+                    self.push_associates(ty, owner_id, mod_path, file, src);
+                }
+            }
+        } else if let Some(list) = child_kind(node, "ordered_field_declaration_list") {
+            let mut cursor = list.walk();
+            for child in list.named_children(&mut cursor) {
+                if is_type(child.kind()) {
+                    self.push_associates(child, owner_id, mod_path, file, src);
+                }
+            }
+        }
+    }
+
+    /// Collect association candidates from an enum's variant payloads. The owner is the enum type.
+    fn collect_enum_associates(
+        &mut self,
+        node: TsNode,
+        owner_id: &str,
+        mod_path: &str,
+        file: &str,
+        src: &[u8],
+    ) {
+        let Some(list) = child_kind(node, "enum_variant_list") else {
+            return;
+        };
+        let mut cursor = list.walk();
+        for variant in list.named_children(&mut cursor) {
+            if variant.kind() != "enum_variant" {
+                continue;
+            }
+            if let Some(payload) = child_kind(variant, "ordered_field_declaration_list") {
+                let mut vc = payload.walk();
+                for child in payload.named_children(&mut vc) {
+                    if is_type(child.kind()) {
+                        self.push_associates(child, owner_id, mod_path, file, src);
+                    }
+                }
+            } else if let Some(payload) = child_kind(variant, "field_declaration_list") {
+                let mut vc = payload.walk();
+                for field in payload.named_children(&mut vc) {
+                    if let Some(ty) = field.child_by_field_name("type") {
+                        self.push_associates(ty, owner_id, mod_path, file, src);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Unwrap a field type and record one association candidate per reachable inner type path.
+    fn push_associates(
+        &mut self,
+        ty: TsNode,
+        owner_id: &str,
+        mod_path: &str,
+        file: &str,
+        src: &[u8],
+    ) {
+        let mut paths = Vec::new();
+        collect_assoc_paths(ty, src, &mut paths);
+        let span = span_of(ty, file);
+        for inner_path in paths {
+            self.associates.push(RawAssociates {
+                owner_id: owner_id.to_string(),
+                inner_path,
+                module: mod_path.to_string(),
+                span: span.clone(),
+            });
         }
     }
 
@@ -1022,6 +1223,82 @@ fn collect_type_names(node: TsNode, src: &[u8], out: &mut Vec<String>) {
             }
         }
         _ => {}
+    }
+}
+
+/// Collect the *path* of each reachable inner type of a field type, unwrapping [`WRAPPERS`] and
+/// references (mirrors [`collect_type_names`] but keeps the full path so `crate::`-qualified names
+/// stay resolvable). Primitives are skipped since they are never local.
+fn collect_assoc_paths(node: TsNode, src: &[u8], out: &mut Vec<String>) {
+    match node.kind() {
+        "type_identifier" | "scoped_type_identifier" => out.push(text(node, src)),
+        "generic_type" => {
+            let base = node.named_child(0);
+            let base_name = base.map(|b| ident_of(b, src)).unwrap_or_default();
+            if WRAPPERS.contains(&base_name.as_str()) {
+                if let Some(args) = child_kind(node, "type_arguments") {
+                    let mut cursor = args.walk();
+                    for arg in args.named_children(&mut cursor) {
+                        if is_type(arg.kind()) {
+                            collect_assoc_paths(arg, src, out);
+                        }
+                    }
+                }
+            } else if let Some(base) = base {
+                out.push(text(base, src));
+            }
+        }
+        "reference_type" => {
+            if let Some(inner) = node.child_by_field_name("type") {
+                collect_assoc_paths(inner, src, out);
+            }
+        }
+        "tuple_type" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if is_type(child.kind()) {
+                    collect_assoc_paths(child, src, out);
+                }
+            }
+        }
+        "array_type" | "slice_type" => {
+            if let Some(inner) = node.child_by_field_name("element") {
+                collect_assoc_paths(inner, src, out);
+            }
+        }
+        "dynamic_type" => {
+            if let Some(inner) = node.named_child(0) {
+                collect_assoc_paths(inner, src, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The type path text for an impl's `Self` type or trait: the full path for a plain or scoped
+/// name, or the base path of a generic (`Foo<T>` -> `Foo`, `a::b::Foo<T>` -> `a::b::Foo`).
+fn type_path_text(node: TsNode, src: &[u8]) -> String {
+    match node.kind() {
+        "type_identifier" | "scoped_type_identifier" => text(node, src),
+        "generic_type" => node
+            .named_child(0)
+            .map(|b| text(b, src))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Resolve a type/trait name written in `module` to an absolute node id, precision-first. A
+/// `crate::`/`self::`/`super::` path goes through [`normalize_path`]; a bare name binds to the
+/// declaring module (`{module}::{name}`); any other scoped path is treated as external (`None`).
+fn resolve_local(path: &str, module: &str) -> Option<String> {
+    let first = path.split("::").next().unwrap_or("");
+    if matches!(first, "crate" | "self" | "super") {
+        normalize_path(path, module)
+    } else if path.is_empty() || path.contains("::") {
+        None
+    } else {
+        Some(format!("{module}::{path}"))
     }
 }
 

@@ -375,6 +375,98 @@ fn transitions_are_deterministic() {
     assert_eq!(transitions(&state_fixture()), transitions(&state_fixture()));
 }
 
+/// A crate exercising the type-view edges: a local trait realized by a local type, an external
+/// trait impl, an inherent impl, and struct fields of local, external, and wrapped-local types.
+fn type_view_fixture() -> Graph {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/lib.rs",
+        r#"
+use std::fmt;
+use std::sync::Arc;
+
+pub trait Repo {
+    fn get(&self);
+}
+
+pub struct Widget;
+pub struct Gadget;
+
+pub struct Store {
+    inner: Widget,
+    boxed: Arc<Gadget>,
+    name: String,
+    count: u64,
+}
+
+impl Repo for Store {
+    fn get(&self) {}
+}
+
+impl std::fmt::Display for Store {
+    fn fmt(&self, _f: &mut fmt::Formatter) -> fmt::Result {
+        Ok(())
+    }
+}
+
+impl Store {}
+"#,
+    );
+    extract(root).unwrap()
+}
+
+fn edges_of_kind(g: &Graph, kind: EdgeKind) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = g
+        .edges
+        .iter()
+        .filter(|e| e.kind == kind)
+        .map(|e| (e.from.as_str().to_string(), e.to.as_str().to_string()))
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn implements_edge_only_for_local_trait_and_type() {
+    let g = type_view_fixture();
+    // Local `impl Repo for Store` yields exactly one Implements edge from the type to the trait.
+    // The external `impl Display for Store` and the inherent `impl Store {}` yield nothing.
+    assert_eq!(
+        edges_of_kind(&g, EdgeKind::Implements),
+        vec![("crate::Store".to_string(), "crate::Repo".to_string())]
+    );
+}
+
+#[test]
+fn associates_edges_only_for_local_field_types() {
+    let g = type_view_fixture();
+    // `inner: Widget` and `boxed: Arc<Gadget>` associate to local nodes (Arc unwrapped). The
+    // `name: String` and `count: u64` fields are external/primitive and emit nothing.
+    assert_eq!(
+        edges_of_kind(&g, EdgeKind::Associates),
+        vec![
+            ("crate::Store".to_string(), "crate::Gadget".to_string()),
+            ("crate::Store".to_string(), "crate::Widget".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn type_view_edges_are_deterministic() {
+    let a = type_view_fixture();
+    let b = type_view_fixture();
+    assert_eq!(
+        edges_of_kind(&a, EdgeKind::Implements),
+        edges_of_kind(&b, EdgeKind::Implements)
+    );
+    assert_eq!(
+        edges_of_kind(&a, EdgeKind::Associates),
+        edges_of_kind(&b, EdgeKind::Associates)
+    );
+}
+
 #[test]
 fn output_is_deterministic() {
     let a = fixture();
