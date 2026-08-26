@@ -199,3 +199,26 @@ with a documentation mandate.
   diff two graphs or render a delta - that is `csd`'s novel layer.
 - cargo-modules: the extraction quality benchmark (ra_ap based).
 - cargo-semver-checks: owns public-API break detection; integrate or stay out of its lane.
+
+## Backend strategy (decision, 2026-08-26)
+
+Extraction backends are chosen per view, not globally, and ranked by how much
+instability they force on the build:
+
+1. **tree-sitter is the default and always-available base** for every view. It is fast,
+   multi-language, and - critically for a diff tool run on two refs mid-refactor - it
+   parses code that does not compile. It is shallow (no name resolution); that is the
+   accepted trade.
+2. **rustdoc JSON is the opt-in backend for the type/trait view** (see
+   `docs/spikes/rustdoc-json-vs-tree-sitter.md`). It resolves field types, generics, and
+   impls that tree-sitter cannot, at a bounded cost (nightly, must-compile, a pinned
+   `rustdoc-types` version). Confining it to one opt-in view means a non-compiling ref or
+   a missing nightly degrades only that view.
+3. **rust-analyzer (`ra_ap_*`) is the last resort, feature-flag gated, for the call view
+   only.** Method-receiver resolution (`x.method()`) needs real type inference, which
+   neither tree-sitter nor rustdoc (no bodies) can provide. `ra_ap_*` has no semver and is
+   republished from HEAD, so it must never be load-bearing for the default path; quarantine
+   it behind a Cargo feature so its breakage cannot sink `csd`. Prefer the crustrace traced
+   mode (observed call traces, true by construction) before reaching for it.
+
+Net: tree-sitter default -> rustdoc-JSON opt-in for types -> `ra_ap_*` last, flag-gated.
