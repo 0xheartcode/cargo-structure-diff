@@ -43,6 +43,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use csd_ir::{Change, EdgeKind, Fingerprint, Graph, NodeKind, StableId};
 
+mod boxes;
+
 /// Which view [`render`] produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -67,8 +69,8 @@ pub enum View {
 
 /// Which output syntax [`render`] emits.
 ///
-/// [`Default`] is [`Format::Mermaid`], the classic behaviour. [`Format::Dot`] and
-/// [`Format::Ascii`] are JS-free alternatives for the DAG-shaped views (see [`render`]); they reuse
+/// [`Default`] is [`Format::Mermaid`], the classic behaviour. [`Format::Dot`], [`Format::Ascii`] and
+/// [`Format::Boxes`] are JS-free alternatives for the DAG-shaped views (see [`render`]); they reuse
 /// the same delta selection and differ only in emission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Format {
@@ -79,6 +81,9 @@ pub enum Format {
     Dot,
     /// cargo-tree-style ASCII text for the DAG views (modules, types, call-graph).
     Ascii,
+    /// Native layered ASCII boxes-and-arrows for the DAG views (modules, types, call-graph, and the
+    /// flattened overview). Pure Rust, no external tools; see [`boxes`] and [`boxes_view`].
+    Boxes,
 }
 
 /// Render options shared by every view.
@@ -116,6 +121,7 @@ pub fn render(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -
         },
         Format::Dot => dot_view(view, head, changes, opts),
         Format::Ascii => ascii_view(view, head, changes, opts),
+        Format::Boxes => boxes_view(view, head, changes, opts),
     }
 }
 
@@ -1850,6 +1856,80 @@ fn ascii_walk<'a>(
     path.pop();
 }
 
+/// Emit a DAG view as a native layered ASCII boxes-and-arrows diagram (see [`boxes`]).
+///
+/// Reuses the shared [`select_graph`] selection, then hands the delta-classed nodes and edges to the
+/// pure [`boxes::layout`] layouter. Supported for the DAG views [`View::Modules`], [`View::Types`],
+/// [`View::CallGraph`] and the flattened [`View::Overview`] (each item's label is prefixed with its
+/// module). The spatial [`View::States`], sequence [`View::Calls`] and [`View::Schema`] views have no
+/// boxes form and degrade to a one-line note. Node names are the short id (last `::segment`); a
+/// scope stub is suffixed ` (external)`. Output is deterministic.
+fn boxes_view(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -> String {
+    match view {
+        View::States | View::Calls | View::Schema => {
+            return String::from(
+                "%% boxes format not supported for this view; use --format mermaid\n",
+            );
+        }
+        View::Modules | View::Types | View::CallGraph | View::Overview => {}
+    }
+    // The four arms above are all graph-shaped, so select_graph never returns None here.
+    let gv = select_graph(head, changes, opts, view).expect("DAG views are graph-shaped");
+
+    if gv.sel.render_ids.is_empty() {
+        return String::from("%% no structural changes in this view\n");
+    }
+
+    let overview = matches!(view, View::Overview);
+
+    // Render-id order is the node order; edges reference these indices.
+    let index: BTreeMap<&StableId, usize> = gv
+        .sel
+        .render_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, i))
+        .collect();
+
+    let mut nodes: Vec<boxes::BoxNode> = Vec::with_capacity(gv.sel.render_ids.len());
+    for id in &gv.sel.render_ids {
+        let is_stub = gv.sel.stubs.contains(id);
+        let class = if is_stub {
+            Class::Context
+        } else {
+            gv.node_class.get(id).copied().unwrap_or(Class::Context)
+        };
+        // Overview flattens the nested module subgraphs, so each item carries its module as a prefix.
+        let base = if overview {
+            format!(
+                "{}::{}",
+                call_name(call_owner(id.as_str())),
+                call_name(id.as_str())
+            )
+        } else {
+            call_name(id.as_str()).to_string()
+        };
+        let name = if is_stub {
+            format!("{base} (external)")
+        } else {
+            base
+        };
+        nodes.push(boxes::BoxNode {
+            marker: ascii_marker(class),
+            name,
+        });
+    }
+
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    for (from, to, _) in &gv.edges {
+        if let (Some(&f), Some(&t)) = (index.get(from), index.get(to)) {
+            edges.push((f, t));
+        }
+    }
+
+    boxes::layout(&nodes, &edges)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3068,6 +3148,136 @@ mod tests {
             },
         );
         assert!(out.contains("%% empty overview"), "{out}");
+    }
+
+    /// Boxes format over the module view, drawing the whole graph.
+    fn boxes_opts() -> RenderOpts {
+        RenderOpts {
+            full: true,
+            format: Format::Boxes,
+            ..RenderOpts::default()
+        }
+    }
+
+    #[test]
+    fn boxes_chain_golden() {
+        // a -> b -> c: three boxes in three columns, `--->` arrows between them.
+        let head = Graph {
+            nodes: vec![module("crate::a"), module("crate::b"), module("crate::c")],
+            edges: vec![uses("crate::a", "crate::b"), uses("crate::b", "crate::c")],
+        };
+        let out = render(View::Modules, &head, &[], &boxes_opts());
+        let expected = concat!(
+            "+----+    +----+    +----+\n",
+            "|  a |--->|  b |--->|  c |\n",
+            "+----+    +----+    +----+\n",
+        );
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn boxes_diamond_three_ranks_golden() {
+        // a->b, a->c, b->d, c->d: a is rank 0, b/c rank 1, d rank 2. Adjacent edges are all arrows;
+        // the row-crossing edges (a->c, c->d) jog through a vertical channel in the gutter.
+        let head = Graph {
+            nodes: vec![
+                module("crate::a"),
+                module("crate::b"),
+                module("crate::c"),
+                module("crate::d"),
+            ],
+            edges: vec![
+                uses("crate::a", "crate::b"),
+                uses("crate::a", "crate::c"),
+                uses("crate::b", "crate::d"),
+                uses("crate::c", "crate::d"),
+            ],
+        };
+        let out = render(View::Modules, &head, &[], &boxes_opts());
+        let expected = concat!(
+            "+----+    +----+    +----+\n",
+            "|  a |-+->|  b |-+->|  d |\n",
+            "+----+ |  +----+ |  +----+\n",
+            "       |         |\n",
+            "       |  +----+ |\n",
+            "       +->|  c |-+\n",
+            "          +----+\n",
+        );
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn boxes_cycle_back_edge_in_legend() {
+        // a -> b -> a: the back-edge is excluded from ranking (so the layout terminates) and listed
+        // in the legend. a is added, so its box carries the `+` marker.
+        let head = Graph {
+            nodes: vec![module("crate::a"), module("crate::b")],
+            edges: vec![uses("crate::a", "crate::b"), uses("crate::b", "crate::a")],
+        };
+        let changes = vec![Change::Added(module("crate::a"))];
+        let out = render(View::Modules, &head, &changes, &boxes_opts());
+        let expected = concat!(
+            "+----+    +----+\n",
+            "| +a |--->|  b |\n",
+            "+----+    +----+\n",
+            "\n",
+            "Legend:\n",
+            "  b ---> a  (back)\n",
+        );
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn boxes_added_node_shows_plus_marker() {
+        // An added module renders `+name` inside its box.
+        let head = Graph {
+            nodes: vec![module("crate::widget")],
+            edges: vec![],
+        };
+        let changes = vec![Change::Added(module("crate::widget"))];
+        let out = render(View::Modules, &head, &changes, &boxes_opts());
+        assert!(out.contains("| +widget |"), "added marker missing:\n{out}");
+    }
+
+    #[test]
+    fn boxes_skip_edge_in_legend() {
+        // a->b->c plus a->c: the two-rank-spanning a->c edge goes to the legend, not the grid.
+        let head = Graph {
+            nodes: vec![module("crate::a"), module("crate::b"), module("crate::c")],
+            edges: vec![
+                uses("crate::a", "crate::b"),
+                uses("crate::b", "crate::c"),
+                uses("crate::a", "crate::c"),
+            ],
+        };
+        let out = render(View::Modules, &head, &[], &boxes_opts());
+        assert!(
+            out.contains("  a ---> c  (skip)\n"),
+            "skip edge missing from legend:\n{out}"
+        );
+        // Adjacent edges are still drawn as arrows on the grid.
+        assert!(out.contains("--->"), "{out}");
+    }
+
+    #[test]
+    fn boxes_state_view_not_supported() {
+        let head = Graph {
+            nodes: vec![variant("crate::S::a")],
+            edges: vec![],
+        };
+        let out = render(
+            View::States,
+            &head,
+            &[],
+            &RenderOpts {
+                format: Format::Boxes,
+                ..RenderOpts::default()
+            },
+        );
+        assert_eq!(
+            out,
+            "%% boxes format not supported for this view; use --format mermaid\n"
+        );
     }
 
     #[test]
