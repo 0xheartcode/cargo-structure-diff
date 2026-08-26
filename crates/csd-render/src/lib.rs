@@ -1,11 +1,13 @@
 //! Render a graph and its delta as one annotated Mermaid diagram.
 //!
-//! Four views live here: [`render_module_view`] (a `flowchart` over `Module` nodes and `Uses`
+//! Six views live here: [`render_module_view`] (a `flowchart` over `Module` nodes and `Uses`
 //! edges), [`render_state_view`] (a `stateDiagram-v2` over `Variant` nodes and `Transitions`
 //! edges, SPEC.md 3.4), [`render_type_view`] (a `classDiagram` over `Struct`/`Enum`/`Trait`
-//! nodes with `Implements`/`Associates` relations, SPEC.md 3.2) and [`render_call_view`] (a
-//! `sequenceDiagram` slice from an entry `Fn` over `Calls` edges, SPEC.md 3.3). All follow the
-//! project convention
+//! nodes with `Implements`/`Associates` relations plus their methods as members, SPEC.md 3.2),
+//! [`render_call_view`] (a `sequenceDiagram` slice from an entry `Fn` over `Calls` edges,
+//! SPEC.md 3.3), the global call-graph `flowchart` ([`View::CallGraph`], one box per `Fn`,
+//! grouped into per-owner subgraphs) and the schema `erDiagram` ([`View::Schema`], over
+//! `Table` nodes and `ForeignKey` edges, SPEC.md 3.5). All follow the project convention
 //! (SPEC.md section 4): the delta is
 //! colour-encoded onto a single drawing rather than diffing two images (green added, red-dashed
 //! removed, amber changed, gray unchanged context) and the graph is pruned to changed nodes, the
@@ -50,6 +52,11 @@ pub enum View {
     Types,
     /// Call `sequenceDiagram` slice (see [`render_call_view`]).
     Calls,
+    /// Global call-graph `flowchart` (see [`call_graph_view`]): one box per `Fn`, `Calls` edges as
+    /// arrows, grouped into per-owner subgraphs. Distinct from [`View::Calls`], which is a slice.
+    CallGraph,
+    /// Schema `erDiagram` (see [`schema_view`]) over `Table` nodes and `ForeignKey` edges.
+    Schema,
 }
 
 /// Render options shared by every view.
@@ -73,6 +80,8 @@ pub fn render(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -
         View::States => state_view(head, changes, opts),
         View::Types => type_view(head, changes, opts),
         View::Calls => call_view(head, changes, opts),
+        View::CallGraph => call_graph_view(head, changes, opts),
+        View::Schema => schema_view(head, changes, opts),
     }
 }
 
@@ -340,28 +349,37 @@ fn type_view(head: &Graph, changes: &[Change], opts: &RenderOpts) -> String {
         })
         .collect();
 
-    // Declare each class, with a `<<trait>>` stereotype and (for Modified classes) member lines.
-    // A scope stub renders as a bare external class with no body.
+    // Per-method (Fn) delta class, keyed by fn id: an `Added`/`Removed` fn or one whose
+    // `member_types` signature changed. A fn whose id is exactly `<class>::<method>` is listed as a
+    // member of that class below.
+    let method_status = method_status(head, changes);
+
+    // Declare each class, with a `<<trait>>` stereotype and, for non-stub classes, its member
+    // lines: fields first (from a Modified fingerprint), then methods (from `Fn` nodes), each
+    // deterministically ordered. Methods carry a `()` suffix to distinguish them from fields. A
+    // scope stub renders as a bare external class with no body.
     for id in &sel.render_ids {
         let handle = &handles[id];
         let is_stub = sel.stubs.contains(id);
         let is_trait = !is_stub && kind_of.get(id).copied() == Some(NodeKind::Trait);
-        let members = if is_stub {
-            None
+        let (fields, methods) = if is_stub {
+            (Vec::new(), Vec::new())
         } else {
-            modified.get(id).map(|(b, a)| member_lines(b, a))
+            let fields = modified.get(id).map(|(b, a)| member_lines(b, a));
+            (
+                fields.unwrap_or_default(),
+                method_lines(id.as_str(), &method_status),
+            )
         };
         let (label, _) = sel.label_class(id, &node_class);
-        let has_body = is_trait || members.as_ref().is_some_and(|m| !m.is_empty());
+        let has_body = is_trait || !fields.is_empty() || !methods.is_empty();
         if has_body {
             let _ = writeln!(out, "    class {}[\"{}\"] {{", handle, label);
             if is_trait {
                 out.push_str("        <<trait>>\n");
             }
-            if let Some(lines) = &members {
-                for line in lines {
-                    let _ = writeln!(out, "        {line}");
-                }
+            for line in fields.iter().chain(methods.iter()) {
+                let _ = writeln!(out, "        {line}");
             }
             out.push_str("    }\n");
         } else {
@@ -966,6 +984,321 @@ fn member_lines(before: &Fingerprint, after: &Fingerprint) -> Vec<String> {
         lines.push(line);
     }
     lines
+}
+
+/// Per-method delta class keyed by fn id, over the `Fn` nodes in `head` plus any the delta removed.
+///
+/// A fn is `Added`/`Removed` from the matching [`Change`]; a `Modified` fn is `Changed` only when
+/// its [`Fingerprint::member_types`] signature differs (a real retype), else `Context`.
+fn method_status<'a>(head: &'a Graph, changes: &'a [Change]) -> BTreeMap<&'a str, Class> {
+    let mut status: BTreeMap<&str, Class> = BTreeMap::new();
+    for n in &head.nodes {
+        if n.kind == NodeKind::Fn {
+            status.insert(n.id.as_str(), Class::Context);
+        }
+    }
+    for c in changes {
+        match c {
+            Change::Added(n) if n.kind == NodeKind::Fn => {
+                status.insert(n.id.as_str(), Class::Added);
+            }
+            Change::Removed(n) if n.kind == NodeKind::Fn => {
+                status.insert(n.id.as_str(), Class::Removed);
+            }
+            Change::Modified { before, after } if after.kind == NodeKind::Fn => {
+                let changed = matches!(
+                    (before.fingerprint.as_ref(), after.fingerprint.as_ref()),
+                    (Some(b), Some(a)) if b.member_types != a.member_types
+                );
+                status.insert(
+                    after.id.as_str(),
+                    if changed {
+                        Class::Changed
+                    } else {
+                        Class::Context
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+    status
+}
+
+/// Member lines for the methods of `class_id`: the `Fn` ids whose owner (id minus the last
+/// `::segment`) is exactly `class_id`, rendered `+name()`/`-name()`/`~name()`/`name()` by delta
+/// class. `status` is sorted by fn id, so lines come out in method-name order (deterministic).
+fn method_lines(class_id: &str, status: &BTreeMap<&str, Class>) -> Vec<String> {
+    status
+        .iter()
+        .filter(|(id, _)| call_owner(id) == class_id)
+        .map(|(id, class)| {
+            let prefix = match class {
+                Class::Added => "+",
+                Class::Removed => "-",
+                Class::Changed => "~",
+                Class::Context => "",
+            };
+            format!("{prefix}{}()", call_name(id))
+        })
+        .collect()
+}
+
+/// Render the global call-graph view of `head` with `changes` colour-encoded, as a Mermaid
+/// `flowchart LR` (SPEC.md 3.3, the codebase-oriented "functions and flow" picture).
+///
+/// Unlike [`render_call_view`], which slices a `sequenceDiagram` from one entry and groups callers
+/// into per-owner lifelines, this draws **one box per [`NodeKind::Fn`]** so a crate of flat free
+/// functions never collapses to a single node: each `Calls` edge is an arrow between two distinct
+/// boxes. Functions are grouped into `subgraph` blocks by owning module/type (fn id minus its last
+/// `::segment`) purely for readability; the boxes stay separate. Nodes and edges are delta-coloured
+/// via [`Class`]/[`CLASS_DEFS`]. A fn with `attrs["unresolved_calls"] > 0` gets a dashed edge to a
+/// small `:::context` `dyn` stub, so the dynamic/generic fidelity ceiling is shown, never faked.
+///
+/// `full`/`scope` are honoured through the shared [`select`] machinery: `full` draws every fn,
+/// `scope` keeps in-scope fns and renders a crossing callee/caller as an external stub.
+fn call_graph_view(head: &Graph, changes: &[Change], opts: &RenderOpts) -> String {
+    let nodes = collect_nodes(head, changes, NodeKind::Fn);
+    let node_class = classify_nodes(&nodes, changes);
+    let edges = collect_edges(head, changes, &nodes, EdgeKind::Calls);
+    let files = file_index(head, changes);
+    let patterns = compile_scope(&opts.scope);
+    let sel = select(
+        &nodes,
+        &node_class,
+        &edges,
+        &files,
+        &patterns,
+        opts.full,
+        CONTEXT_HOPS,
+    );
+
+    let mut out = String::from("flowchart LR\n");
+    out.push_str(CLASS_DEFS);
+    out.push('\n');
+
+    if sel.render_ids.is_empty() {
+        out.push_str("    %% no structural changes in the call graph\n");
+        return out;
+    }
+
+    // Stable f<i> handles in id order.
+    let handles: BTreeMap<&StableId, String> = sel
+        .render_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, format!("f{i}")))
+        .collect();
+
+    // `unresolved_calls` counts per fn (the dyn/generics fidelity ceiling).
+    let unresolved: BTreeMap<&str, u32> = head
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Fn)
+        .filter_map(|n| {
+            n.attrs
+                .get("unresolved_calls")
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|c| *c > 0)
+                .map(|c| (n.id.as_str(), c))
+        })
+        .collect();
+
+    // Group the rendered fns by owner (sorted), one subgraph each. render_ids is already sorted, so
+    // fns within a subgraph stay in id order.
+    let mut by_owner: BTreeMap<&str, Vec<&StableId>> = BTreeMap::new();
+    for id in &sel.render_ids {
+        by_owner
+            .entry(call_owner(id.as_str()))
+            .or_default()
+            .push(id);
+    }
+    for (i, (owner, ids)) in by_owner.iter().enumerate() {
+        let _ = writeln!(out, "    subgraph sg{i}[\"{owner}\"]");
+        for id in ids {
+            let is_stub = sel.stubs.contains(id);
+            let class = if is_stub {
+                Class::Context
+            } else {
+                node_class.get(id).copied().unwrap_or(Class::Context)
+            };
+            let name = call_name(id.as_str());
+            let label = if is_stub {
+                format!("{name} (external)")
+            } else {
+                name.to_string()
+            };
+            let _ = writeln!(
+                out,
+                "        {}[\"{}\"]:::{}",
+                handles[id],
+                label,
+                class.css()
+            );
+        }
+        out.push_str("    end\n");
+    }
+
+    // Call edges as arrows; added/removed carry a +/- marker (same convention as the module view).
+    for (from, to, class) in &edges {
+        if !handles.contains_key(from) || !handles.contains_key(to) {
+            continue;
+        }
+        let (arrow, label) = match class {
+            Class::Added => ("-->", "|+|"),
+            Class::Removed => ("-.->", "|-|"),
+            _ => ("-->", ""),
+        };
+        let _ = writeln!(
+            out,
+            "    {} {}{} {}",
+            handles[from], arrow, label, handles[to]
+        );
+    }
+
+    // Honest dyn ceiling: a dashed edge to a `dyn` stub for each rendered fn with unresolved calls.
+    let mut dyn_idx = 0;
+    for id in &sel.render_ids {
+        if sel.stubs.contains(id) {
+            continue;
+        }
+        if unresolved.contains_key(id.as_str()) {
+            let _ = writeln!(out, "    dyn{dyn_idx}[\"dyn\"]:::context");
+            let _ = writeln!(out, "    {} -.-> dyn{dyn_idx}", handles[id]);
+            dyn_idx += 1;
+        }
+    }
+
+    out
+}
+
+/// The columns of a table node, parsed from `attrs["columns"]` (`"id: Int4, name: Varchar"`), as
+/// erDiagram attribute lines `Type name` (`"id: Int4"` -> `Int4 id`). Entries without a `:` are
+/// skipped. Best-effort: whitespace is trimmed, non-name chars are not otherwise validated.
+fn column_lines(columns: Option<&str>) -> Vec<String> {
+    let Some(cols) = columns else {
+        return Vec::new();
+    };
+    cols.split(',')
+        .filter_map(|c| {
+            let (name, ty) = c.split_once(':')?;
+            let (name, ty) = (name.trim(), ty.trim());
+            if name.is_empty() || ty.is_empty() {
+                None
+            } else {
+                Some(format!("{} {}", sanitize_ident(ty), sanitize_ident(name)))
+            }
+        })
+        .collect()
+}
+
+/// A Mermaid-safe identifier: every char outside `[A-Za-z0-9_]` becomes `_`. erDiagram entity and
+/// attribute names cannot carry `::` or spaces, so ids are projected through this.
+fn sanitize_ident(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// Render the schema view of `head` with `changes`, as a Mermaid `erDiagram` (SPEC.md 3.5).
+///
+/// Entities are [`NodeKind::Table`] nodes; their columns come from `attrs["columns"]` (see
+/// [`column_lines`]). Relationships are [`EdgeKind::ForeignKey`] edges, drawn `child }o--|| parent`.
+/// `erDiagram` supports neither `classDef` colouring nor per-member colour, so the delta is carried
+/// as **text markers**, not colour: an added/removed table gets a leading `csd_delta added` /
+/// `csd_delta removed` attribute row, and an added/removed relationship gets a `(added)`/`(removed)`
+/// suffix on its label. `full`/`scope` are honoured through [`select`] as in the type view. Empty
+/// case: the header plus a `%% no schema tables` comment.
+fn schema_view(head: &Graph, changes: &[Change], opts: &RenderOpts) -> String {
+    let nodes = collect_nodes(head, changes, NodeKind::Table);
+    let node_class = classify_nodes(&nodes, changes);
+    let edges = collect_edges(head, changes, &nodes, EdgeKind::ForeignKey);
+    let files = file_index(head, changes);
+    let patterns = compile_scope(&opts.scope);
+    let sel = select(
+        &nodes,
+        &node_class,
+        &edges,
+        &files,
+        &patterns,
+        opts.full,
+        CONTEXT_HOPS,
+    );
+
+    let mut out = String::from("erDiagram\n");
+    if sel.render_ids.is_empty() {
+        out.push_str("    %% no schema tables\n");
+        return out;
+    }
+
+    // Column source per table id: head node attrs plus removed nodes recovered from the delta.
+    let mut columns: BTreeMap<&StableId, &str> = BTreeMap::new();
+    for n in &head.nodes {
+        if n.kind == NodeKind::Table {
+            if let Some(c) = n.attrs.get("columns") {
+                columns.insert(&n.id, c.as_str());
+            }
+        }
+    }
+    for c in changes {
+        if let Change::Removed(n) = c {
+            if n.kind == NodeKind::Table {
+                if let Some(c) = n.attrs.get("columns") {
+                    columns.entry(&n.id).or_insert(c.as_str());
+                }
+            }
+        }
+    }
+
+    let rendered: BTreeSet<&StableId> = sel.render_ids.iter().copied().collect();
+    let ent = |id: &StableId| sanitize_ident(id.as_str());
+
+    // Declare each entity, delta marker (if any) first, then its columns.
+    for id in &sel.render_ids {
+        let is_stub = sel.stubs.contains(id);
+        let class = if is_stub {
+            Class::Context
+        } else {
+            node_class.get(id).copied().unwrap_or(Class::Context)
+        };
+        let marker = match class {
+            Class::Added => Some("added"),
+            Class::Removed => Some("removed"),
+            _ => None,
+        };
+        let cols = if is_stub {
+            Vec::new()
+        } else {
+            column_lines(columns.get(id).copied())
+        };
+        if marker.is_some() || !cols.is_empty() {
+            let _ = writeln!(out, "    {} {{", ent(id));
+            if let Some(m) = marker {
+                let _ = writeln!(out, "        csd_delta {m}");
+            }
+            for line in &cols {
+                let _ = writeln!(out, "        {line}");
+            }
+            out.push_str("    }\n");
+        } else {
+            let _ = writeln!(out, "    {}", ent(id));
+        }
+    }
+
+    // Foreign-key relationships in (from, to) order; endpoints pruned away are skipped.
+    for (from, to, class) in &edges {
+        if !rendered.contains(from) || !rendered.contains(to) {
+            continue;
+        }
+        let label = match class {
+            Class::Added => "references (added)",
+            Class::Removed => "references (removed)",
+            _ => "references",
+        };
+        let _ = writeln!(out, "    {} }}o--|| {} : \"{}\"", ent(from), ent(to), label);
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -1684,6 +2017,244 @@ mod tests {
         assert!(
             !out.contains("helper_deep"),
             "far side must not expand:\n{out}"
+        );
+    }
+
+    fn table_node(id: &str, columns: &str) -> Node {
+        let mut n = Node {
+            id: StableId::new(id),
+            kind: NodeKind::Table,
+            span: span(),
+            attrs: BTreeMap::new(),
+            fingerprint: None,
+        };
+        n.attrs.insert("columns".into(), columns.into());
+        n
+    }
+
+    fn foreign_key(from: &str, to: &str) -> Edge {
+        Edge {
+            from: StableId::new(from),
+            to: StableId::new(to),
+            kind: EdgeKind::ForeignKey,
+            span: span(),
+            ordinal: None,
+        }
+    }
+
+    #[test]
+    fn call_graph_two_modules_two_subgraphs_golden() {
+        // f (crate::a) calls g (crate::b): two boxes in two subgraphs plus an arrow. `full` renders
+        // both even without a delta.
+        let head = Graph {
+            nodes: vec![fn_node("crate::a::f"), fn_node("crate::b::g")],
+            edges: vec![calls("crate::a::f", "crate::b::g", 0)],
+        };
+        let out = render(
+            View::CallGraph,
+            &head,
+            &[],
+            &RenderOpts {
+                full: true,
+                ..RenderOpts::default()
+            },
+        );
+        let expected = concat!(
+            "flowchart LR\n",
+            "    classDef added fill:#f0fdf4,stroke:#22c55e,stroke-width:2px\n",
+            "    classDef removed fill:#fef2f2,stroke:#ef4444,stroke-width:2px,stroke-dasharray:4 4\n",
+            "    classDef changed fill:#fffbeb,stroke:#f59e0b,stroke-width:2px\n",
+            "    classDef context fill:#ffffff,stroke:#d1d5db,color:#9ca3af\n",
+            "    subgraph sg0[\"crate::a\"]\n",
+            "        f0[\"f\"]:::context\n",
+            "    end\n",
+            "    subgraph sg1[\"crate::b\"]\n",
+            "        f1[\"g\"]:::context\n",
+            "    end\n",
+            "    f0 --> f1\n",
+        );
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn call_graph_added_call_is_coloured() {
+        // A newly added call between two existing fns: the arrow carries the `+` marker and the
+        // endpoints are pulled in by the prune (no `full` needed).
+        let head = Graph {
+            nodes: vec![fn_node("crate::a::f"), fn_node("crate::b::g")],
+            edges: vec![calls("crate::a::f", "crate::b::g", 0)],
+        };
+        let changes = vec![Change::EdgeAdded(calls("crate::a::f", "crate::b::g", 0))];
+        let out = render(View::CallGraph, &head, &changes, &RenderOpts::default());
+        assert!(
+            out.contains("    f0 -->|+| f1\n"),
+            "added arrow missing:\n{out}"
+        );
+        assert!(out.contains("f0[\"f\"]:::context"), "{out}");
+        assert!(out.contains("f1[\"g\"]:::context"), "{out}");
+    }
+
+    #[test]
+    fn call_graph_flat_same_module_not_collapsed() {
+        // Two free functions in the SAME module with a call between them. The sequence view would
+        // collapse this to one lifeline (p0 ->> p0); the call graph keeps two distinct boxes.
+        let head = Graph {
+            nodes: vec![fn_node("crate::m::a"), fn_node("crate::m::b")],
+            edges: vec![calls("crate::m::a", "crate::m::b", 0)],
+        };
+        let out = render(
+            View::CallGraph,
+            &head,
+            &[],
+            &RenderOpts {
+                full: true,
+                ..RenderOpts::default()
+            },
+        );
+        // One subgraph, but two separate boxes and a real arrow between them.
+        assert!(out.contains("    subgraph sg0[\"crate::m\"]\n"), "{out}");
+        assert!(out.contains("        f0[\"a\"]:::context\n"), "{out}");
+        assert!(out.contains("        f1[\"b\"]:::context\n"), "{out}");
+        assert!(
+            out.contains("    f0 --> f1\n"),
+            "distinct boxes must connect:\n{out}"
+        );
+        // Not collapsed: no self-referential single-node shape.
+        assert!(
+            !out.contains("f0 --> f0"),
+            "must not collapse to one node:\n{out}"
+        );
+    }
+
+    #[test]
+    fn call_graph_dyn_stub_for_unresolved_calls() {
+        // A fn with unresolved (dynamic) callees gets a dashed edge to a `dyn` context stub.
+        let head = Graph {
+            nodes: vec![fn_node_dyn("crate::a::f", 2)],
+            edges: vec![],
+        };
+        let out = render(
+            View::CallGraph,
+            &head,
+            &[],
+            &RenderOpts {
+                full: true,
+                ..RenderOpts::default()
+            },
+        );
+        assert!(out.contains("    dyn0[\"dyn\"]:::context\n"), "{out}");
+        assert!(
+            out.contains("    f0 -.-> dyn0\n"),
+            "dyn edge missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn type_view_lists_added_and_removed_methods() {
+        // Struct S (fields unchanged) gains method `foo` and loses method `bar`; a plain method
+        // `baz` stays. Fields still render; methods carry +/-/() markers.
+        let fp = fingerprint(&["id"], &[("u64", 1)]);
+        let head = Graph {
+            nodes: vec![
+                type_node("crate::S", NodeKind::Struct, Some(fp.clone())),
+                fn_node("crate::S::foo"),
+                fn_node("crate::S::baz"),
+            ],
+            edges: vec![],
+        };
+        let changes = vec![
+            Change::Modified {
+                before: type_node("crate::S", NodeKind::Struct, Some(fp.clone())),
+                after: type_node("crate::S", NodeKind::Struct, Some(fp)),
+            },
+            Change::Added(fn_node("crate::S::foo")),
+            Change::Removed(fn_node("crate::S::bar")),
+        ];
+        let out = render_type_view(&head, &changes);
+        let expected = concat!(
+            "classDiagram\n",
+            "    classDef added fill:#f0fdf4,stroke:#22c55e,stroke-width:2px\n",
+            "    classDef removed fill:#fef2f2,stroke:#ef4444,stroke-width:2px,stroke-dasharray:4 4\n",
+            "    classDef changed fill:#fffbeb,stroke:#f59e0b,stroke-width:2px\n",
+            "    classDef context fill:#ffffff,stroke:#d1d5db,color:#9ca3af\n",
+            "    class c0[\"crate::S\"] {\n",
+            "        id\n",
+            "        -bar()\n",
+            "        baz()\n",
+            "        +foo()\n",
+            "    }\n",
+            "    class c0:::changed\n",
+        );
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn schema_two_tables_one_fk_golden() {
+        // Two tables and a foreign key; `full` renders the whole schema with no delta markers.
+        let head = Graph {
+            nodes: vec![
+                table_node("users", "id: Int4, name: Varchar"),
+                table_node("posts", "id: Int4, user_id: Int4"),
+            ],
+            edges: vec![foreign_key("posts", "users")],
+        };
+        let out = render(
+            View::Schema,
+            &head,
+            &[],
+            &RenderOpts {
+                full: true,
+                ..RenderOpts::default()
+            },
+        );
+        let expected = concat!(
+            "erDiagram\n",
+            "    posts {\n",
+            "        Int4 id\n",
+            "        Int4 user_id\n",
+            "    }\n",
+            "    users {\n",
+            "        Int4 id\n",
+            "        Varchar name\n",
+            "    }\n",
+            "    posts }o--|| users : \"references\"\n",
+        );
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn schema_empty_renders_no_tables_comment() {
+        let head = Graph {
+            nodes: vec![],
+            edges: vec![],
+        };
+        let out = render(View::Schema, &head, &[], &RenderOpts::default());
+        assert_eq!(out, "erDiagram\n    %% no schema tables\n");
+    }
+
+    #[test]
+    fn schema_added_table_and_fk_carry_text_markers() {
+        // erDiagram cannot colour, so an added table gets a `csd_delta added` row and an added FK a
+        // `(added)` label suffix.
+        let head = Graph {
+            nodes: vec![
+                table_node("users", "id: Int4"),
+                table_node("posts", "id: Int4, user_id: Int4"),
+            ],
+            edges: vec![foreign_key("posts", "users")],
+        };
+        let changes = vec![
+            Change::Added(table_node("posts", "id: Int4, user_id: Int4")),
+            Change::EdgeAdded(foreign_key("posts", "users")),
+        ];
+        let out = render(View::Schema, &head, &changes, &RenderOpts::default());
+        assert!(
+            out.contains("        csd_delta added\n"),
+            "table marker missing:\n{out}"
+        );
+        assert!(
+            out.contains("posts }o--|| users : \"references (added)\"\n"),
+            "fk marker missing:\n{out}"
         );
     }
 }
