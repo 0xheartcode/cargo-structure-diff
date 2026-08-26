@@ -11,4 +11,10 @@ authors.workspace = true
 [dependencies]
 csd-ir = { workspace = true }
 anyhow = { workspace = true }
-# tree-sitter grammars are added with the M0 extractor work (backlog `extract`).
+# tree-sitter grammars for the M0 extractor (backlog `extract`). tree-sitter-rust 0.24 is built
+# against the tree-sitter 0.25/0.26 ABI and exposes the grammar as a `LanguageFn` (`LANGUAGE`).
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+
+[dev-dependencies]
+tempfile = "3"
