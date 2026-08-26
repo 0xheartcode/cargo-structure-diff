@@ -1,0 +1,26 @@
+[package]
+name = "cargo-structure-diff"
+description = "Structural diff for Rust crates: extract the module graph, diff base against head, render it as Mermaid, and gate on architectural lints."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "csd"
+path = "src/main.rs"
+
+[[bin]]
+name = "cargo-structure-diff"
+path = "src/cargo_shim.rs"
+
+[dependencies]
+csd-ir = { workspace = true }
+csd-diff = { workspace = true }
+csd-extract-rs = { workspace = true }
+csd-config = { workspace = true }
+csd-render = { workspace = true }
+csd-lint = { workspace = true }
+anyhow = { workspace = true }
