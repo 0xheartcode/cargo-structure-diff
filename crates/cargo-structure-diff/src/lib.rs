@@ -23,17 +23,26 @@ use csd_render::{render_call_view, render_module_view, render_state_view, render
 /// Default base ref when `--base` is omitted.
 const DEFAULT_BASE: &str = "main";
 
+/// Default trace command when `--cmd` is omitted.
+const DEFAULT_TRACE_CMD: &str = "cargo test";
+
 /// Usage text for `-h`/`--help` and parse errors.
 const HELP: &str = "\
 cargo-structure-diff: structural diff and architectural lint gate
 
 USAGE:
     csd diff [--base <ref>]
+    csd trace [--base <ref>] [--cmd <shell command>]
     cargo structure-diff diff [--base <ref>]
 
 OPTIONS:
     --base <ref>    Base git ref to diff against (default: main)
+    --cmd <cmd>     trace: shell command that emits Mermaid (default: cargo test)
     -h, --help      Print this help
+
+trace mode is opt-in and observational: it runs <cmd> in the base and head
+worktrees, extracts the emitted `sequenceDiagram` Mermaid blocks, and diffs the
+observed traces as a set. It exits 0 (2 only if the command fails to run).
 ";
 
 /// A parsed invocation.
@@ -45,6 +54,13 @@ pub enum Cmd {
     Diff {
         /// The git ref to treat as the base side.
         base: String,
+    },
+    /// Run a trace command in base and head, then diff the observed Mermaid traces.
+    Trace {
+        /// The git ref to treat as the base side.
+        base: String,
+        /// The shell command that emits Mermaid on stdout.
+        cmd: String,
     },
 }
 
@@ -107,17 +123,19 @@ impl Report {
 
 /// Parse the argument list (already stripped of the program name).
 ///
-/// Accepts the `diff` subcommand with an optional `--base <ref>` or `--base=<ref>`, and `-h`/
-/// `--help` anywhere. Dependency-free by design; no clap.
+/// Accepts the `diff` and `trace` subcommands with an optional `--base <ref>` or `--base=<ref>`,
+/// `trace` also taking `--cmd <shell command>`, and `-h`/`--help` anywhere. Dependency-free by
+/// design; no clap.
 pub fn parse_args(args: &[String]) -> Result<Cmd> {
     let mut base = DEFAULT_BASE.to_string();
-    let mut saw_diff = false;
+    let mut cmd = DEFAULT_TRACE_CMD.to_string();
+    let mut sub: Option<&str> = None;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
         match arg {
             "-h" | "--help" => return Ok(Cmd::Help),
-            "diff" => saw_diff = true,
+            "diff" | "trace" if sub.is_none() => sub = Some(arg),
             "--base" => {
                 i += 1;
                 let value = args.get(i).context("--base requires a value")?;
@@ -126,14 +144,23 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
             _ if arg.starts_with("--base=") => {
                 base = arg["--base=".len()..].to_string();
             }
+            "--cmd" => {
+                i += 1;
+                let value = args.get(i).context("--cmd requires a value")?;
+                cmd = value.clone();
+            }
+            _ if arg.starts_with("--cmd=") => {
+                cmd = arg["--cmd=".len()..].to_string();
+            }
             other => bail!("unexpected argument {other:?}; try --help"),
         }
         i += 1;
     }
-    if !saw_diff {
-        bail!("expected the `diff` subcommand; try --help");
+    match sub {
+        Some("trace") => Ok(Cmd::Trace { base, cmd }),
+        Some(_) => Ok(Cmd::Diff { base }),
+        None => bail!("expected the `diff` or `trace` subcommand; try --help"),
     }
-    Ok(Cmd::Diff { base })
 }
 
 /// Entry point shared by both binaries. Returns the process exit code.
@@ -158,6 +185,13 @@ pub fn run(args: &[String]) -> i32 {
                 2
             }
         },
+        Cmd::Trace { base, cmd } => match run_trace(&base, &cmd) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                2
+            }
+        },
     }
 }
 
@@ -168,6 +202,122 @@ fn run_diff(base: &str) -> Result<i32> {
     let report = analyze(&repo, base, &config)?;
     report.print(base);
     Ok(report.exit_code())
+}
+
+/// Run `cmd` in the base worktree and in the head working tree, extract the emitted
+/// `sequenceDiagram` Mermaid blocks, and print the observed-trace delta.
+///
+/// Traced mode is opt-in and observational: it exits 0 whatever the delta, and only 2 when the
+/// command itself fails to run. The base worktree is always torn down, even on error.
+fn run_trace(base: &str, cmd: &str) -> Result<i32> {
+    let repo = repo_root()?;
+    let (base_blocks, head_blocks) = observe_traces(&repo, base, cmd)?;
+    let (added, removed) = trace_delta(&base_blocks, &head_blocks);
+
+    println!(
+        "cargo-structure-diff trace (observational): {} base trace(s), {} head trace(s), {} added, {} removed vs {base}",
+        base_blocks.len(),
+        head_blocks.len(),
+        added.len(),
+        removed.len(),
+    );
+    for block in &added {
+        println!("\n+ added trace:\n{block}");
+    }
+    for block in &removed {
+        println!("\n- removed trace:\n{block}");
+    }
+    Ok(0)
+}
+
+/// Run `cmd` in the base worktree and in `repo` (head), returning the normalized sequence blocks
+/// observed on each side. The base worktree is always cleaned up. Testable without touching cwd.
+fn observe_traces(repo: &Path, base: &str, cmd: &str) -> Result<(Vec<String>, Vec<String>)> {
+    let base_out = trace_base(repo, base, cmd)?;
+    let head_out = run_shell(repo, cmd)
+        .with_context(|| format!("failed to run trace command {cmd:?} in head"))?;
+    Ok((
+        extract_mermaid_sequences(&base_out),
+        extract_mermaid_sequences(&head_out),
+    ))
+}
+
+/// Run `cmd` in a throwaway detached worktree at `base`, always removing the worktree afterward.
+fn trace_base(repo: &Path, base: &str, cmd: &str) -> Result<String> {
+    let worktree = worktree_path(base);
+    git(
+        repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            &worktree.to_string_lossy(),
+            base,
+        ],
+    )
+    .with_context(|| format!("failed to add base worktree for {base:?}"))?;
+    let result = run_shell(&worktree, cmd)
+        .with_context(|| format!("failed to run trace command {cmd:?} in {base:?}"));
+    cleanup(repo, &worktree);
+    result
+}
+
+/// Run a shell command via `sh -c <cmd>` in `dir` and return its stdout. Errors only if the
+/// process cannot be spawned; a non-zero exit still yields whatever was printed.
+fn run_shell(dir: &Path, cmd: &str) -> Result<String> {
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(dir)
+        .output()
+        .with_context(|| format!("failed to spawn shell for {cmd:?} in {}", dir.display()))?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Extract fenced ```mermaid blocks whose body is a `sequenceDiagram`, normalized (each line and
+/// the block trailing-trimmed). Non-mermaid fences and other Mermaid kinds (flowchart, etc.) are
+/// ignored, and set semantics are the caller's job.
+pub fn extract_mermaid_sequences(stdout: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut lines = stdout.lines();
+    while let Some(line) = lines.next() {
+        let info = line.trim_start();
+        if info.strip_prefix("```").map(str::trim) != Some("mermaid") {
+            continue;
+        }
+        let mut body = Vec::new();
+        for inner in lines.by_ref() {
+            if inner.trim_start().starts_with("```") {
+                break;
+            }
+            body.push(inner.trim_end());
+        }
+        // First non-empty body line decides the diagram kind.
+        let is_sequence = body
+            .iter()
+            .find(|l| !l.trim().is_empty())
+            .is_some_and(|l| l.trim_start().starts_with("sequenceDiagram"));
+        if is_sequence {
+            blocks.push(body.join("\n").trim_end().to_string());
+        }
+    }
+    blocks
+}
+
+/// Set diff of normalized trace blocks: those in head but not base (added) and in base but not head
+/// (removed). Order follows each input; duplicates within a side are preserved by that side's list.
+pub fn trace_delta(base_blocks: &[String], head_blocks: &[String]) -> (Vec<String>, Vec<String>) {
+    let added = head_blocks
+        .iter()
+        .filter(|b| !base_blocks.contains(b))
+        .cloned()
+        .collect();
+    let removed = base_blocks
+        .iter()
+        .filter(|b| !head_blocks.contains(b))
+        .cloned()
+        .collect();
+    (added, removed)
 }
 
 /// The repo root of the current working directory (`git rev-parse --show-toplevel`).
@@ -670,6 +820,110 @@ deny = [\"layering\", \"cycles\"]
         assert!(
             parse_args(&["bogus".to_string()]).is_err(),
             "unknown arg is an error"
+        );
+    }
+
+    #[test]
+    fn parse_trace_defaults_and_flags() {
+        assert_eq!(
+            parse_args(&["trace".to_string()]).unwrap(),
+            Cmd::Trace {
+                base: "main".to_string(),
+                cmd: "cargo test".to_string(),
+            }
+        );
+        let cmd = parse_args(&[
+            "trace".into(),
+            "--base".into(),
+            "dev".into(),
+            "--cmd".into(),
+            "echo hi".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            cmd,
+            Cmd::Trace {
+                base: "dev".to_string(),
+                cmd: "echo hi".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn extract_only_sequence_mermaid_blocks() {
+        let stdout = "\
+noise before
+```mermaid
+sequenceDiagram
+    A->>B: hello
+```
+some prose
+```rust
+fn not_mermaid() {}
+```
+```mermaid
+flowchart TD
+    A --> B
+```
+trailing noise
+";
+        let blocks = extract_mermaid_sequences(stdout);
+        assert_eq!(
+            blocks,
+            vec!["sequenceDiagram\n    A->>B: hello".to_string()],
+            "only the sequenceDiagram mermaid block is extracted"
+        );
+    }
+
+    #[test]
+    fn trace_delta_added_removed_unchanged() {
+        let base = vec!["shared".to_string(), "gone".to_string()];
+        let head = vec!["shared".to_string(), "fresh".to_string()];
+        let (added, removed) = trace_delta(&base, &head);
+        assert_eq!(added, vec!["fresh".to_string()], "head-only is added");
+        assert_eq!(removed, vec!["gone".to_string()], "base-only is removed");
+
+        // An identical set has no delta.
+        let (a, r) = trace_delta(&base, &base);
+        assert!(a.is_empty() && r.is_empty(), "unchanged sets have no delta");
+    }
+
+    /// Integration test for the worktree materialization, shell capture, and cleanup guarantee.
+    /// The trace command cats a committed file, which differs between base and head, so head gains
+    /// one trace and loses another. `sh` and `git` are always available in the sandbox.
+    #[test]
+    fn observe_traces_diffs_committed_traces_and_cleans_up() {
+        let repo = TmpRepo::new("trace");
+        let dir = &repo.path;
+        git_ok(dir, &["-c", "init.defaultBranch=main", "init", "-q"]);
+        write(
+            dir,
+            "trace.md",
+            "```mermaid\nsequenceDiagram\n    A->>B: base\n```\n",
+        );
+        git_ok(dir, &["add", "-A"]);
+        git_ok(dir, &["commit", "-q", "-m", "base"]);
+        // Head changes the emitted trace body.
+        write(
+            dir,
+            "trace.md",
+            "```mermaid\nsequenceDiagram\n    A->>B: head\n```\n",
+        );
+
+        let (base_blocks, head_blocks) = observe_traces(dir, "main", "cat trace.md").unwrap();
+        let (added, removed) = trace_delta(&base_blocks, &head_blocks);
+        assert_eq!(added, vec!["sequenceDiagram\n    A->>B: head".to_string()]);
+        assert_eq!(
+            removed,
+            vec!["sequenceDiagram\n    A->>B: base".to_string()]
+        );
+
+        // No worktree leaked past observe_traces.
+        let list = git(dir, &["worktree", "list"]).unwrap();
+        assert_eq!(
+            list.lines().count(),
+            1,
+            "only main worktree remains:\n{list}"
         );
     }
 }
