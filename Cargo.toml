@@ -8,7 +8,7 @@ edition = "2021"
 rust-version = "1.82"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/0xheartcode/cargo-structure-diff"
-authors = ["0xheartcode <salaryman75@gmail.com>"]
+authors = ["0xheartcode <0xheartcode@gmail.com>"]
 
 [workspace.dependencies]
 # shared internal crates
