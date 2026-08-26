@@ -18,7 +18,7 @@ use csd_config::Config;
 use csd_diff::{diff, DiffOptions, FileRename};
 use csd_ir::{Change, EdgeKind, Graph, StableId};
 use csd_lint::{has_denials, lint, Finding, Severity};
-use csd_render::{render_call_view, render_module_view, render_state_view, render_type_view};
+use csd_render::{render, Format, RenderOpts, View};
 
 /// Default base ref when `--base` is omitted.
 const DEFAULT_BASE: &str = "main";
@@ -31,13 +31,17 @@ const HELP: &str = "\
 cargo-structure-diff: structural diff and architectural lint gate
 
 USAGE:
-    csd diff [--base <ref>] [--show]
+    csd diff [--base <ref>] [--show] [--full] [--scope <glob>]... [--format <fmt>]
     csd trace [--base <ref>] [--cmd <shell command>]
     cargo structure-diff diff [--base <ref>] [--show]
 
 OPTIONS:
     --base <ref>    Base git ref to diff against (default: main)
     --show          diff: print every rendered view even when nothing denies
+    --full          diff: render the whole graph, not just the pruned delta
+    --scope <glob>  diff: only render nodes whose source path matches <glob>
+                    (repeatable; crossing edges show an external stub)
+    --format <fmt>  diff: diagram syntax, one of mermaid|dot|ascii (default: mermaid)
     --cmd <cmd>     trace: shell command that emits Mermaid (default: cargo test)
     -h, --help      Print this help
 
@@ -57,6 +61,12 @@ pub enum Cmd {
         base: String,
         /// Print every rendered view even when nothing denies (for interactive use).
         show: bool,
+        /// Render the whole graph, not just the pruned delta.
+        full: bool,
+        /// Path globs; only nodes whose source path matches render (empty means all).
+        scope: Vec<String>,
+        /// Diagram output syntax.
+        format: Format,
     },
     /// Run a trace command in base and head, then diff the observed Mermaid traces.
     Trace {
@@ -140,6 +150,9 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
     let mut base = DEFAULT_BASE.to_string();
     let mut cmd = DEFAULT_TRACE_CMD.to_string();
     let mut show = false;
+    let mut full = false;
+    let mut scope: Vec<String> = Vec::new();
+    let mut format = Format::default();
     let mut sub: Option<&str> = None;
     let mut i = 0;
     while i < args.len() {
@@ -147,6 +160,7 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
         match arg {
             "-h" | "--help" => return Ok(Cmd::Help),
             "--show" => show = true,
+            "--full" => full = true,
             "diff" | "trace" if sub.is_none() => sub = Some(arg),
             "--base" => {
                 i += 1;
@@ -155,6 +169,22 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
             }
             _ if arg.starts_with("--base=") => {
                 base = arg["--base=".len()..].to_string();
+            }
+            "--scope" => {
+                i += 1;
+                let value = args.get(i).context("--scope requires a value")?;
+                scope.push(value.clone());
+            }
+            _ if arg.starts_with("--scope=") => {
+                scope.push(arg["--scope=".len()..].to_string());
+            }
+            "--format" => {
+                i += 1;
+                let value = args.get(i).context("--format requires a value")?;
+                format = parse_format(value)?;
+            }
+            _ if arg.starts_with("--format=") => {
+                format = parse_format(&arg["--format=".len()..])?;
             }
             "--cmd" => {
                 i += 1;
@@ -170,8 +200,24 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
     }
     match sub {
         Some("trace") => Ok(Cmd::Trace { base, cmd }),
-        Some(_) => Ok(Cmd::Diff { base, show }),
+        Some(_) => Ok(Cmd::Diff {
+            base,
+            show,
+            full,
+            scope,
+            format,
+        }),
         None => bail!("expected the `diff` or `trace` subcommand; try --help"),
+    }
+}
+
+/// Parse a `--format` value into a [`Format`], erroring on an unknown syntax.
+fn parse_format(value: &str) -> Result<Format> {
+    match value {
+        "mermaid" => Ok(Format::Mermaid),
+        "dot" => Ok(Format::Dot),
+        "ascii" => Ok(Format::Ascii),
+        other => bail!("unknown --format {other:?}; expected mermaid, dot, or ascii"),
     }
 }
 
@@ -190,13 +236,27 @@ pub fn run(args: &[String]) -> i32 {
             print!("{HELP}");
             0
         }
-        Cmd::Diff { base, show } => match run_diff(&base, show) {
-            Ok(code) => code,
-            Err(e) => {
-                eprintln!("error: {e:#}");
-                2
+        Cmd::Diff {
+            base,
+            show,
+            full,
+            scope,
+            format,
+        } => {
+            let opts = RenderOpts {
+                full,
+                scope,
+                entry: None,
+                format,
+            };
+            match run_diff(&base, show, &opts) {
+                Ok(code) => code,
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    2
+                }
             }
-        },
+        }
         Cmd::Trace { base, cmd } => match run_trace(&base, &cmd) {
             Ok(code) => code,
             Err(e) => {
@@ -208,10 +268,10 @@ pub fn run(args: &[String]) -> i32 {
 }
 
 /// Resolve the repo root, load config, run the pipeline, and print the report.
-fn run_diff(base: &str, show: bool) -> Result<i32> {
+fn run_diff(base: &str, show: bool, opts: &RenderOpts) -> Result<i32> {
     let repo = repo_root()?;
     let config = load_config(&repo)?;
-    let report = analyze(&repo, base, &config)?;
+    let report = analyze(&repo, base, &config, opts)?;
     report.print(base, show);
     Ok(report.exit_code())
 }
@@ -353,10 +413,13 @@ fn load_config(repo: &Path) -> Result<Config> {
 ///
 /// The base ref is materialized in a throwaway detached worktree that is always removed, even on
 /// error. Head is the working tree as-is. This is testable without changing the process cwd.
-pub fn analyze(repo: &Path, base: &str, config: &Config) -> Result<Report> {
+pub fn analyze(repo: &Path, base: &str, config: &Config, opts: &RenderOpts) -> Result<Report> {
     let base_graph = base_graph(repo, base)?;
-    let head_graph =
+    let mut head_graph =
         csd_extract_rs::extract(repo).context("failed to extract head working tree")?;
+    let head_schema =
+        csd_extract_db::extract_schema(repo).context("failed to extract head schema")?;
+    merge_schema(&mut head_graph, head_schema);
     let file_renames = file_renames(repo, base)?;
     let changes = diff(
         &base_graph,
@@ -367,7 +430,7 @@ pub fn analyze(repo: &Path, base: &str, config: &Config) -> Result<Report> {
         },
     );
     let findings = lint(&head_graph, &changes, config);
-    let diagrams = render_views(&head_graph, &changes, config);
+    let diagrams = render_views(&head_graph, &changes, config, opts);
     Ok(Report {
         changes,
         findings,
@@ -375,24 +438,50 @@ pub fn analyze(repo: &Path, base: &str, config: &Config) -> Result<Report> {
     })
 }
 
+/// Merge a schema-view graph's `Table` nodes and `ForeignKey` edges into `graph`, then renormalize
+/// so ordering stays byte-stable. A schema-less repo yields an empty graph, so this is a no-op.
+fn merge_schema(graph: &mut Graph, schema: Graph) {
+    graph.nodes.extend(schema.nodes);
+    graph.edges.extend(schema.edges);
+    graph.normalize();
+}
+
 /// Render one diagram per enabled view. Defaults to the module view when `views.enabled` is empty;
 /// unknown view names are ignored. The state lints run via [`lint`] independent of this.
-fn render_views(head: &Graph, changes: &[Change], config: &Config) -> Vec<ViewDiagram> {
+fn render_views(
+    head: &Graph,
+    changes: &[Change],
+    config: &Config,
+    opts: &RenderOpts,
+) -> Vec<ViewDiagram> {
     let enabled: Vec<String> = if config.views.enabled.is_empty() {
         vec!["modules".to_string()]
     } else {
         config.views.enabled.clone()
     };
     let mut diagrams = Vec::new();
-    for view in enabled {
-        let mermaid = match view.as_str() {
-            "modules" => render_module_view(head, changes),
-            "states" => render_state_view(head, changes),
-            "types" => render_type_view(head, changes),
-            "calls" => render_call_view(head, changes, &call_entry(head, config)),
+    for name in enabled {
+        let view = match name.as_str() {
+            "modules" => View::Modules,
+            "states" => View::States,
+            "types" => View::Types,
+            "calls" => View::Calls,
+            "callgraph" => View::CallGraph,
+            "schema" => View::Schema,
             _ => continue,
         };
-        diagrams.push(ViewDiagram { view, mermaid });
+        // Thread the CLI opts through; the entry (calls view only) always comes from config.
+        let view_opts = RenderOpts {
+            full: opts.full,
+            scope: opts.scope.clone(),
+            entry: Some(call_entry(head, config)),
+            format: opts.format,
+        };
+        let mermaid = render(view, head, changes, &view_opts);
+        diagrams.push(ViewDiagram {
+            view: name,
+            mermaid,
+        });
     }
     diagrams
 }
@@ -430,8 +519,16 @@ fn base_graph(repo: &Path, base: &str) -> Result<Graph> {
         ],
     )
     .with_context(|| format!("failed to add base worktree for {base:?}"))?;
-    let result =
-        csd_extract_rs::extract(&worktree).with_context(|| format!("failed to extract {base:?}"));
+    // Extract the module graph and the schema graph from the one base worktree, then merge, so the
+    // schema view and the destructive_migration lint see both sides of the delta.
+    let result = (|| {
+        let mut graph = csd_extract_rs::extract(&worktree)
+            .with_context(|| format!("failed to extract {base:?}"))?;
+        let schema = csd_extract_db::extract_schema(&worktree)
+            .with_context(|| format!("failed to extract {base:?} schema"))?;
+        merge_schema(&mut graph, schema);
+        Ok(graph)
+    })();
     cleanup(repo, &worktree);
     result
 }
@@ -588,7 +685,7 @@ deny = [\"layering\", \"cycles\"]
         );
 
         let config = Config::load(&dir.join(".csd.toml")).unwrap();
-        let report = analyze(dir, "main", &config).unwrap();
+        let report = analyze(dir, "main", &config, &RenderOpts::default()).unwrap();
 
         assert_eq!(report.exit_code(), 1, "a denied finding must exit 1");
         assert!(
@@ -631,7 +728,7 @@ deny = [\"layering\", \"cycles\"]
         );
 
         let config = Config::load(&dir.join(".csd.toml")).unwrap();
-        let report = analyze(dir, "main", &config).unwrap();
+        let report = analyze(dir, "main", &config, &RenderOpts::default()).unwrap();
 
         assert_eq!(report.exit_code(), 0, "no denial must exit 0");
         assert!(
@@ -692,7 +789,7 @@ deny = [\"layering\", \"cycles\"]
         );
 
         let config = Config::load(&dir.join(".csd.toml")).unwrap();
-        let report = analyze(dir, "main", &config).unwrap();
+        let report = analyze(dir, "main", &config, &RenderOpts::default()).unwrap();
 
         assert_eq!(report.exit_code(), 1, "a new state cycle must exit 1");
         assert!(
@@ -725,7 +822,7 @@ deny = [\"layering\", \"cycles\"]
         write(dir, "src/lib.rs", "pub struct A;\npub struct B;\n");
 
         let config = Config::load(&dir.join(".csd.toml")).unwrap();
-        let report = analyze(dir, "main", &config).unwrap();
+        let report = analyze(dir, "main", &config, &RenderOpts::default()).unwrap();
 
         assert_eq!(report.exit_code(), 0, "no lints denied, so exit 0");
         let types = report
@@ -770,7 +867,7 @@ deny = [\"layering\", \"cycles\"]
         );
 
         let config = Config::load(&dir.join(".csd.toml")).unwrap();
-        let report = analyze(dir, "main", &config).unwrap();
+        let report = analyze(dir, "main", &config, &RenderOpts::default()).unwrap();
 
         assert_eq!(report.exit_code(), 0, "no lints denied, so exit 0");
         let calls = report
@@ -790,6 +887,218 @@ deny = [\"layering\", \"cycles\"]
         );
     }
 
+    /// A repo enabling every view, with a head that adds a module so the DAG views have content.
+    fn all_views_repo(tag: &str) -> TmpRepo {
+        let repo = TmpRepo::new(tag);
+        let dir = &repo.path;
+        git_ok(dir, &["-c", "init.defaultBranch=main", "init", "-q"]);
+        write(
+            dir,
+            ".csd.toml",
+            "[views]\nenabled = [\"modules\", \"states\", \"types\", \"calls\", \"callgraph\", \"schema\"]\n",
+        );
+        write(dir, "src/lib.rs", "pub mod a;\n");
+        write(dir, "src/a.rs", "pub fn helper() {}\n");
+        git_ok(dir, &["add", "-A"]);
+        git_ok(dir, &["commit", "-q", "-m", "base"]);
+        // Head adds a second module, so the module/call-graph views have an added node to draw.
+        write(dir, "src/lib.rs", "pub mod a;\npub mod b;\n");
+        write(dir, "src/b.rs", "pub fn other() {}\n");
+        repo
+    }
+
+    #[test]
+    fn dot_format_emits_a_digraph() {
+        let repo = all_views_repo("dot");
+        let dir = &repo.path;
+        let config = Config::load(&dir.join(".csd.toml")).unwrap();
+        let opts = RenderOpts {
+            format: Format::Dot,
+            ..RenderOpts::default()
+        };
+        let report = analyze(dir, "main", &config, &opts).unwrap();
+
+        let modules = report
+            .diagrams
+            .iter()
+            .find(|d| d.view == "modules")
+            .expect("the modules view is enabled");
+        assert!(
+            modules.mermaid.contains("digraph {"),
+            "dot output must be a digraph:\n{}",
+            modules.mermaid
+        );
+        assert!(
+            !modules.mermaid.contains("flowchart"),
+            "dot output must not be Mermaid:\n{}",
+            modules.mermaid
+        );
+    }
+
+    #[test]
+    fn ascii_format_emits_tree_text() {
+        let repo = all_views_repo("ascii");
+        let dir = &repo.path;
+        let config = Config::load(&dir.join(".csd.toml")).unwrap();
+        let opts = RenderOpts {
+            format: Format::Ascii,
+            ..RenderOpts::default()
+        };
+        let report = analyze(dir, "main", &config, &opts).unwrap();
+
+        let modules = report
+            .diagrams
+            .iter()
+            .find(|d| d.view == "modules")
+            .expect("the modules view is enabled");
+        // The added module is drawn as a `+`-marked tree node, not a Mermaid or DOT header.
+        assert!(
+            modules.mermaid.contains('+') && !modules.mermaid.contains("no structural changes"),
+            "ascii tree with the added module expected:\n{}",
+            modules.mermaid
+        );
+        assert!(
+            !modules.mermaid.contains("flowchart") && !modules.mermaid.contains("digraph"),
+            "ascii output must be neither Mermaid nor DOT:\n{}",
+            modules.mermaid
+        );
+    }
+
+    #[test]
+    fn parse_reads_full_scope_and_format() {
+        let cmd = parse_args(&[
+            "diff".into(),
+            "--full".into(),
+            "--scope".into(),
+            "src/a/**".into(),
+            "--scope=src/b/**".into(),
+            "--format".into(),
+            "dot".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            cmd,
+            Cmd::Diff {
+                base: "main".to_string(),
+                show: false,
+                full: true,
+                scope: vec!["src/a/**".to_string(), "src/b/**".to_string()],
+                format: Format::Dot,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_unknown_format_errors() {
+        assert!(
+            parse_args(&["diff".into(), "--format".into(), "bogus".into()]).is_err(),
+            "an unknown --format value is a parse error"
+        );
+        // The unknown value is a usage error, so `run` maps it to exit 2 before touching a repo.
+        assert_eq!(
+            run(&[
+                "diff".to_string(),
+                "--format".to_string(),
+                "bogus".to_string()
+            ]),
+            2
+        );
+    }
+
+    #[test]
+    fn scope_narrows_the_rendered_output() {
+        let repo = all_views_repo("scope");
+        let dir = &repo.path;
+        let config = Config::load(&dir.join(".csd.toml")).unwrap();
+
+        // Unscoped: the added module `b` renders in the module view.
+        let unscoped = analyze(dir, "main", &config, &RenderOpts::default()).unwrap();
+        let unscoped_modules = &unscoped
+            .diagrams
+            .iter()
+            .find(|d| d.view == "modules")
+            .unwrap()
+            .mermaid;
+        assert!(
+            unscoped_modules.contains("crate::b"),
+            "the added module should render unscoped:\n{unscoped_modules}"
+        );
+
+        // Scoped to `src/a/**`: the added module `b` (in src/b.rs) is filtered out.
+        let opts = RenderOpts {
+            scope: vec!["src/a.rs".to_string()],
+            ..RenderOpts::default()
+        };
+        let scoped = analyze(dir, "main", &config, &opts).unwrap();
+        let scoped_modules = &scoped
+            .diagrams
+            .iter()
+            .find(|d| d.view == "modules")
+            .unwrap()
+            .mermaid;
+        assert!(
+            !scoped_modules.contains("crate::b"),
+            "the out-of-scope module must not render:\n{scoped_modules}"
+        );
+    }
+
+    /// A repo whose config enables the schema view and denies destructive migrations, with a base
+    /// Diesel `schema.rs` whose head drops a column.
+    fn schema_repo(tag: &str) -> TmpRepo {
+        let repo = TmpRepo::new(tag);
+        let dir = &repo.path;
+        git_ok(dir, &["-c", "init.defaultBranch=main", "init", "-q"]);
+        write(
+            dir,
+            ".csd.toml",
+            "[views]\nenabled = [\"schema\"]\n\n[lint]\ndeny = [\"destructive_migration\"]\n",
+        );
+        write(dir, "src/lib.rs", "pub fn placeholder() {}\n");
+        write(
+            dir,
+            "src/schema.rs",
+            "table! {\n    users (id) {\n        id -> Int4,\n        name -> Varchar,\n    }\n}\n",
+        );
+        git_ok(dir, &["add", "-A"]);
+        git_ok(dir, &["commit", "-q", "-m", "base"]);
+        repo
+    }
+
+    #[test]
+    fn schema_view_renders_and_dropped_column_denies() {
+        let repo = schema_repo("schema");
+        let dir = &repo.path;
+        // Head drops the `name` column: a destructive migration.
+        write(
+            dir,
+            "src/schema.rs",
+            "table! {\n    users (id) {\n        id -> Int4,\n    }\n}\n",
+        );
+
+        let config = Config::load(&dir.join(".csd.toml")).unwrap();
+        let report = analyze(dir, "main", &config, &RenderOpts::default()).unwrap();
+
+        assert_eq!(report.exit_code(), 1, "a dropped column must exit 1");
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule == "destructive_migration" && f.message.contains("users.name")),
+            "expected a destructive_migration finding, got {:?}",
+            report.findings
+        );
+        let schema = report
+            .diagrams
+            .iter()
+            .find(|d| d.view == "schema")
+            .expect("the schema view is enabled");
+        assert!(
+            schema.mermaid.contains("erDiagram"),
+            "an erDiagram is expected:\n{}",
+            schema.mermaid
+        );
+    }
+
     #[test]
     fn parse_defaults_base_to_main() {
         let cmd = parse_args(&["diff".to_string()]).unwrap();
@@ -798,6 +1107,9 @@ deny = [\"layering\", \"cycles\"]
             Cmd::Diff {
                 base: "main".to_string(),
                 show: false,
+                full: false,
+                scope: Vec::new(),
+                format: Format::Mermaid,
             }
         );
     }
@@ -809,6 +1121,9 @@ deny = [\"layering\", \"cycles\"]
         let want = Cmd::Diff {
             base: "dev".to_string(),
             show: false,
+            full: false,
+            scope: Vec::new(),
+            format: Format::Mermaid,
         };
         assert_eq!(split, want);
         assert_eq!(joined, want);
@@ -822,6 +1137,9 @@ deny = [\"layering\", \"cycles\"]
             Cmd::Diff {
                 base: "main".to_string(),
                 show: true,
+                full: false,
+                scope: Vec::new(),
+                format: Format::Mermaid,
             }
         );
     }

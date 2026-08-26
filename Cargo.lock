@@ -30,6 +30,7 @@ dependencies = [
  "anyhow",
  "csd-config",
  "csd-diff",
+ "csd-extract-db",
  "csd-extract-rs",
  "csd-ir",
  "csd-lint",
