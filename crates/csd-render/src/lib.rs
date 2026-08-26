@@ -1,13 +1,15 @@
 //! Render a graph and its delta as one annotated Mermaid diagram.
 //!
-//! Six views live here: [`render_module_view`] (a `flowchart` over `Module` nodes and `Uses`
+//! Seven views live here: [`render_module_view`] (a `flowchart` over `Module` nodes and `Uses`
 //! edges), [`render_state_view`] (a `stateDiagram-v2` over `Variant` nodes and `Transitions`
 //! edges, SPEC.md 3.4), [`render_type_view`] (a `classDiagram` over `Struct`/`Enum`/`Trait`
 //! nodes with `Implements`/`Associates` relations plus their methods as members, SPEC.md 3.2),
 //! [`render_call_view`] (a `sequenceDiagram` slice from an entry `Fn` over `Calls` edges,
 //! SPEC.md 3.3), the global call-graph `flowchart` ([`View::CallGraph`], one box per `Fn`,
 //! grouped into per-owner subgraphs) and the schema `erDiagram` ([`View::Schema`], over
-//! `Table` nodes and `ForeignKey` edges, SPEC.md 3.5). All follow the project convention
+//! `Table` nodes and `ForeignKey` edges, SPEC.md 3.5) and the combined schema `flowchart`
+//! ([`View::Overview`], modules as subgraphs holding their items with every edge kind). All follow
+//! the project convention
 //! (SPEC.md section 4): the delta is
 //! colour-encoded onto a single drawing rather than diffing two images (green added, red-dashed
 //! removed, amber changed, gray unchanged context) and the graph is pruned to changed nodes, the
@@ -57,6 +59,10 @@ pub enum View {
     CallGraph,
     /// Schema `erDiagram` (see [`schema_view`]) over `Table` nodes and `ForeignKey` edges.
     Schema,
+    /// Combined "code schema" `flowchart` (see [`overview_view`]): one subgraph per `Module`
+    /// holding its `Struct`/`Enum`/`Trait`/`Fn` items, with every non-module edge kind
+    /// (`Implements`/`Associates`/`Calls`) drawn among the items and `Uses` between the subgraphs.
+    Overview,
 }
 
 /// Which output syntax [`render`] emits.
@@ -106,6 +112,7 @@ pub fn render(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -
             View::Calls => call_view(head, changes, opts),
             View::CallGraph => call_graph_view(head, changes, opts),
             View::Schema => schema_view(head, changes, opts),
+            View::Overview => overview_view(head, changes, opts),
         },
         Format::Dot => dot_view(view, head, changes, opts),
         Format::Ascii => ascii_view(view, head, changes, opts),
@@ -1328,6 +1335,198 @@ fn schema_view(head: &Graph, changes: &[Change], opts: &RenderOpts) -> String {
     out
 }
 
+/// Render the combined overview ("code schema") of `head` with `changes` colour-encoded, as a
+/// Mermaid `flowchart LR` (issue view-overview: the SchemaSpy/drawDB analogue for code).
+///
+/// One diagram for the whole structure. Every `Struct`/`Enum`/`Trait`/`Fn` item is a node, grouped
+/// into one `subgraph` per owning module (owner = id minus its last `::segment`), and every
+/// non-module edge kind is drawn together among the items: `Implements`, `Associates` and `Calls`,
+/// each disambiguated by a short edge label (`impl`/`assoc`/`calls`). Module-level `Uses` edges are
+/// drawn between the subgraphs that are rendered (label `uses`). `flowchart` has no realization
+/// arrow (`..|>` is `classDiagram`-only), so relations are told apart by their label, not arrow
+/// glyph. Types render as rectangles, fns as rounded boxes, so the two item kinds read apart.
+///
+/// Delta colouring is identical in meaning to the other views: nodes via [`classify_nodes`]
+/// (added green, removed red-dashed, changed amber/`Moved` amber, context gray) and edges via
+/// [`collect_edges`], with the same arrow/marker convention as [`module_view`] (`-->|... +|` added,
+/// `-.->|... -|` removed). Removed items and removed edges are recovered from `changes`. `flowchart`
+/// cannot colour a subgraph box, so a module whose `Module` node is entirely added/removed is marked
+/// with a ` (added)`/` (removed)` title suffix. `full`/`scope` compose through the shared [`select`]
+/// machinery (2-hop neighbourhood by default); scope is the primary comprehension use case.
+///
+/// Empty case: the header plus `%% no structural changes in the overview` (or `%% empty overview`
+/// for `full` on an empty graph).
+fn overview_view(head: &Graph, changes: &[Change], opts: &RenderOpts) -> String {
+    // Item nodes: Struct/Enum/Trait/Fn.
+    let mut items = collect_nodes(head, changes, NodeKind::Struct);
+    items.extend(collect_nodes(head, changes, NodeKind::Enum));
+    items.extend(collect_nodes(head, changes, NodeKind::Trait));
+    items.extend(collect_nodes(head, changes, NodeKind::Fn));
+    let node_class = classify_nodes(&items, changes);
+
+    // All item-level edge kinds together, tagged with their kind.
+    let mut kinded: Vec<(&StableId, &StableId, EdgeKind, Class)> = Vec::new();
+    for (from, to, class) in collect_edges(head, changes, &items, EdgeKind::Implements) {
+        kinded.push((from, to, EdgeKind::Implements, class));
+    }
+    for (from, to, class) in collect_edges(head, changes, &items, EdgeKind::Associates) {
+        kinded.push((from, to, EdgeKind::Associates, class));
+    }
+    for (from, to, class) in collect_edges(head, changes, &items, EdgeKind::Calls) {
+        kinded.push((from, to, EdgeKind::Calls, class));
+    }
+    kinded.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+
+    // Prune over the union of item edges (kind dropped), then honour `full`/`scope`.
+    let prune_edges: Vec<(&StableId, &StableId, Class)> =
+        kinded.iter().map(|(f, t, _, c)| (*f, *t, *c)).collect();
+    let files = file_index(head, changes);
+    let patterns = compile_scope(&opts.scope);
+    let sel = select(
+        &items,
+        &node_class,
+        &prune_edges,
+        &files,
+        &patterns,
+        opts.full,
+        CONTEXT_HOPS,
+    );
+
+    let mut out = String::from("flowchart LR\n");
+    out.push_str(CLASS_DEFS);
+    out.push('\n');
+
+    if sel.render_ids.is_empty() {
+        if opts.full {
+            out.push_str("    %% empty overview\n");
+        } else {
+            out.push_str("    %% no structural changes in the overview\n");
+        }
+        return out;
+    }
+
+    // Stable n<i> handles in id order.
+    let handles: BTreeMap<&StableId, String> = sel
+        .render_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, format!("n{i}")))
+        .collect();
+
+    // Node kind per id (chooses the shape), including items the delta removed.
+    let mut kind_of: BTreeMap<&StableId, NodeKind> =
+        head.nodes.iter().map(|n| (&n.id, n.kind)).collect();
+    for c in changes {
+        if let Change::Removed(n) = c {
+            kind_of.entry(&n.id).or_insert(n.kind);
+        }
+    }
+
+    // Module delta class, so an entirely added/removed module box can be marked in its title.
+    let modules = collect_nodes(head, changes, NodeKind::Module);
+    let module_class = classify_nodes(&modules, changes);
+    let module_class_by_id: BTreeMap<&str, Class> =
+        module_class.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+
+    // Group rendered items into one subgraph per owning module (sorted). render_ids is already
+    // sorted, so items within a subgraph stay in id order.
+    let mut by_owner: BTreeMap<&str, Vec<&StableId>> = BTreeMap::new();
+    for id in &sel.render_ids {
+        by_owner
+            .entry(call_owner(id.as_str()))
+            .or_default()
+            .push(id);
+    }
+    // Owner -> its subgraph handle, for linking Uses edges between subgraphs.
+    let sg_handle: BTreeMap<&str, String> = by_owner
+        .keys()
+        .enumerate()
+        .map(|(i, owner)| (*owner, format!("sg{i}")))
+        .collect();
+
+    for (owner, ids) in &by_owner {
+        let suffix = match module_class_by_id.get(owner) {
+            Some(Class::Added) => " (added)",
+            Some(Class::Removed) => " (removed)",
+            _ => "",
+        };
+        let _ = writeln!(
+            out,
+            "    subgraph {}[\"{}{}\"]",
+            sg_handle[owner], owner, suffix
+        );
+        for id in ids {
+            let is_stub = sel.stubs.contains(id);
+            let class = if is_stub {
+                Class::Context
+            } else {
+                node_class.get(id).copied().unwrap_or(Class::Context)
+            };
+            let name = call_name(id.as_str());
+            let label = if is_stub {
+                format!("{name} (external)")
+            } else {
+                name.to_string()
+            };
+            // Fns render as rounded boxes, types as rectangles, so the item kinds read apart.
+            let (open, close) = match kind_of.get(id) {
+                Some(NodeKind::Fn) => ("(", ")"),
+                _ => ("[", "]"),
+            };
+            let _ = writeln!(
+                out,
+                "        {}{}\"{}\"{}:::{}",
+                handles[id],
+                open,
+                label,
+                close,
+                class.css()
+            );
+        }
+        out.push_str("    end\n");
+    }
+
+    // Item-level edges: all kinds together, disambiguated by a short label, delta-coloured with the
+    // same arrow/marker convention as the module view.
+    for (from, to, kind, class) in &kinded {
+        if !handles.contains_key(from) || !handles.contains_key(to) {
+            continue;
+        }
+        let tag = match kind {
+            EdgeKind::Implements => "impl",
+            EdgeKind::Associates => "assoc",
+            _ => "calls",
+        };
+        let (arrow, marker) = match class {
+            Class::Added => ("-->", " +"),
+            Class::Removed => ("-.->", " -"),
+            _ => ("-->", ""),
+        };
+        let _ = writeln!(
+            out,
+            "    {} {}|{}{}| {}",
+            handles[from], arrow, tag, marker, handles[to]
+        );
+    }
+
+    // Module-level Uses edges between the subgraphs that are rendered (both owners present).
+    let uses = collect_edges(head, changes, &modules, EdgeKind::Uses);
+    for (from, to, class) in &uses {
+        let (Some(sf), Some(st)) = (sg_handle.get(from.as_str()), sg_handle.get(to.as_str()))
+        else {
+            continue;
+        };
+        let (arrow, marker) = match class {
+            Class::Added => ("-->", " +"),
+            Class::Removed => ("-.->", " -"),
+            _ => ("-->", ""),
+        };
+        let _ = writeln!(out, "    {} {}|uses{}| {}", sf, arrow, marker, st);
+    }
+
+    out
+}
+
 /// A view's selected graph, shared across the alternative output formats.
 ///
 /// Bundles what an emitter needs after [`select`] has run: the per-node delta [`Class`], the drawn
@@ -1431,6 +1630,29 @@ fn select_graph<'a>(
             );
             (node_class, edges, sel)
         }
+        View::Overview => {
+            // Union of the item kinds and all non-module edge kinds; the kind tags are only needed
+            // by the Mermaid path, so the shared graph keeps the plain (from, to, class) edges.
+            let mut nodes = collect_nodes(head, changes, NodeKind::Struct);
+            nodes.extend(collect_nodes(head, changes, NodeKind::Enum));
+            nodes.extend(collect_nodes(head, changes, NodeKind::Trait));
+            nodes.extend(collect_nodes(head, changes, NodeKind::Fn));
+            let node_class = classify_nodes(&nodes, changes);
+            let mut edges = collect_edges(head, changes, &nodes, EdgeKind::Implements);
+            edges.extend(collect_edges(head, changes, &nodes, EdgeKind::Associates));
+            edges.extend(collect_edges(head, changes, &nodes, EdgeKind::Calls));
+            edges.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            let sel = select(
+                &nodes,
+                &node_class,
+                &edges,
+                &files,
+                &patterns,
+                opts.full,
+                CONTEXT_HOPS,
+            );
+            (node_class, edges, sel)
+        }
         View::Calls => return None,
     };
 
@@ -1522,7 +1744,7 @@ fn ascii_marker(class: Class) -> char {
 /// Calls (sequence) and Schema are not DAG-shaped, so they degrade to a one-line note.
 fn ascii_view(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -> String {
     match view {
-        View::States | View::Calls | View::Schema => {
+        View::States | View::Calls | View::Schema | View::Overview => {
             return String::from(
                 "%% ascii format not supported for this view; use --format mermaid\n",
             );
@@ -2669,6 +2891,183 @@ mod tests {
             "crate::b -> crate::a\n",
         );
         assert_eq!(out, expected);
+    }
+
+    /// A type node whose source path is `file`, for overview scope tests.
+    fn type_node_at(id: &str, kind: NodeKind, file: &str) -> Node {
+        let mut n = type_node(id, kind, None);
+        n.span.file = file.into();
+        n
+    }
+
+    #[test]
+    fn overview_delta_places_items_in_module_and_colours() {
+        // base: module m with struct A and fn f.
+        // head: adds struct B, removes fn f, changes A, adds a Calls edge and an Implements edge.
+        let before_a = fingerprint(&["id: u64"], &[("u64", 1)]);
+        let after_a = fingerprint(&["id: u64", "extra: u8"], &[("u64", 1), ("u8", 1)]);
+        let head = Graph {
+            nodes: vec![
+                type_node("m::A", NodeKind::Struct, Some(after_a.clone())),
+                type_node("m::B", NodeKind::Struct, None),
+                type_node("m::T", NodeKind::Trait, None),
+                fn_node("m::g"),
+                fn_node("m::h"),
+            ],
+            edges: vec![
+                relation("m::A", "m::T", EdgeKind::Implements),
+                calls("m::g", "m::h", 0),
+            ],
+        };
+        let changes = vec![
+            Change::Added(type_node("m::B", NodeKind::Struct, None)),
+            Change::Removed(fn_node("m::f")),
+            Change::Modified {
+                before: type_node("m::A", NodeKind::Struct, Some(before_a)),
+                after: type_node("m::A", NodeKind::Struct, Some(after_a)),
+            },
+            Change::EdgeAdded(relation("m::A", "m::T", EdgeKind::Implements)),
+            Change::EdgeAdded(calls("m::g", "m::h", 0)),
+        ];
+        let out = render(View::Overview, &head, &changes, &RenderOpts::default());
+        // Every item of module m lives inside the single `m` subgraph.
+        assert!(out.contains("    subgraph sg0[\"m\"]\n"), "{out}");
+        assert_eq!(
+            out.matches("subgraph ").count(),
+            1,
+            "one module box:\n{out}"
+        );
+        // Delta colours match the other views: changed amber, added green, removed red.
+        assert!(out.contains("[\"A\"]:::changed"), "A changed:\n{out}");
+        assert!(out.contains("[\"B\"]:::added"), "B added:\n{out}");
+        // f is a Fn (rounded box) recovered from the delta and coloured removed.
+        assert!(out.contains("(\"f\"):::removed"), "f removed:\n{out}");
+        // The added edges are shown, disambiguated by kind and carrying the `+` delta marker.
+        assert!(out.contains("-->|impl +|"), "added impl edge:\n{out}");
+        assert!(out.contains("-->|calls +|"), "added calls edge:\n{out}");
+    }
+
+    #[test]
+    fn overview_full_groups_all_items_by_module() {
+        // Empty delta, full=true: every item renders as context, grouped into per-module subgraphs.
+        let head = Graph {
+            nodes: vec![
+                type_node("a::S", NodeKind::Struct, None),
+                fn_node("a::f"),
+                type_node("b::T", NodeKind::Trait, None),
+            ],
+            edges: vec![relation("a::S", "b::T", EdgeKind::Implements)],
+        };
+        let out = render(
+            View::Overview,
+            &head,
+            &[],
+            &RenderOpts {
+                full: true,
+                ..RenderOpts::default()
+            },
+        );
+        let expected = concat!(
+            "flowchart LR\n",
+            "    classDef added fill:#f0fdf4,stroke:#22c55e,stroke-width:2px\n",
+            "    classDef removed fill:#fef2f2,stroke:#ef4444,stroke-width:2px,stroke-dasharray:4 4\n",
+            "    classDef changed fill:#fffbeb,stroke:#f59e0b,stroke-width:2px\n",
+            "    classDef context fill:#ffffff,stroke:#d1d5db,color:#9ca3af\n",
+            "    subgraph sg0[\"a\"]\n",
+            "        n0[\"S\"]:::context\n",
+            "        n1(\"f\"):::context\n",
+            "    end\n",
+            "    subgraph sg1[\"b\"]\n",
+            "        n2[\"T\"]:::context\n",
+            "    end\n",
+            "    n0 -->|impl| n2\n",
+        );
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn overview_scope_narrows_to_one_module_with_stub() {
+        // Scope to module a's file: a::S renders in the `a` subgraph, and the out-of-scope b::T on
+        // the crossing Implements edge collapses to an external stub in its own subgraph.
+        let head = Graph {
+            nodes: vec![
+                type_node_at("a::S", NodeKind::Struct, "src/a.rs"),
+                type_node_at("b::T", NodeKind::Trait, "src/b.rs"),
+            ],
+            edges: vec![relation("a::S", "b::T", EdgeKind::Implements)],
+        };
+        let out = render(
+            View::Overview,
+            &head,
+            &[],
+            &RenderOpts {
+                full: true,
+                scope: vec!["src/a.rs".to_string()],
+                ..RenderOpts::default()
+            },
+        );
+        assert!(out.contains("    subgraph sg0[\"a\"]\n"), "{out}");
+        assert!(out.contains("[\"S\"]:::context"), "{out}");
+        // The crossing endpoint is a collapsed external stub.
+        assert!(
+            out.contains("[\"T (external)\"]:::context"),
+            "boundary stub missing:\n{out}"
+        );
+        // The crossing edge stays visible to the stub.
+        assert!(
+            out.contains("-->|impl| n1"),
+            "crossing edge missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn overview_module_added_removed_marked_in_title() {
+        // A wholly-added module box carries an ` (added)` title suffix (flowchart cannot colour the
+        // box itself). The item inside is coloured added as usual.
+        let head = Graph {
+            nodes: vec![type_node("m::A", NodeKind::Struct, None), module("m")],
+            edges: vec![],
+        };
+        let changes = vec![
+            Change::Added(module("m")),
+            Change::Added(type_node("m::A", NodeKind::Struct, None)),
+        ];
+        let out = render(View::Overview, &head, &changes, &RenderOpts::default());
+        assert!(
+            out.contains("    subgraph sg0[\"m (added)\"]\n"),
+            "added module title missing:\n{out}"
+        );
+        assert!(out.contains("[\"A\"]:::added"), "{out}");
+    }
+
+    #[test]
+    fn overview_empty_delta_renders_no_changes() {
+        let head = Graph {
+            nodes: vec![type_node("m::A", NodeKind::Struct, None)],
+            edges: vec![],
+        };
+        let out = render(View::Overview, &head, &[], &RenderOpts::default());
+        assert!(out.starts_with("flowchart LR\n"));
+        assert!(out.contains("%% no structural changes in the overview"));
+        assert!(!out.contains(":::"));
+    }
+
+    #[test]
+    fn overview_full_empty_graph_renders_empty_note() {
+        let head = Graph {
+            nodes: vec![],
+            edges: vec![],
+        };
+        let out = render(
+            View::Overview,
+            &head,
+            &[],
+            &RenderOpts {
+                full: true,
+                ..RenderOpts::default()
+            },
+        );
+        assert!(out.contains("%% empty overview"), "{out}");
     }
 
     #[test]
