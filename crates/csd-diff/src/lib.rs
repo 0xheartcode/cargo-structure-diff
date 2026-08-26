@@ -1,29 +1,43 @@
 //! Diffing between two [`csd_ir::Graph`]s.
 //!
-//! Two layers, tracked in the backlog (area `diff`):
-//! 1. a flat set diff over nodes and edges, and
-//! 2. a rename/move matcher that rewrites `Added` + `Removed` pairs into `Moved`/`Modified` when
-//!    structural fingerprints are similar enough.
+//! A flat, identity-keyed set diff over nodes and edges, followed by two move-detection passes.
 //!
-//! This file implements both layers. Layer 2 ([`detect_renames`]) only runs when
-//! `DiffOptions::rename_threshold` is `Some`; with `None` the output is the pure set diff.
+//! [`seed_module_moves`] reconciles module `Added` + `Removed` using git's file-rename signal,
+//! since modules carry no fingerprint and the similarity matcher cannot catch them; it runs only
+//! when `DiffOptions::file_renames` is non-empty. [`detect_renames`] is the fingerprint similarity
+//! matcher for the remaining items and runs only when `DiffOptions::rename_threshold` is `Some`.
+//! With neither signal, the output is the pure set diff.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use csd_ir::{similarity, Change, Edge, EdgeKind, Graph, Node, StableId};
+use csd_ir::{similarity, Change, Edge, EdgeKind, Graph, Node, NodeKind, StableId};
+
+/// A file rename reported by git (`git diff -M --name-status`). The harness feeds these in so the
+/// differ can recover module moves precisely: modules carry no fingerprint, so the similarity
+/// matcher can never catch them on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRename {
+    /// Path on the base side.
+    pub old_path: String,
+    /// Path on the head side.
+    pub new_path: String,
+}
 
 /// Options controlling rename/move detection.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DiffOptions {
     /// Similarity in `[0.0, 1.0]` at or above which a candidate pair is accepted as a move.
-    /// `None` disables rename detection (pure set diff).
+    /// `None` disables fingerprint rename detection (pure set diff).
     pub rename_threshold: Option<f32>,
+    /// Git file renames used to seed module-level moves. Empty means no git signal is available.
+    pub file_renames: Vec<FileRename>,
 }
 
 impl Default for DiffOptions {
     fn default() -> Self {
         Self {
             rename_threshold: Some(0.7),
+            file_renames: Vec::new(),
         }
     }
 }
@@ -77,8 +91,14 @@ pub fn diff(base: &Graph, head: &Graph, opts: DiffOptions) -> Vec<Change> {
         }
     }
 
-    // Layer 2: rewrite matched Added + Removed pairs into Moved/Modified. Skipped entirely when
-    // no threshold is set, so `diff` returns exactly the pure set diff in that case.
+    // Layer 2a: use git's file-rename signal to reconcile module Added + Removed into Moved/
+    // Modified. Modules have no fingerprint, so the similarity matcher below cannot catch them.
+    if !opts.file_renames.is_empty() {
+        changes = seed_module_moves(changes, &opts.file_renames);
+    }
+
+    // Layer 2b: rewrite the remaining matched Added + Removed pairs into Moved/Modified via
+    // fingerprint similarity. Skipped when no threshold is set, so `diff` returns the pure set diff.
     if let Some(threshold) = opts.rename_threshold {
         changes = detect_renames(changes, threshold);
     }
@@ -164,6 +184,85 @@ fn detect_renames(changes: Vec<Change>, threshold: f32) -> Vec<Change> {
         if !added_taken[ai] {
             out.push(Change::Added(a));
         }
+    }
+    out
+}
+
+/// Reconcile module `Added` + `Removed` into `Moved`/`Modified` using git file renames.
+///
+/// A renamed file implies its module moved (modules correspond to files). For each rename we look
+/// for exactly one `Removed` module node on `old_path` and exactly one `Added` module node on
+/// `new_path`; more than one on either side is ambiguous (a file with inline submodules) and is
+/// left untouched, keeping precision over recall. A matched pair becomes `Moved` when the parent
+/// module differs, else `Modified`.
+fn seed_module_moves(changes: Vec<Change>, renames: &[FileRename]) -> Vec<Change> {
+    let mut removed_by_file: BTreeMap<String, Vec<Node>> = BTreeMap::new();
+    let mut added_by_file: BTreeMap<String, Vec<Node>> = BTreeMap::new();
+    let mut out: Vec<Change> = Vec::new();
+    for change in changes {
+        match change {
+            Change::Removed(n) if n.kind == NodeKind::Module => {
+                removed_by_file
+                    .entry(n.span.file.clone())
+                    .or_default()
+                    .push(n);
+            }
+            Change::Added(n) if n.kind == NodeKind::Module => {
+                added_by_file
+                    .entry(n.span.file.clone())
+                    .or_default()
+                    .push(n);
+            }
+            other => out.push(other),
+        }
+    }
+
+    let mut consumed_removed: BTreeSet<String> = BTreeSet::new();
+    let mut consumed_added: BTreeSet<String> = BTreeSet::new();
+    for rename in renames {
+        let (Some(rem), Some(add)) = (
+            removed_by_file.get(&rename.old_path),
+            added_by_file.get(&rename.new_path),
+        ) else {
+            continue;
+        };
+        if rem.len() != 1 || add.len() != 1 {
+            continue;
+        }
+        let before = &rem[0];
+        let after = &add[0];
+        if before.id == after.id {
+            continue;
+        }
+        let (from, to) = (parent(&before.id), parent(&after.id));
+        if from != to {
+            out.push(Change::Moved {
+                node: after.id.clone(),
+                from,
+                to,
+            });
+        } else {
+            out.push(Change::Modified {
+                before: before.clone(),
+                after: after.clone(),
+            });
+        }
+        consumed_removed.insert(rename.old_path.clone());
+        consumed_added.insert(rename.new_path.clone());
+    }
+
+    // Re-emit every module change the renames did not consume.
+    for (file, nodes) in removed_by_file {
+        if consumed_removed.contains(&file) {
+            continue;
+        }
+        out.extend(nodes.into_iter().map(Change::Removed));
+    }
+    for (file, nodes) in added_by_file {
+        if consumed_added.contains(&file) {
+            continue;
+        }
+        out.extend(nodes.into_iter().map(Change::Added));
     }
     out
 }
@@ -477,7 +576,103 @@ mod tests {
             &graph(vec![after.clone()], vec![]),
             DiffOptions {
                 rename_threshold: None,
+                file_renames: Vec::new(),
             },
+        );
+        assert_eq!(out, vec![Change::Added(after), Change::Removed(before)]);
+    }
+
+    fn mod_node(id: &str, file: &str) -> Node {
+        Node {
+            id: StableId::new(id),
+            kind: NodeKind::Module,
+            span: SourceSpan {
+                file: file.into(),
+                start: 0,
+                end: 1,
+            },
+            attrs: BTreeMap::new(),
+            fingerprint: None,
+        }
+    }
+
+    fn renames(pairs: &[(&str, &str)]) -> DiffOptions {
+        DiffOptions {
+            rename_threshold: Some(0.7),
+            file_renames: pairs
+                .iter()
+                .map(|(o, n)| FileRename {
+                    old_path: (*o).to_string(),
+                    new_path: (*n).to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn module_file_move_across_parents_is_moved() {
+        let base = graph(
+            vec![mod_node("crate::api::billing", "src/api/billing.rs")],
+            vec![],
+        );
+        let head = graph(
+            vec![mod_node("crate::infra::billing", "src/infra/billing.rs")],
+            vec![],
+        );
+        let out = diff(
+            &base,
+            &head,
+            renames(&[("src/api/billing.rs", "src/infra/billing.rs")]),
+        );
+        assert_eq!(
+            out,
+            vec![Change::Moved {
+                node: StableId::new("crate::infra::billing"),
+                from: StableId::new("crate::api"),
+                to: StableId::new("crate::infra"),
+            }]
+        );
+    }
+
+    #[test]
+    fn module_file_rename_same_parent_is_modified() {
+        let before = mod_node("crate::billing", "src/billing.rs");
+        let after = mod_node("crate::payments", "src/payments.rs");
+        let out = diff(
+            &graph(vec![before.clone()], vec![]),
+            &graph(vec![after.clone()], vec![]),
+            renames(&[("src/billing.rs", "src/payments.rs")]),
+        );
+        assert_eq!(out, vec![Change::Modified { before, after }]);
+    }
+
+    #[test]
+    fn ambiguous_file_with_two_modules_is_not_merged() {
+        // Two modules share src/m.rs (a file module plus an inline submodule), so the rename is
+        // ambiguous and must be left as Added + Removed rather than guessed.
+        let m = mod_node("crate::m", "src/m.rs");
+        let inner = mod_node("crate::m::inner", "src/m.rs");
+        let n = mod_node("crate::n", "src/n.rs");
+        let out = diff(
+            &graph(vec![m.clone(), inner.clone()], vec![]),
+            &graph(vec![n.clone()], vec![]),
+            renames(&[("src/m.rs", "src/n.rs")]),
+        );
+        assert_eq!(
+            out,
+            vec![Change::Added(n), Change::Removed(m), Change::Removed(inner),]
+        );
+    }
+
+    #[test]
+    fn without_git_signal_module_rename_stays_add_remove() {
+        // No file_renames and modules have no fingerprint, so nothing reconciles them.
+        let before = mod_node("crate::billing", "src/billing.rs");
+        let after = mod_node("crate::payments", "src/payments.rs");
+        let out = diff(
+            &graph(vec![before.clone()], vec![]),
+            &graph(vec![after.clone()], vec![]),
+            DiffOptions::default(),
         );
         assert_eq!(out, vec![Change::Added(after), Change::Removed(before)]);
     }
