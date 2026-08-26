@@ -1219,7 +1219,9 @@ fn attribute_kind(attr_item: TsNode, src: &[u8]) -> AttrKind {
     }
 }
 
-/// Fingerprint a `struct_item`: field names and unwrapped field types.
+/// Fingerprint a `struct_item`: field names, unwrapped field types, and per-field type signatures.
+/// `member_types` maps each named field to its unwrapped type (`total` to `Money`); tuple fields
+/// have no names, so they contribute to `field_types` only.
 fn struct_fingerprint(node: TsNode, src: &[u8], doc: &str) -> Fingerprint {
     let mut fp = base_fingerprint(doc);
     if let Some(list) = child_kind(node, "field_declaration_list") {
@@ -1228,11 +1230,15 @@ fn struct_fingerprint(node: TsNode, src: &[u8], doc: &str) -> Fingerprint {
             if field.kind() != "field_declaration" {
                 continue;
             }
-            if let Some(name) = field.child_by_field_name("name") {
-                fp.members.insert(text(name, src));
+            let name = field.child_by_field_name("name").map(|n| text(n, src));
+            if let Some(name) = &name {
+                fp.members.insert(name.clone());
             }
             if let Some(ty) = field.child_by_field_name("type") {
                 add_types(ty, src, &mut fp.field_types);
+                if let Some(name) = name {
+                    fp.member_types.insert(name, member_type_sig(ty, src));
+                }
             }
         }
     } else if let Some(list) = child_kind(node, "ordered_field_declaration_list") {
@@ -1241,7 +1247,10 @@ fn struct_fingerprint(node: TsNode, src: &[u8], doc: &str) -> Fingerprint {
     fp
 }
 
-/// Fingerprint an `enum_item`: variant names and the types in variant payloads.
+/// Fingerprint an `enum_item`: variant names, the types in variant payloads, and per-variant
+/// payload signatures. `member_types` maps each variant to the joined unwrapped types of its
+/// payload (`Closed(Money)` to `Money`, `Pending { since: u64 }` to `u64`); a unit variant maps
+/// to `""`.
 fn enum_fingerprint(node: TsNode, src: &[u8], doc: &str) -> Fingerprint {
     let mut fp = base_fingerprint(doc);
     if let Some(list) = child_kind(node, "enum_variant_list") {
@@ -1250,26 +1259,40 @@ fn enum_fingerprint(node: TsNode, src: &[u8], doc: &str) -> Fingerprint {
             if variant.kind() != "enum_variant" {
                 continue;
             }
-            if let Some(name) = child_name(variant, src) {
-                fp.members.insert(name);
+            let name = child_name(variant, src);
+            if let Some(name) = &name {
+                fp.members.insert(name.clone());
             }
+            let mut payload_types: Vec<String> = Vec::new();
             if let Some(payload) = child_kind(variant, "ordered_field_declaration_list") {
                 add_ordered_types(payload, src, &mut fp.field_types);
+                let mut vc = payload.walk();
+                for child in payload.named_children(&mut vc) {
+                    if is_type(child.kind()) {
+                        payload_types.extend(type_names(child, src));
+                    }
+                }
             } else if let Some(payload) = child_kind(variant, "field_declaration_list") {
                 let mut vc = payload.walk();
                 for field in payload.named_children(&mut vc) {
                     if let Some(ty) = field.child_by_field_name("type") {
                         add_types(ty, src, &mut fp.field_types);
+                        payload_types.extend(type_names(ty, src));
                     }
                 }
+            }
+            if let Some(name) = name {
+                fp.member_types.insert(name, payload_types.join(","));
             }
         }
     }
     fp
 }
 
-/// Fingerprint a `trait_item`: member names only. `field_types` stays empty (trait method
-/// signatures are refined with the types view, backlog M3).
+/// Fingerprint a `trait_item`: member names and a best-effort per-member signature. `field_types`
+/// stays empty (trait method signatures are refined with the types view, backlog M3).
+/// `member_types` maps a method to its unwrapped return type, a const to its type, and an
+/// associated type to `""`, so a return-type or const-type change reads as a member retype.
 fn trait_fingerprint(node: TsNode, src: &[u8], doc: &str) -> Fingerprint {
     let mut fp = base_fingerprint(doc);
     if let Some(list) = child_kind(node, "declaration_list") {
@@ -1278,7 +1301,19 @@ fn trait_fingerprint(node: TsNode, src: &[u8], doc: &str) -> Fingerprint {
             match item.kind() {
                 "function_item" | "function_signature_item" | "associated_type" | "const_item" => {
                     if let Some(name) = child_name(item, src) {
-                        fp.members.insert(name);
+                        let sig = match item.kind() {
+                            "function_item" | "function_signature_item" => item
+                                .child_by_field_name("return_type")
+                                .map(|ty| member_type_sig(ty, src))
+                                .unwrap_or_default(),
+                            "const_item" => item
+                                .child_by_field_name("type")
+                                .map(|ty| member_type_sig(ty, src))
+                                .unwrap_or_default(),
+                            _ => String::new(),
+                        };
+                        fp.members.insert(name.clone());
+                        fp.member_types.insert(name, sig);
                     }
                 }
                 _ => {}
@@ -1288,7 +1323,9 @@ fn trait_fingerprint(node: TsNode, src: &[u8], doc: &str) -> Fingerprint {
     fp
 }
 
-/// Fingerprint a `function_item`: parameter names and the parameter/return types.
+/// Fingerprint a `function_item`: parameter names, the parameter/return types, and per-parameter
+/// type signatures. `member_types` maps each named parameter to its unwrapped type; the return type
+/// is not a named member, so it feeds `field_types` only.
 fn fn_fingerprint(node: TsNode, src: &[u8], doc: &str) -> Fingerprint {
     let mut fp = base_fingerprint(doc);
     if let Some(params) = child_kind(node, "parameters") {
@@ -1297,13 +1334,17 @@ fn fn_fingerprint(node: TsNode, src: &[u8], doc: &str) -> Fingerprint {
             if param.kind() != "parameter" {
                 continue; // skip `self_parameter`, variadics
             }
-            if let Some(pat) = param.child_by_field_name("pattern") {
-                if pat.kind() == "identifier" {
-                    fp.members.insert(text(pat, src));
-                }
+            let name = param
+                .child_by_field_name("pattern")
+                .and_then(|pat| (pat.kind() == "identifier").then(|| text(pat, src)));
+            if let Some(name) = &name {
+                fp.members.insert(name.clone());
             }
             if let Some(ty) = param.child_by_field_name("type") {
                 add_types(ty, src, &mut fp.field_types);
+                if let Some(name) = name {
+                    fp.member_types.insert(name, member_type_sig(ty, src));
+                }
             }
         }
     }
@@ -1343,6 +1384,12 @@ fn type_names(node: TsNode, src: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     collect_type_names(node, src, &mut out);
     out
+}
+
+/// A single member's type signature: its unwrapped associated type names joined with `,` (usually
+/// one, e.g. `Arc<Money>` to `Money`; more for a tuple type). `""` when no type name resolves.
+fn member_type_sig(node: TsNode, src: &[u8]) -> String {
+    type_names(node, src).join(",")
 }
 
 fn collect_type_names(node: TsNode, src: &[u8], out: &mut Vec<String>) {
