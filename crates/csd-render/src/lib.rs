@@ -1,9 +1,11 @@
 //! Render a graph and its delta as one annotated Mermaid diagram.
 //!
-//! Three views live here: [`render_module_view`] (a `flowchart` over `Module` nodes and `Uses`
+//! Four views live here: [`render_module_view`] (a `flowchart` over `Module` nodes and `Uses`
 //! edges), [`render_state_view`] (a `stateDiagram-v2` over `Variant` nodes and `Transitions`
-//! edges, SPEC.md 3.4) and [`render_type_view`] (a `classDiagram` over `Struct`/`Enum`/`Trait`
-//! nodes with `Implements`/`Associates` relations, SPEC.md 3.2). All follow the project convention
+//! edges, SPEC.md 3.4), [`render_type_view`] (a `classDiagram` over `Struct`/`Enum`/`Trait`
+//! nodes with `Implements`/`Associates` relations, SPEC.md 3.2) and [`render_call_view`] (a
+//! `sequenceDiagram` slice from an entry `Fn` over `Calls` edges, SPEC.md 3.3). All follow the
+//! project convention
 //! (SPEC.md section 4): the delta is
 //! colour-encoded onto a single drawing rather than diffing two images (green added, red-dashed
 //! removed, amber changed, gray unchanged context) and the graph is pruned to changed nodes, the
@@ -273,6 +275,241 @@ pub fn render_type_view(head: &Graph, changes: &[Change]) -> String {
     }
 
     out
+}
+
+/// How deep the call slice recurses before it stops, so a deep or recursive graph never blows the
+/// stack or the diagram. Documented so the ceiling is honest, not silent.
+const MAX_CALL_DEPTH: usize = 32;
+
+/// Added-region tint (SPEC.md section 4: green added). `sequenceDiagram` colours a region with a
+/// `rect rgb(...)` block, not `classDef`, so the value is inlined here. Matches the `added` classDef
+/// fill `#f0fdf4`.
+const RECT_ADDED: &str = "240,253,244";
+/// Removed-region tint (SPEC.md section 4: red removed). Matches the `removed` classDef fill
+/// `#fef2f2`.
+const RECT_REMOVED: &str = "254,242,242";
+
+/// Render a call-graph slice of `head` from `entry`, with `changes` colour-encoded, as a Mermaid
+/// `sequenceDiagram` (SPEC.md 3.3).
+///
+/// The diagram is a slice, not the whole graph: a depth-first pre-order walk from the `entry` `Fn`
+/// node following [`EdgeKind::Calls`] edges in `ordinal` (source) order, so messages read top to
+/// bottom in call order. The walk carries an ancestor stack and skips any edge back to a node
+/// already on it, so a cycle (`a` calls `b` calls `a`) terminates instead of recursing forever;
+/// depth is also bounded by [`MAX_CALL_DEPTH`].
+///
+/// Participants are the type/module owning each fn, derived from the fn id by stripping the last
+/// `::segment` (`crate::Widget::run` -> `crate::Widget`; `crate::helper` -> `crate`). Ids are not
+/// valid Mermaid names, so each owner is declared once, in first-seen order, with a stable `p<i>`
+/// alias (`participant p0 as crate::Widget`). A message is `caller ->> callee : callee_fn_name`.
+///
+/// Delta colouring is taken straight from the delta's edge changes: a message whose `Calls` edge
+/// `(from, to, ordinal)` is a [`Change::EdgeAdded`] is wrapped in a green `rect rgb(...)`; a
+/// [`Change::EdgeRemoved`] `Calls` edge is shown as a message wrapped in a red `rect rgb(...)` with
+/// a ` (removed)` suffix. The precise reorder-as-move analysis lives in `csd_diff::call_tree_diff`;
+/// wiring it in is a later refinement, and this renderer deliberately takes no dependency on the
+/// differ, colouring only from `EdgeAdded`/`EdgeRemoved`.
+///
+/// Fidelity ceiling (SPEC.md 3.3): a fn with `attrs["unresolved_calls"] = N` (N > 0) carries dynamic
+/// or generic callees with no statically known target. These are never fabricated as resolved
+/// calls; instead a `note over <participant> : N dynamic call(s) not shown` is emitted after that
+/// fn's messages.
+///
+/// If `entry` is not a `Fn` node, or has no outgoing calls, the output is `sequenceDiagram` plus a
+/// `%% no calls from <entry>` comment.
+pub fn render_call_view(head: &Graph, changes: &[Change], entry: &StableId) -> String {
+    // Edges the delta added / removed, keyed by (from, to, ordinal) for exact-message matching.
+    let added: BTreeSet<(&str, &str, Option<u32>)> = changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::EdgeAdded(e) if e.kind == EdgeKind::Calls => {
+                Some((e.from.as_str(), e.to.as_str(), e.ordinal))
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Outgoing Calls per caller: head edges (added or plain) plus edges the delta removed. Keyed by
+    // id string so `entry` and cross-graph edge endpoints compare by value.
+    let mut outgoing: BTreeMap<&str, Vec<Out>> = BTreeMap::new();
+    for e in &head.edges {
+        if e.kind != EdgeKind::Calls {
+            continue;
+        }
+        let class = if added.contains(&(e.from.as_str(), e.to.as_str(), e.ordinal)) {
+            Class::Added
+        } else {
+            Class::Context
+        };
+        outgoing.entry(e.from.as_str()).or_default().push(Out {
+            to: e.to.as_str(),
+            ordinal: e.ordinal,
+            class,
+        });
+    }
+    for c in changes {
+        if let Change::EdgeRemoved(e) = c {
+            if e.kind == EdgeKind::Calls {
+                outgoing.entry(e.from.as_str()).or_default().push(Out {
+                    to: e.to.as_str(),
+                    ordinal: e.ordinal,
+                    class: Class::Removed,
+                });
+            }
+        }
+    }
+    // Deterministic message order at each level: by ordinal, then callee id.
+    for outs in outgoing.values_mut() {
+        outs.sort_by(|a, b| (a.ordinal, a.to).cmp(&(b.ordinal, b.to)));
+    }
+
+    // `unresolved_calls` counts per fn (the dyn/generics fidelity ceiling).
+    let unresolved: BTreeMap<&str, u32> = head
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Fn)
+        .filter_map(|n| {
+            n.attrs
+                .get("unresolved_calls")
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|n| *n > 0)
+                .map(|count| (n.id.as_str(), count))
+        })
+        .collect();
+
+    let is_fn = head
+        .nodes
+        .iter()
+        .any(|n| n.kind == NodeKind::Fn && &n.id == entry);
+    let has_calls = outgoing
+        .get(entry.as_str())
+        .is_some_and(|outs| !outs.is_empty());
+
+    if !is_fn || !has_calls {
+        let mut out = String::from("sequenceDiagram\n");
+        let _ = writeln!(out, "    %% no calls from {}", entry.as_str());
+        return out;
+    }
+
+    // Walk, building message lines and the first-seen participant order together.
+    let mut parts = Parts { order: Vec::new() };
+    let mut lines = String::new();
+    let mut stack: Vec<&str> = Vec::new();
+    walk_calls(
+        entry.as_str(),
+        0,
+        &mut stack,
+        &outgoing,
+        &unresolved,
+        &mut parts,
+        &mut lines,
+    );
+
+    let mut out = String::from("sequenceDiagram\n");
+    for (i, owner) in parts.order.iter().enumerate() {
+        let _ = writeln!(out, "    participant p{i} as {owner}");
+    }
+    out.push_str(&lines);
+    out
+}
+
+/// One outgoing call from a fn, tagged with its delta colour.
+struct Out<'a> {
+    to: &'a str,
+    ordinal: Option<u32>,
+    class: Class,
+}
+
+/// First-seen participant registry mapping an owner id to a stable `p<i>` alias.
+struct Parts<'a> {
+    order: Vec<&'a str>,
+}
+
+impl<'a> Parts<'a> {
+    /// The `p<i>` alias for `owner`, assigning a new index on first sight.
+    fn alias(&mut self, owner: &'a str) -> String {
+        let idx = match self.order.iter().position(|o| *o == owner) {
+            Some(i) => i,
+            None => {
+                self.order.push(owner);
+                self.order.len() - 1
+            }
+        };
+        format!("p{idx}")
+    }
+}
+
+/// The owner (participant) of a fn id: everything before the last `::segment`, or the whole id.
+fn call_owner(id: &str) -> &str {
+    match id.rfind("::") {
+        Some(i) => &id[..i],
+        None => id,
+    }
+}
+
+/// The fn's own name: the last `::segment`, or the whole id.
+fn call_name(id: &str) -> &str {
+    match id.rfind("::") {
+        Some(i) => &id[i + 2..],
+        None => id,
+    }
+}
+
+/// Depth-first pre-order emit of one fn's messages, then its dyn note, recursing into callees.
+///
+/// `stack` holds the ancestors on the current path; an edge back to any of them is skipped so cycles
+/// terminate. Recursion also stops at [`MAX_CALL_DEPTH`].
+#[allow(clippy::too_many_arguments)]
+fn walk_calls<'a>(
+    node: &'a str,
+    depth: usize,
+    stack: &mut Vec<&'a str>,
+    outgoing: &BTreeMap<&'a str, Vec<Out<'a>>>,
+    unresolved: &BTreeMap<&'a str, u32>,
+    parts: &mut Parts<'a>,
+    lines: &mut String,
+) {
+    stack.push(node);
+    if let Some(outs) = outgoing.get(node) {
+        for out in outs {
+            let caller = parts.alias(call_owner(node));
+            let callee = parts.alias(call_owner(out.to));
+            let name = call_name(out.to);
+            match out.class {
+                // Added region: green rect (SPEC.md section 4 convention).
+                Class::Added => {
+                    let _ = writeln!(lines, "    rect rgb({RECT_ADDED})");
+                    let _ = writeln!(lines, "        {caller} ->> {callee} : {name}");
+                    lines.push_str("    end\n");
+                }
+                // Removed region: red rect with a `(removed)` suffix (SPEC.md section 4 convention).
+                Class::Removed => {
+                    let _ = writeln!(lines, "    rect rgb({RECT_REMOVED})");
+                    let _ = writeln!(lines, "        {caller} ->> {callee} : {name} (removed)");
+                    lines.push_str("    end\n");
+                }
+                _ => {
+                    let _ = writeln!(lines, "    {caller} ->> {callee} : {name}");
+                }
+            }
+            // Recurse into the callee unless it is an ancestor (cycle) or we hit the depth ceiling.
+            if depth + 1 < MAX_CALL_DEPTH
+                && !stack.contains(&out.to)
+                && outgoing.contains_key(out.to)
+            {
+                walk_calls(out.to, depth + 1, stack, outgoing, unresolved, parts, lines);
+            }
+        }
+    }
+    // Honest dyn ceiling: note the unresolved callees after this fn's messages, never as a call.
+    if let Some(&count) = unresolved.get(node) {
+        let p = parts.alias(call_owner(node));
+        let _ = writeln!(
+            lines,
+            "    note over {p} : {count} dynamic call(s) not shown"
+        );
+    }
+    stack.pop();
 }
 
 use std::fmt::Write as _;
@@ -847,5 +1084,150 @@ mod tests {
         // Field types unchanged -> plain.
         let same = fingerprint(&["amount"], &[("Money", 1)]);
         assert_eq!(member_lines(&before, &same), vec!["amount".to_string()]);
+    }
+
+    fn fn_node(id: &str) -> Node {
+        Node {
+            id: StableId::new(id),
+            kind: NodeKind::Fn,
+            span: span(),
+            attrs: BTreeMap::new(),
+            fingerprint: None,
+        }
+    }
+
+    fn fn_node_dyn(id: &str, unresolved: u32) -> Node {
+        let mut node = fn_node(id);
+        node.attrs
+            .insert("unresolved_calls".into(), unresolved.to_string());
+        node
+    }
+
+    fn calls(from: &str, to: &str, ordinal: u32) -> Edge {
+        Edge {
+            from: StableId::new(from),
+            to: StableId::new(to),
+            kind: EdgeKind::Calls,
+            span: span(),
+            ordinal: Some(ordinal),
+        }
+    }
+
+    #[test]
+    fn call_entry_not_found_renders_no_calls() {
+        let head = Graph {
+            nodes: vec![fn_node("crate::App::run")],
+            edges: vec![],
+        };
+        let out = render_call_view(&head, &[], &StableId::new("crate::orphan"));
+        assert_eq!(out, "sequenceDiagram\n    %% no calls from crate::orphan\n");
+    }
+
+    #[test]
+    fn call_entry_without_calls_renders_no_calls() {
+        // A real Fn node, but with no outgoing Calls edges.
+        let head = Graph {
+            nodes: vec![fn_node("crate::App::run")],
+            edges: vec![],
+        };
+        let out = render_call_view(&head, &[], &StableId::new("crate::App::run"));
+        assert_eq!(
+            out,
+            "sequenceDiagram\n    %% no calls from crate::App::run\n"
+        );
+    }
+
+    #[test]
+    fn call_added_message_golden() {
+        // run calls init (unchanged) then helper (newly added). ordinal order drives the sequence.
+        let head = Graph {
+            nodes: vec![
+                fn_node("crate::Widget::run"),
+                fn_node("crate::Widget::init"),
+                fn_node("crate::helper"),
+            ],
+            edges: vec![
+                calls("crate::Widget::run", "crate::Widget::init", 0),
+                calls("crate::Widget::run", "crate::helper", 1),
+            ],
+        };
+        let changes = vec![Change::EdgeAdded(calls(
+            "crate::Widget::run",
+            "crate::helper",
+            1,
+        ))];
+        let out = render_call_view(&head, &changes, &StableId::new("crate::Widget::run"));
+        let expected = concat!(
+            "sequenceDiagram\n",
+            "    participant p0 as crate::Widget\n",
+            "    participant p1 as crate\n",
+            "    p0 ->> p0 : init\n",
+            "    rect rgb(240,253,244)\n",
+            "        p0 ->> p1 : helper\n",
+            "    end\n",
+        );
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn call_removed_message_wrapped_in_red_rect() {
+        // The removed call is absent from head; it is recovered from the delta.
+        let head = Graph {
+            nodes: vec![fn_node("crate::A::f"), fn_node("crate::A::g")],
+            edges: vec![],
+        };
+        let changes = vec![Change::EdgeRemoved(calls("crate::A::f", "crate::A::g", 0))];
+        let out = render_call_view(&head, &changes, &StableId::new("crate::A::f"));
+        let expected = concat!(
+            "sequenceDiagram\n",
+            "    participant p0 as crate::A\n",
+            "    rect rgb(254,242,242)\n",
+            "        p0 ->> p0 : g (removed)\n",
+            "    end\n",
+        );
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn call_dyn_note_appears_for_unresolved_calls() {
+        // f has two dynamic callees with no static target: they must be noted, never faked as calls.
+        let head = Graph {
+            nodes: vec![fn_node_dyn("crate::A::f", 2), fn_node("crate::A::g")],
+            edges: vec![calls("crate::A::f", "crate::A::g", 0)],
+        };
+        let out = render_call_view(&head, &[], &StableId::new("crate::A::f"));
+        assert!(
+            out.contains("    p0 ->> p0 : g\n"),
+            "resolved call missing:\n{out}"
+        );
+        assert!(
+            out.contains("    note over p0 : 2 dynamic call(s) not shown\n"),
+            "dyn note missing:\n{out}"
+        );
+        // The note follows the message.
+        let msg = out.find("p0 ->> p0 : g").unwrap();
+        let note = out.find("note over p0").unwrap();
+        assert!(note > msg, "note must come after the message:\n{out}");
+    }
+
+    #[test]
+    fn call_cycle_guard_terminates() {
+        // start -> step -> start: the back edge to an ancestor is skipped, so the walk terminates.
+        let head = Graph {
+            nodes: vec![fn_node("crate::A::start"), fn_node("crate::B::step")],
+            edges: vec![
+                calls("crate::A::start", "crate::B::step", 0),
+                calls("crate::B::step", "crate::A::start", 0),
+            ],
+        };
+        let out = render_call_view(&head, &[], &StableId::new("crate::A::start"));
+        let expected = concat!(
+            "sequenceDiagram\n",
+            "    participant p0 as crate::A\n",
+            "    participant p1 as crate::B\n",
+            "    p0 ->> p1 : step\n",
+            "    p1 ->> p0 : start\n",
+        );
+        assert_eq!(out, expected);
     }
 }
