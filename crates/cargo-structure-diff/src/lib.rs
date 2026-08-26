@@ -448,6 +448,19 @@ deny = [\"layering\", \"cycles\"]
     }
 
     #[test]
+    fn run_maps_help_and_parse_errors_to_exit_codes() {
+        // Help is a clean exit; a missing subcommand or unknown arg is a usage error (2). These
+        // paths take no IO, so they pin the exit-code contract without a repo.
+        assert_eq!(run(&["--help".to_string()]), 0);
+        assert_eq!(run(&[]), 2, "no subcommand is a usage error");
+        assert_eq!(
+            run(&["bogus".to_string()]),
+            2,
+            "unknown arg is a usage error"
+        );
+    }
+
+    #[test]
     fn parse_help_and_errors() {
         assert_eq!(parse_args(&["--help".to_string()]).unwrap(), Cmd::Help);
         assert!(parse_args(&[]).is_err(), "no subcommand is an error");
