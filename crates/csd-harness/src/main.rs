@@ -384,3 +384,134 @@ fn render_markdown(input: RenderInput) -> String {
 
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use csd_ir::{NodeKind, SourceSpan, StableId};
+    use std::collections::BTreeMap;
+
+    fn counts(added: usize, removed: usize, moved: usize, modified: usize) -> Counts {
+        Counts {
+            added,
+            removed,
+            moved,
+            modified,
+            edge_added: 0,
+            edge_removed: 0,
+        }
+    }
+
+    fn module_node(id: &str, file: &str) -> Node {
+        Node {
+            id: StableId::new(id),
+            kind: NodeKind::Module,
+            span: SourceSpan {
+                file: file.into(),
+                start: 0,
+                end: 1,
+            },
+            attrs: BTreeMap::new(),
+            fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn add_counts_sums_each_field() {
+        let a = Counts {
+            added: 1,
+            removed: 2,
+            moved: 3,
+            modified: 4,
+            edge_added: 5,
+            edge_removed: 6,
+        };
+        let b = Counts {
+            added: 10,
+            removed: 20,
+            moved: 30,
+            modified: 40,
+            edge_added: 50,
+            edge_removed: 60,
+        };
+        let s = add_counts(a, b);
+        assert_eq!(
+            (
+                s.added,
+                s.removed,
+                s.moved,
+                s.modified,
+                s.edge_added,
+                s.edge_removed
+            ),
+            (11, 22, 33, 44, 55, 66)
+        );
+    }
+
+    #[test]
+    fn module_reconciliations_counts_a_seeded_rename() {
+        let base = Graph {
+            nodes: vec![module_node("crate::billing", "src/billing.rs")],
+            edges: vec![],
+        };
+        let head = Graph {
+            nodes: vec![module_node("crate::payments", "src/payments.rs")],
+            edges: vec![],
+        };
+        let renames = vec![FileRename {
+            old_path: "src/billing.rs".into(),
+            new_path: "src/payments.rs".into(),
+        }];
+        assert_eq!(module_reconciliations(&base, &head, &renames), 1);
+        // Without the git signal nothing reconciles: modules carry no fingerprint.
+        assert_eq!(module_reconciliations(&base, &head, &[]), 0);
+    }
+
+    #[test]
+    fn render_markdown_tabulates_counts_and_notes() {
+        let totals = vec![
+            ThresholdTotals {
+                counts: counts(7, 0, 1, 2),
+                spurious: 3,
+            };
+            THRESHOLD_SWEEP.len()
+        ];
+        let out = render_markdown(RenderInput {
+            repo_name: "demo",
+            analyzed: 5,
+            baseline: counts(9, 1, 0, 2),
+            totals: &totals,
+            rs_renames: 4,
+            module_reconciled: 2,
+            audit_matches: vec![AcceptedMatch {
+                removed_id: "m::Old".into(),
+                added_id: "m::New".into(),
+                score: 0.42,
+                moved: false,
+            }],
+            audit_splits: vec![SplitCandidate {
+                removed_id: "m::A".into(),
+                added_id: "m::B".into(),
+                score: 0.55,
+            }],
+        });
+        assert!(out.contains("sweep report: demo"));
+        assert!(out.contains("Pairs analyzed: 5"));
+        assert!(out.contains("Edge precision/recall is PENDING"));
+        assert!(out.contains("Git `.rs` file renames across all pairs: 4"));
+        assert!(out.contains("Reconciled to a module Moved/Modified by csd: 2"));
+        // The off row must carry the baseline counts in the right columns.
+        assert!(
+            out.contains("| off | 9 | 1 | 0 | 2 | 0 | 0 | n/a |"),
+            "off row wrong:\n{out}"
+        );
+        // A threshold row must carry that threshold's totals (added 7, moved 1, modified 2, spurious 3).
+        assert!(
+            out.contains("| 0.7 | 7 | 0 | 1 | 2 | 0 | 0 | 3 |"),
+            "threshold row wrong:\n{out}"
+        );
+        // Audit and split samples render with 3-decimal scores.
+        assert!(out.contains("0.420") && out.contains("m::Old"));
+        assert!(out.contains("0.550") && out.contains("m::A"));
+    }
+}
