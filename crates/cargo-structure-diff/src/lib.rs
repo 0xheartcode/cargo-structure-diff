@@ -18,7 +18,7 @@ use csd_config::Config;
 use csd_diff::{diff, DiffOptions, FileRename};
 use csd_ir::{Change, Graph};
 use csd_lint::{has_denials, lint, Finding, Severity};
-use csd_render::{render_module_view, render_state_view};
+use csd_render::{render_module_view, render_state_view, render_type_view};
 
 /// Default base ref when `--base` is omitted.
 const DEFAULT_BASE: &str = "main";
@@ -226,6 +226,7 @@ fn render_views(head: &Graph, changes: &[Change], config: &Config) -> Vec<ViewDi
         let mermaid = match view.as_str() {
             "modules" => render_module_view(head, changes),
             "states" => render_state_view(head, changes),
+            "types" => render_type_view(head, changes),
             _ => continue,
         };
         diagrams.push(ViewDiagram { view, mermaid });
@@ -529,6 +530,39 @@ deny = [\"layering\", \"cycles\"]
             state.mermaid.contains("stateDiagram-v2"),
             "state diagram expected:\n{}",
             state.mermaid
+        );
+    }
+
+    #[test]
+    fn types_view_renders_a_class_diagram() {
+        let repo = TmpRepo::new("types");
+        let dir = &repo.path;
+        git_ok(dir, &["-c", "init.defaultBranch=main", "init", "-q"]);
+        write(dir, ".csd.toml", "[views]\nenabled = [\"types\"]\n");
+        write(dir, "src/lib.rs", "pub struct A;\n");
+        git_ok(dir, &["add", "-A"]);
+        git_ok(dir, &["commit", "-q", "-m", "base"]);
+        // Head adds a type, so the type view has a changed class to draw.
+        write(dir, "src/lib.rs", "pub struct A;\npub struct B;\n");
+
+        let config = Config::load(&dir.join(".csd.toml")).unwrap();
+        let report = analyze(dir, "main", &config).unwrap();
+
+        assert_eq!(report.exit_code(), 0, "no lints denied, so exit 0");
+        let types = report
+            .diagrams
+            .iter()
+            .find(|d| d.view == "types")
+            .expect("the types view is enabled");
+        assert!(
+            types.mermaid.contains("classDiagram"),
+            "class diagram expected:\n{}",
+            types.mermaid
+        );
+        assert!(
+            types.mermaid.contains("crate::B"),
+            "the added type should appear:\n{}",
+            types.mermaid
         );
     }
 
