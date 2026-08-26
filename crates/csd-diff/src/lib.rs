@@ -59,24 +59,21 @@ pub struct MemberDelta {
     pub added: Vec<String>,
     /// Member names present only on the base side.
     pub removed: Vec<String>,
-    /// Member names present on both sides whose type appears to have changed. See [`member_diff`]
-    /// for the exact (and limited) meaning given the current [`Fingerprint`] shape.
+    /// Member names present on both sides whose per-member type signature changed. See
+    /// [`member_diff`].
     pub changed: Vec<String>,
 }
 
 /// Report member-level changes between two nodes matched at the node level.
 ///
-/// Members are matched by NAME using [`Fingerprint::members`]. A name only on the head side is
-/// `added`; a name only on the base side is `removed`.
+/// Members are matched by NAME using [`Fingerprint::member_types`] (member name to type signature).
+/// A name only on the head side is `added`; a name only on the base side is `removed`; a name on
+/// both sides whose type signature differs is `changed`. Because the retype is attributed to the
+/// exact member, an unrelated sibling change no longer flips every common member to `changed`
+/// (the old false `~id`/`~total`).
 ///
-/// `changed` is the honest limit of the current [`Fingerprint`] shape. The fingerprint stores
-/// member names as a set and field types as a separate `field_types` multiset (type name to
-/// count); it does NOT map a member to its type, so a per-member retype is not directly
-/// recoverable. The best available signal: when the member-name set is identical on both sides
-/// (no adds or removes) yet the `field_types` multiset differs, at least one surviving member was
-/// retyped. Which one is not recoverable, so every common member is reported as `changed`. When
-/// names were added or removed, the `field_types` delta is attributed to those adds/removes and
-/// `changed` stays empty, avoiding a false retype signal.
+/// Type signatures are the extractor's best-effort tree-sitter view (wrapper-unwrapped); the
+/// rustdoc backend supersedes them later for full type resolution.
 ///
 /// A node with no fingerprint on either side yields an empty [`MemberDelta`].
 pub fn member_diff(before: &Node, after: &Node) -> MemberDelta {
@@ -84,17 +81,27 @@ pub fn member_diff(before: &Node, after: &Node) -> MemberDelta {
         return MemberDelta::default();
     };
 
-    let added: Vec<String> = af.members.difference(&bf.members).cloned().collect();
-    let removed: Vec<String> = bf.members.difference(&af.members).cloned().collect();
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut changed = Vec::new();
 
-    let changed = if added.is_empty() && removed.is_empty() && bf.field_types != af.field_types {
-        // Names unchanged but the type multiset moved: a surviving member was retyped.
-        bf.members.intersection(&af.members).cloned().collect()
-    } else {
-        Vec::new()
-    };
+    for (name, after_ty) in &af.member_types {
+        match bf.member_types.get(name) {
+            None => added.push(name.clone()),
+            Some(before_ty) if before_ty != after_ty => changed.push(name.clone()),
+            Some(_) => {}
+        }
+    }
+    for name in bf.member_types.keys() {
+        if !af.member_types.contains_key(name) {
+            removed.push(name.clone());
+        }
+    }
 
-    // BTreeSet iteration is already sorted; keep it explicit so the contract does not rely on it.
+    // BTreeMap iteration is already sorted; keep it explicit so the contract does not rely on it.
+    added.sort();
+    removed.sort();
+    changed.sort();
     MemberDelta {
         added,
         removed,
@@ -723,6 +730,7 @@ mod tests {
         Fingerprint {
             members: members.iter().map(|s| s.to_string()).collect(),
             field_types: fields.iter().map(|(t, c)| (t.to_string(), *c)).collect(),
+            member_types: BTreeMap::new(),
             neighbors: BTreeSet::new(),
             doc_hash: 0,
         }
@@ -1064,10 +1072,21 @@ mod tests {
         assert_eq!(out, vec![Change::Added(after), Change::Removed(before)]);
     }
 
+    /// A struct node whose fingerprint carries per-member type signatures (name -> type).
+    fn mt_node(id: &str, members: &[(&str, &str)]) -> Node {
+        let mut f = Fingerprint::default();
+        for (name, ty) in members {
+            f.members.insert((*name).to_string());
+            f.member_types
+                .insert((*name).to_string(), (*ty).to_string());
+        }
+        fp_node(id, NodeKind::Struct, f)
+    }
+
     #[test]
     fn member_added_is_reported_as_added() {
-        let before = fp_node("m::T", NodeKind::Struct, fp(&["a"], &[("u64", 1)]));
-        let after = fp_node("m::T", NodeKind::Struct, fp(&["a", "b"], &[("u64", 2)]));
+        let before = mt_node("m::T", &[("a", "u64")]);
+        let after = mt_node("m::T", &[("a", "u64"), ("b", "u64")]);
         let d = member_diff(&before, &after);
         assert_eq!(d.added, vec!["b".to_string()]);
         assert!(d.removed.is_empty());
@@ -1076,8 +1095,8 @@ mod tests {
 
     #[test]
     fn member_removed_is_reported_as_removed() {
-        let before = fp_node("m::T", NodeKind::Struct, fp(&["a", "b"], &[("u64", 2)]));
-        let after = fp_node("m::T", NodeKind::Struct, fp(&["a"], &[("u64", 1)]));
+        let before = mt_node("m::T", &[("a", "u64"), ("b", "u64")]);
+        let after = mt_node("m::T", &[("a", "u64")]);
         let d = member_diff(&before, &after);
         assert_eq!(d.removed, vec!["b".to_string()]);
         assert!(d.added.is_empty());
@@ -1086,9 +1105,9 @@ mod tests {
 
     #[test]
     fn retyped_member_is_reported_as_changed() {
-        // Same name set, field_types multiset differs: a surviving member was retyped.
-        let before = fp_node("m::T", NodeKind::Struct, fp(&["a"], &[("u64", 1)]));
-        let after = fp_node("m::T", NodeKind::Struct, fp(&["a"], &[("String", 1)]));
+        // Same name, different per-member type signature: exactly that member is retyped.
+        let before = mt_node("m::T", &[("a", "u64")]);
+        let after = mt_node("m::T", &[("a", "String")]);
         let d = member_diff(&before, &after);
         assert_eq!(d.changed, vec!["a".to_string()]);
         assert!(d.added.is_empty());
@@ -1096,10 +1115,34 @@ mod tests {
     }
 
     #[test]
+    fn adding_field_does_not_flag_unrelated_siblings() {
+        // Order gains `note`; `id`/`total` keep their types. Exactly +note, no false ~id/~total.
+        let before = mt_node("m::Order", &[("id", "u64"), ("total", "Money")]);
+        let after = mt_node(
+            "m::Order",
+            &[("id", "u64"), ("total", "Money"), ("note", "String")],
+        );
+        let d = member_diff(&before, &after);
+        assert_eq!(d.added, vec!["note".to_string()]);
+        assert!(d.removed.is_empty());
+        assert!(d.changed.is_empty(), "siblings must not read as changed");
+    }
+
+    #[test]
+    fn retyping_one_field_flags_only_it() {
+        // id u32 -> u64 while total is untouched: exactly ~id.
+        let before = mt_node("m::Order", &[("id", "u32"), ("total", "Money")]);
+        let after = mt_node("m::Order", &[("id", "u64"), ("total", "Money")]);
+        let d = member_diff(&before, &after);
+        assert_eq!(d.changed, vec!["id".to_string()]);
+        assert!(d.added.is_empty());
+        assert!(d.removed.is_empty());
+    }
+
+    #[test]
     fn identical_members_yield_empty_delta() {
-        let f = fp(&["a", "b"], &[("u64", 2)]);
-        let before = fp_node("m::T", NodeKind::Struct, f.clone());
-        let after = fp_node("m::T", NodeKind::Struct, f);
+        let before = mt_node("m::T", &[("a", "u64"), ("b", "u64")]);
+        let after = mt_node("m::T", &[("a", "u64"), ("b", "u64")]);
         assert_eq!(member_diff(&before, &after), MemberDelta::default());
     }
 
@@ -1112,12 +1155,8 @@ mod tests {
 
     #[test]
     fn member_delta_is_sorted_and_deterministic() {
-        let before = fp_node("m::T", NodeKind::Struct, fp(&["a", "c"], &[("u64", 2)]));
-        let after = fp_node(
-            "m::T",
-            NodeKind::Struct,
-            fp(&["a", "z", "b"], &[("u64", 3)]),
-        );
+        let before = mt_node("m::T", &[("a", "u64"), ("c", "u64")]);
+        let after = mt_node("m::T", &[("a", "u64"), ("z", "u64"), ("b", "u64")]);
         let d = member_diff(&before, &after);
         assert_eq!(d.added, vec!["b".to_string(), "z".to_string()]);
         assert_eq!(d.removed, vec!["c".to_string()]);

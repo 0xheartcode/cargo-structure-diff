@@ -171,6 +171,22 @@ fn struct_fingerprint_members_and_unwrapped_field_types() {
             "wrapper {wrapper} leaked"
         );
     }
+
+    // Per-member type signatures map each named field to its unwrapped type.
+    assert_eq!(fp.member_types.get("id").map(String::as_str), Some("u64"));
+    assert_eq!(
+        fp.member_types.get("total").map(String::as_str),
+        Some("Money")
+    );
+    assert_eq!(
+        fp.member_types.get("tags").map(String::as_str),
+        Some("String")
+    );
+    assert_eq!(
+        fp.member_types.get("maybe").map(String::as_str),
+        Some("Money")
+    );
+
     assert_ne!(fp.doc_hash, 0, "doc comment should hash non-zero");
 }
 
@@ -183,10 +199,29 @@ fn enum_and_trait_and_fn_fingerprints() {
     assert_eq!(variants, vec!["Active", "Closed", "Pending"]);
     assert_eq!(status.field_types.get("Money"), Some(&1));
     assert_eq!(status.field_types.get("u64"), Some(&1));
+    // Variant payload signatures: unit variant maps to "", tuple/struct payloads to their types.
+    assert_eq!(
+        status.member_types.get("Active").map(String::as_str),
+        Some("")
+    );
+    assert_eq!(
+        status.member_types.get("Closed").map(String::as_str),
+        Some("Money")
+    );
+    assert_eq!(
+        status.member_types.get("Pending").map(String::as_str),
+        Some("u64")
+    );
 
     let repo = node(&g, "crate::Repo").fingerprint.as_ref().unwrap();
     let items: Vec<&str> = repo.members.iter().map(String::as_str).collect();
     assert_eq!(items, vec!["Id", "get"]);
+    // Associated type has no signature; the method maps to its unwrapped return type.
+    assert_eq!(repo.member_types.get("Id").map(String::as_str), Some(""));
+    assert_eq!(
+        repo.member_types.get("get").map(String::as_str),
+        Some("Money")
+    );
 
     let make = node(&g, "crate::make").fingerprint.as_ref().unwrap();
     let params: Vec<&str> = make.members.iter().map(String::as_str).collect();
@@ -195,6 +230,12 @@ fn enum_and_trait_and_fn_fingerprints() {
     assert_eq!(make.field_types.get("u64"), Some(&1));
     assert_eq!(make.field_types.get("Money"), Some(&1));
     assert_eq!(make.field_types.get("Order"), Some(&1));
+    // Per-parameter signatures; the return type is not a named member.
+    assert_eq!(make.member_types.get("a").map(String::as_str), Some("u64"));
+    assert_eq!(
+        make.member_types.get("b").map(String::as_str),
+        Some("Money")
+    );
 }
 
 #[test]

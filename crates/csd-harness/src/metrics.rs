@@ -244,6 +244,7 @@ mod tests {
         Fingerprint {
             members: members.iter().map(|s| s.to_string()).collect(),
             field_types: fields.iter().map(|(t, c)| (t.to_string(), *c)).collect(),
+            member_types: BTreeMap::new(),
             neighbors: BTreeSet::new(),
             doc_hash: 0,
         }

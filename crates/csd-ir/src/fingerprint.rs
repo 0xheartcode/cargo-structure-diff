@@ -21,7 +21,12 @@ pub struct Fingerprint {
     /// Member and method names declared on the node (fields, variants, trait items).
     pub members: BTreeSet<String>,
     /// Multiset of the types referenced by the node's fields or parameters: type name to count.
+    /// Used by [`similarity`] scoring.
     pub field_types: BTreeMap<String, u32>,
+    /// Per-member type signature: member name to its (wrapper-unwrapped) type, e.g. `id` to `u64`,
+    /// `total` to `Money`. Lets the differ tell a real member retype from an unrelated sibling
+    /// change. Best-effort from tree-sitter; a member with no meaningful type maps to `""`.
+    pub member_types: BTreeMap<String, String>,
     /// Ids of adjacent nodes (the edge neighbourhood), giving structural context beyond members.
     pub neighbors: BTreeSet<String>,
     /// Fixed-seed hash of the node's doc comment, or `0` when it has none.
@@ -134,6 +139,7 @@ mod tests {
         Fingerprint {
             members: members.iter().map(|s| s.to_string()).collect(),
             field_types: fields.iter().map(|(t, c)| (t.to_string(), *c)).collect(),
+            member_types: BTreeMap::new(),
             neighbors: BTreeSet::new(),
             doc_hash: doc_hash(doc),
         }
