@@ -31,12 +31,13 @@ const HELP: &str = "\
 cargo-structure-diff: structural diff and architectural lint gate
 
 USAGE:
-    csd diff [--base <ref>]
+    csd diff [--base <ref>] [--show]
     csd trace [--base <ref>] [--cmd <shell command>]
-    cargo structure-diff diff [--base <ref>]
+    cargo structure-diff diff [--base <ref>] [--show]
 
 OPTIONS:
     --base <ref>    Base git ref to diff against (default: main)
+    --show          diff: print every rendered view even when nothing denies
     --cmd <cmd>     trace: shell command that emits Mermaid (default: cargo test)
     -h, --help      Print this help
 
@@ -54,6 +55,8 @@ pub enum Cmd {
     Diff {
         /// The git ref to treat as the base side.
         base: String,
+        /// Print every rendered view even when nothing denies (for interactive use).
+        show: bool,
     },
     /// Run a trace command in base and head, then diff the observed Mermaid traces.
     Trace {
@@ -93,8 +96,10 @@ impl Report {
         i32::from(self.denied())
     }
 
-    /// Print the always-on summary, and on a denial the findings plus the diagram.
-    fn print(&self, base: &str) {
+    /// Print the always-on summary. On a denial, the findings and diagrams go to stderr (the
+    /// diagram is the error message). With `show`, the diagrams are also printed on a clean run,
+    /// to stdout, so the tool is usable interactively.
+    fn print(&self, base: &str, show: bool) {
         let denials = self
             .findings
             .iter()
@@ -105,7 +110,8 @@ impl Report {
             "cargo-structure-diff: {} change(s) vs {base}, {denials} denial(s), {warns} warning(s)",
             self.changes.len()
         );
-        if self.denied() {
+        let denied = self.denied();
+        if denied {
             eprintln!("\nlint findings:");
             for f in &self.findings {
                 let tag = match f.severity {
@@ -114,8 +120,12 @@ impl Report {
                 };
                 eprintln!("  [{tag}] {}: {}", f.rule, f.message);
             }
-            for d in &self.diagrams {
+        }
+        for d in &self.diagrams {
+            if denied {
                 eprintln!("\n{} view:\n{}", d.view, d.mermaid);
+            } else if show {
+                println!("\n{} view:\n{}", d.view, d.mermaid);
             }
         }
     }
@@ -129,12 +139,14 @@ impl Report {
 pub fn parse_args(args: &[String]) -> Result<Cmd> {
     let mut base = DEFAULT_BASE.to_string();
     let mut cmd = DEFAULT_TRACE_CMD.to_string();
+    let mut show = false;
     let mut sub: Option<&str> = None;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
         match arg {
             "-h" | "--help" => return Ok(Cmd::Help),
+            "--show" => show = true,
             "diff" | "trace" if sub.is_none() => sub = Some(arg),
             "--base" => {
                 i += 1;
@@ -158,7 +170,7 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
     }
     match sub {
         Some("trace") => Ok(Cmd::Trace { base, cmd }),
-        Some(_) => Ok(Cmd::Diff { base }),
+        Some(_) => Ok(Cmd::Diff { base, show }),
         None => bail!("expected the `diff` or `trace` subcommand; try --help"),
     }
 }
@@ -178,7 +190,7 @@ pub fn run(args: &[String]) -> i32 {
             print!("{HELP}");
             0
         }
-        Cmd::Diff { base } => match run_diff(&base) {
+        Cmd::Diff { base, show } => match run_diff(&base, show) {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("error: {e:#}");
@@ -196,11 +208,11 @@ pub fn run(args: &[String]) -> i32 {
 }
 
 /// Resolve the repo root, load config, run the pipeline, and print the report.
-fn run_diff(base: &str) -> Result<i32> {
+fn run_diff(base: &str, show: bool) -> Result<i32> {
     let repo = repo_root()?;
     let config = load_config(&repo)?;
     let report = analyze(&repo, base, &config)?;
-    report.print(base);
+    report.print(base, show);
     Ok(report.exit_code())
 }
 
@@ -784,7 +796,8 @@ deny = [\"layering\", \"cycles\"]
         assert_eq!(
             cmd,
             Cmd::Diff {
-                base: "main".to_string()
+                base: "main".to_string(),
+                show: false,
             }
         );
     }
@@ -795,9 +808,22 @@ deny = [\"layering\", \"cycles\"]
         let joined = parse_args(&["diff".into(), "--base=dev".into()]).unwrap();
         let want = Cmd::Diff {
             base: "dev".to_string(),
+            show: false,
         };
         assert_eq!(split, want);
         assert_eq!(joined, want);
+    }
+
+    #[test]
+    fn parse_reads_show_flag() {
+        let cmd = parse_args(&["diff".into(), "--show".into()]).unwrap();
+        assert_eq!(
+            cmd,
+            Cmd::Diff {
+                base: "main".to_string(),
+                show: true,
+            }
+        );
     }
 
     #[test]
