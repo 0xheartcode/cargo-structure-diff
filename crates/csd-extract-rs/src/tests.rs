@@ -375,6 +375,125 @@ fn transitions_are_deterministic() {
     assert_eq!(transitions(&state_fixture()), transitions(&state_fixture()));
 }
 
+/// A crate whose `step(self) -> Self` builds the to-state with every constructor form: an explicit
+/// `return`, a tuple `Variant(..)`, a struct `Variant { .. }`, and a bare/`Self::` name.
+fn constructor_fixture() -> Graph {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/lib.rs",
+        r#"
+pub enum Door {
+    Open,
+    Closed,
+    Locked(u32),
+    Ajar { gap: u32 },
+}
+
+impl Door {
+    /// `-> Self` return, exercising every to-expr constructor form.
+    pub fn step(self) -> Self {
+        match self {
+            Door::Open => return Door::Closed,       // explicit return, qualified
+            Door::Closed => Door::Locked(1),         // tuple `Variant(..)` constructor
+            Door::Locked(_) => Self::Ajar { gap: 2 }, // struct `Self::Variant { .. }` constructor
+            Door::Ajar { .. } => Self::Open,          // struct-pattern from, `Self::` to
+        }
+    }
+}
+"#,
+    );
+    extract(root).unwrap()
+}
+
+#[test]
+fn to_expr_constructor_forms_are_detected() {
+    let g = constructor_fixture();
+    // return-position variant, tuple constructor, struct constructor, and Self:: name all resolve.
+    let want: Vec<(String, String)> = [
+        ("crate::Door::Ajar", "crate::Door::Open"),
+        ("crate::Door::Closed", "crate::Door::Locked"),
+        ("crate::Door::Locked", "crate::Door::Ajar"),
+        ("crate::Door::Open", "crate::Door::Closed"),
+    ]
+    .iter()
+    .map(|(f, t)| (f.to_string(), t.to_string()))
+    .collect();
+    assert_eq!(transitions(&g), want);
+}
+
+/// A crate whose match uses bare patterns and bare to-exprs (as under `use Enum::*`).
+fn bare_name_fixture() -> Graph {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/lib.rs",
+        r#"
+pub enum Flag { Up, Down }
+
+impl Flag {
+    pub fn flip(self) -> Self {
+        match self {
+            Up => Down,
+            Down => Up,
+        }
+    }
+}
+"#,
+    );
+    extract(root).unwrap()
+}
+
+#[test]
+fn bare_patterns_and_exprs_are_detected() {
+    let g = bare_name_fixture();
+    let want: Vec<(String, String)> = [
+        ("crate::Flag::Down", "crate::Flag::Up"),
+        ("crate::Flag::Up", "crate::Flag::Down"),
+    ]
+    .iter()
+    .map(|(f, t)| (f.to_string(), t.to_string()))
+    .collect();
+    assert_eq!(transitions(&g), want);
+}
+
+/// A crate assigning a variant through a `self.field = Variant` target inside a match arm.
+fn field_assign_fixture() -> Graph {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/lib.rs",
+        r#"
+pub enum Sig { A, B, C }
+
+impl Sig {
+    pub fn poke(&mut self) {
+        match self {
+            Sig::A => self.inner = Sig::B,
+            _ => {}
+        }
+    }
+}
+"#,
+    );
+    extract(root).unwrap()
+}
+
+#[test]
+fn self_field_assignment_reads_rhs_variant() {
+    let g = field_assign_fixture();
+    // `is_self_target` accepts a `self.field` LHS, so the RHS variant is read as the to-state. The
+    // from-variant is the arm pattern (`A`). This is the real behavior of the field-assign branch.
+    let want: Vec<(String, String)> = [("crate::Sig::A", "crate::Sig::B")]
+        .iter()
+        .map(|(f, t)| (f.to_string(), t.to_string()))
+        .collect();
+    assert_eq!(transitions(&g), want);
+}
+
 /// A crate exercising the type-view edges: a local trait realized by a local type, an external
 /// trait impl, an inherent impl, and struct fields of local, external, and wrapped-local types.
 fn type_view_fixture() -> Graph {
