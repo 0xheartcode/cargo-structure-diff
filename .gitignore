@@ -6,3 +6,6 @@ Cargo.lock.orig
 /corpus
 /.csd-cache
 *.log
+
+# methodology tooling and its output stay local, never published
+/local/
