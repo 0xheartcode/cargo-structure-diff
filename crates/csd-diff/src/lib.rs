@@ -11,6 +11,11 @@
 //! [`member_diff`] is the member level of the SPEC 3.2 three-level diff (node add/remove, then
 //! member matching within surviving nodes, then signature comparison). It is an additive helper
 //! for the renderer and CLI; it does not change [`diff`]'s output.
+//!
+//! [`call_tree_diff`] is the ordered call-sequence diff of SPEC 3.3. Call order is significant, so
+//! a set diff over `Calls` edges cannot see a reordering. It runs Zhang-Shasha ordered tree edit
+//! distance over the call tree/forest the caller extracts and returns an [`EditScript`]. Like
+//! [`member_diff`] it is additive and pure; it does not touch [`diff`]'s output.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -360,6 +365,333 @@ fn order_key(c: &Change) -> (u8, &StableId, &StableId, EdgeKind, Option<u32>) {
         Change::EdgeAdded(e) => (4, &e.from, &e.to, e.kind, e.ordinal),
         Change::EdgeRemoved(e) => (5, &e.from, &e.to, e.kind, e.ordinal),
     }
+}
+
+// ---------------------------------------------------------------------------
+// SPEC 3.3: ordered call-sequence diff (Zhang-Shasha tree edit distance).
+// ---------------------------------------------------------------------------
+
+/// A node in an ordered call tree.
+///
+/// `label` is the callee id. Children are the callees in ordinal order. A linear call sequence is
+/// a root whose children are the calls in order; nested `children` model a real call tree. Order is
+/// significant: `[a, b]` and `[b, a]` are different trees, which is the whole point of using tree
+/// edit distance over a set diff (SPEC 3.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallNode {
+    /// Callee id (the label compared for match/relabel).
+    pub label: String,
+    /// Ordered children (callees).
+    pub children: Vec<CallNode>,
+}
+
+impl CallNode {
+    /// A leaf with no children.
+    pub fn leaf(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            children: Vec::new(),
+        }
+    }
+
+    /// A node with ordered children.
+    pub fn new(label: impl Into<String>, children: Vec<CallNode>) -> Self {
+        Self {
+            label: label.into(),
+            children,
+        }
+    }
+}
+
+/// One step in an [`EditScript`].
+///
+/// Zhang-Shasha yields insert/delete/relabel plus (unemitted) matches. It has no native "move";
+/// the post-pass in [`call_tree_diff`] rewrites a delete+insert of the same label into [`EditOp::Moved`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditOp {
+    /// Insert a head-side node with this label.
+    Insert(String),
+    /// Delete a base-side node with this label.
+    Delete(String),
+    /// Relabel a base-side node to a head-side label.
+    Relabel {
+        /// Base-side label.
+        from: String,
+        /// Head-side label.
+        to: String,
+    },
+    /// A base and head node aligned unchanged (zero cost). Recovered internally to trace the
+    /// alignment; [`call_tree_diff`] does not emit it, so an identical tree yields an empty script.
+    Match(String),
+    /// A reordered call, surfaced by the move post-pass from a paired delete+insert of one label.
+    Moved(String),
+}
+
+/// The recovered edit script between two call trees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditScript {
+    /// The edits, in a deterministic order.
+    pub ops: Vec<EditOp>,
+    /// The Zhang-Shasha edit distance (unit cost per insert/delete/relabel, zero per match). The
+    /// move post-pass only relabels op pairs for readability; it does not change this distance, so
+    /// a reordered call still costs its delete+insert (2).
+    pub cost: u32,
+}
+
+/// Ordered tree edit distance between two call trees, with a recovered [`EditScript`].
+///
+/// # Algorithm (Zhang-Shasha)
+///
+/// 1. Postorder-flatten each tree ([`flatten_postorder`]). Each node gets a 1-based postorder
+///    index; `lld[i]` is the postorder index of the leftmost leaf descendant of node `i`.
+/// 2. Keyroots are the nodes that are either the root or have a left sibling, computed as the
+///    largest index for each distinct `lld` value. Only keyroot pairs need a forest-distance pass.
+/// 3. For each keyroot pair, fill a forest-distance DP ([`forest_dist`]) and copy its tree cells
+///    into the global `treedist` table. `treedist[n][m]` is the whole-tree distance (the cost).
+/// 4. Recover the script by backtracking the forest distance of the root pair ([`recover`]),
+///    recursing into matched subtrees. Ties break deterministically: delete, then insert, then
+///    match/relabel. That bias makes a reordering fall out as delete+insert (a move) rather than
+///    two unrelated relabels.
+///
+/// # Move post-pass
+///
+/// Zhang-Shasha cannot say "moved": a reordered call `[a, b] -> [b, a]` comes back as a delete of
+/// one label at its old slot and an insert of the same label at its new slot. [`detect_moves`]
+/// pairs each `Delete(x)` with a matching `Insert(x)`, rewriting the delete into [`EditOp::Moved`]
+/// and dropping the paired insert, so the reorder reads as a move instead of a blind add+remove.
+/// The pairing count per label is `min(deletes, inserts)` and consumes ops left to right, so it is
+/// deterministic. `cost` is left as the raw edit distance.
+pub fn call_tree_diff(base: &CallNode, head: &CallNode) -> EditScript {
+    let (labels1, lld1, keyroots1) = flatten_postorder(base);
+    let (labels2, lld2, keyroots2) = flatten_postorder(head);
+    let n = labels1.len() - 1;
+    let m = labels2.len() - 1;
+
+    // treedist[i][j] = edit distance between the subtree rooted at postorder i (tree1) and j (tree2).
+    let mut treedist = vec![vec![0u32; m + 1]; n + 1];
+    for &i in &keyroots1 {
+        for &j in &keyroots2 {
+            let fd = forest_dist(i, j, &labels1, &lld1, &labels2, &lld2, &treedist);
+            let (li, lj) = (lld1[i], lld2[j]);
+            // Copy the tree-rooted cells of this forest distance into the global table.
+            for di in li..=i {
+                for dj in lj..=j {
+                    if lld1[di] == li && lld2[dj] == lj {
+                        treedist[di][dj] = fd[di][dj];
+                    }
+                }
+            }
+        }
+    }
+
+    let cost = treedist[n][m];
+    let mut ops = recover(n, m, &labels1, &lld1, &labels2, &lld2, &treedist);
+    // Matches are the zero-cost baseline; drop them so an identical tree yields an empty script.
+    ops.retain(|op| !matches!(op, EditOp::Match(_)));
+    let ops = detect_moves(ops);
+    EditScript { ops, cost }
+}
+
+/// Postorder-flatten a tree into 1-based `(labels, lld, keyroots)`.
+///
+/// Index 0 is an unused sentinel so the DP can address `i - 1` at the boundary. `labels[i]` is the
+/// label of postorder node `i`; `lld[i]` is the postorder index of its leftmost leaf descendant
+/// (itself, for a leaf). Keyroots are sorted ascending.
+fn flatten_postorder(root: &CallNode) -> (Vec<String>, Vec<usize>, Vec<usize>) {
+    let mut labels = vec![String::new()];
+    let mut lld = vec![0usize];
+
+    // Returns the postorder index assigned to `node`.
+    fn visit(node: &CallNode, labels: &mut Vec<String>, lld: &mut Vec<usize>) -> usize {
+        let mut first_child_lld = None;
+        for (idx, child) in node.children.iter().enumerate() {
+            let ci = visit(child, labels, lld);
+            if idx == 0 {
+                first_child_lld = Some(lld[ci]);
+            }
+        }
+        labels.push(node.label.clone());
+        let me = labels.len() - 1;
+        // Leftmost leaf descendant: that of the first child, or self when a leaf.
+        lld.push(first_child_lld.unwrap_or(me));
+        me
+    }
+    visit(root, &mut labels, &mut lld);
+
+    // Keyroot for each distinct lld value is its largest postorder index; iterating ascending and
+    // overwriting keeps that maximum.
+    let mut kr_by_lld: BTreeMap<usize, usize> = BTreeMap::new();
+    for (i, &l) in lld.iter().enumerate().skip(1) {
+        kr_by_lld.insert(l, i);
+    }
+    let mut keyroots: Vec<usize> = kr_by_lld.into_values().collect();
+    keyroots.sort_unstable();
+    (labels, lld, keyroots)
+}
+
+/// Fill the forest-distance DP for keyroots `i` (tree1) and `j` (tree2).
+///
+/// Returns the full matrix; only cells `[li - 1..=i][lj - 1..=j]` are meaningful, where
+/// `li = lld1[i]` and `lj = lld2[j]`. Tree-rooted cells (both nodes on the leftmost path) use a
+/// relabel step; other cells fold in the precomputed `treedist` of the aligned subtrees.
+fn forest_dist(
+    i: usize,
+    j: usize,
+    labels1: &[String],
+    lld1: &[usize],
+    labels2: &[String],
+    lld2: &[usize],
+    treedist: &[Vec<u32>],
+) -> Vec<Vec<u32>> {
+    let (li, lj) = (lld1[i], lld2[j]);
+    let mut fd = vec![vec![0u32; j + 1]; i + 1];
+
+    // Empty-forest borders: delete the whole base prefix, or insert the whole head prefix.
+    for di in li..=i {
+        fd[di][lj - 1] = fd[di - 1][lj - 1] + 1;
+    }
+    for dj in lj..=j {
+        fd[li - 1][dj] = fd[li - 1][dj - 1] + 1;
+    }
+
+    for di in li..=i {
+        for dj in lj..=j {
+            let del = fd[di - 1][dj] + 1;
+            let ins = fd[di][dj - 1] + 1;
+            if lld1[di] == li && lld2[dj] == lj {
+                // Both nodes root a subtree of this forest: relabel/match them directly.
+                let relabel = u32::from(labels1[di] != labels2[dj]);
+                fd[di][dj] = del.min(ins).min(fd[di - 1][dj - 1] + relabel);
+            } else {
+                // Otherwise align the two subtrees, then continue with the forests left of them.
+                let sub = fd[lld1[di] - 1][lld2[dj] - 1] + treedist[di][dj];
+                fd[di][dj] = del.min(ins).min(sub);
+            }
+        }
+    }
+    fd
+}
+
+/// Backtrack the forest distance of keyroot pair `(i, j)` into ops in forward order.
+///
+/// Recurses into matched subtrees. Ties break deterministically as delete, then insert, then
+/// match/relabel, so a reordering surfaces as delete+insert for the move post-pass to pair.
+fn recover(
+    i: usize,
+    j: usize,
+    labels1: &[String],
+    lld1: &[usize],
+    labels2: &[String],
+    lld2: &[usize],
+    treedist: &[Vec<u32>],
+) -> Vec<EditOp> {
+    let fd = forest_dist(i, j, labels1, lld1, labels2, lld2, treedist);
+    let (li, lj) = (lld1[i], lld2[j]);
+    let mut rev: Vec<EditOp> = Vec::new();
+    let (mut di, mut dj) = (i, j);
+
+    while di >= li || dj >= lj {
+        if di < li {
+            // Base forest exhausted: only inserts remain.
+            rev.push(EditOp::Insert(labels2[dj].clone()));
+            dj -= 1;
+        } else if dj < lj {
+            // Head forest exhausted: only deletes remain.
+            rev.push(EditOp::Delete(labels1[di].clone()));
+            di -= 1;
+        } else if lld1[di] == li && lld2[dj] == lj {
+            // Tree-rooted cell: delete, insert, or match/relabel.
+            let del = fd[di - 1][dj] + 1;
+            let ins = fd[di][dj - 1] + 1;
+            let relabel = u32::from(labels1[di] != labels2[dj]);
+            let cur = fd[di][dj];
+            if cur == del {
+                rev.push(EditOp::Delete(labels1[di].clone()));
+                di -= 1;
+            } else if cur == ins {
+                rev.push(EditOp::Insert(labels2[dj].clone()));
+                dj -= 1;
+            } else if relabel == 0 {
+                rev.push(EditOp::Match(labels1[di].clone()));
+                di -= 1;
+                dj -= 1;
+            } else {
+                rev.push(EditOp::Relabel {
+                    from: labels1[di].clone(),
+                    to: labels2[dj].clone(),
+                });
+                di -= 1;
+                dj -= 1;
+            }
+        } else {
+            // Forest cell: delete, insert, or descend into the aligned subtree pair.
+            let del = fd[di - 1][dj] + 1;
+            let ins = fd[di][dj - 1] + 1;
+            let cur = fd[di][dj];
+            if cur == del {
+                rev.push(EditOp::Delete(labels1[di].clone()));
+                di -= 1;
+            } else if cur == ins {
+                rev.push(EditOp::Insert(labels2[dj].clone()));
+                dj -= 1;
+            } else {
+                let sub = recover(di, dj, labels1, lld1, labels2, lld2, treedist);
+                for op in sub.into_iter().rev() {
+                    rev.push(op);
+                }
+                di = lld1[di] - 1;
+                dj = lld2[dj] - 1;
+            }
+        }
+    }
+
+    rev.reverse();
+    rev
+}
+
+/// Rewrite paired `Delete(x)` + `Insert(x)` into `Moved(x)`.
+///
+/// Zhang-Shasha has no move op, so a reordered call reads as a delete of a label at its old slot
+/// plus an insert of the same label at its new slot. For each label the number of moves is
+/// `min(deletes, inserts)`; the first that many deletes become [`EditOp::Moved`] and the first that
+/// many inserts are dropped. Left-to-right consumption keeps it deterministic.
+fn detect_moves(ops: Vec<EditOp>) -> Vec<EditOp> {
+    let mut del_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut ins_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for op in &ops {
+        match op {
+            EditOp::Delete(x) => *del_counts.entry(x.clone()).or_default() += 1,
+            EditOp::Insert(x) => *ins_counts.entry(x.clone()).or_default() += 1,
+            _ => {}
+        }
+    }
+
+    // Remaining deletes to convert / inserts to drop, per label.
+    let mut del_budget: BTreeMap<String, usize> = BTreeMap::new();
+    let mut ins_drop: BTreeMap<String, usize> = BTreeMap::new();
+    for (label, &dc) in &del_counts {
+        let moves = dc.min(ins_counts.get(label).copied().unwrap_or(0));
+        if moves > 0 {
+            del_budget.insert(label.clone(), moves);
+            ins_drop.insert(label.clone(), moves);
+        }
+    }
+
+    let mut out = Vec::with_capacity(ops.len());
+    for op in ops {
+        match op {
+            EditOp::Delete(x) if del_budget.get(&x).copied().unwrap_or(0) > 0 => {
+                *del_budget.get_mut(&x).unwrap() -= 1;
+                out.push(EditOp::Moved(x));
+            }
+            EditOp::Insert(x) if ins_drop.get(&x).copied().unwrap_or(0) > 0 => {
+                *ins_drop.get_mut(&x).unwrap() -= 1;
+                // Paired with the delete above; drop it.
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -812,6 +1144,122 @@ mod tests {
         );
         let first = diff(&base, &head, DiffOptions::default());
         let second = diff(&base, &head, DiffOptions::default());
+        assert_eq!(first, second);
+    }
+
+    // --- call_tree_diff (SPEC 3.3) ---
+
+    /// A root labelled `entry` whose children are the given leaf calls in order.
+    fn seq(labels: &[&str]) -> CallNode {
+        CallNode::new("entry", labels.iter().map(|l| CallNode::leaf(*l)).collect())
+    }
+
+    #[test]
+    fn identical_trees_yield_empty_script() {
+        let base = seq(&["a", "b", "c"]);
+        let head = seq(&["a", "b", "c"]);
+        let script = call_tree_diff(&base, &head);
+        assert_eq!(script.cost, 0);
+        assert!(script.ops.is_empty());
+    }
+
+    #[test]
+    fn inserted_leaf_is_a_single_insert() {
+        let base = seq(&["a", "b"]);
+        let head = seq(&["a", "b", "c"]);
+        let script = call_tree_diff(&base, &head);
+        assert_eq!(script.cost, 1);
+        assert_eq!(script.ops, vec![EditOp::Insert("c".to_string())]);
+    }
+
+    #[test]
+    fn deleted_leaf_is_a_single_delete() {
+        let base = seq(&["a", "b", "c"]);
+        let head = seq(&["a", "b"]);
+        let script = call_tree_diff(&base, &head);
+        assert_eq!(script.cost, 1);
+        assert_eq!(script.ops, vec![EditOp::Delete("c".to_string())]);
+    }
+
+    #[test]
+    fn relabelled_leaf_is_a_relabel() {
+        let base = seq(&["a", "b"]);
+        let head = seq(&["a", "c"]);
+        let script = call_tree_diff(&base, &head);
+        assert_eq!(script.cost, 1);
+        assert_eq!(
+            script.ops,
+            vec![EditOp::Relabel {
+                from: "b".to_string(),
+                to: "c".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn reordered_pair_surfaces_as_a_move() {
+        // [a, b] -> [b, a]: Zhang-Shasha produces a delete + insert of the same label, which the
+        // move post-pass pairs into a single Moved rather than two unrelated edits.
+        let base = seq(&["a", "b"]);
+        let head = seq(&["b", "a"]);
+        let script = call_tree_diff(&base, &head);
+        assert_eq!(script.cost, 2, "a reorder is delete+insert = distance 2");
+        let moved: Vec<_> = script
+            .ops
+            .iter()
+            .filter(|op| matches!(op, EditOp::Moved(_)))
+            .collect();
+        assert_eq!(
+            moved.len(),
+            1,
+            "exactly one call reads as moved: {:?}",
+            script.ops
+        );
+        // No blind add/remove survives the post-pass for a pure reorder.
+        assert!(
+            !script
+                .ops
+                .iter()
+                .any(|op| matches!(op, EditOp::Insert(_) | EditOp::Delete(_))),
+            "reorder must not leave an unrelated add+remove: {:?}",
+            script.ops
+        );
+    }
+
+    #[test]
+    fn nested_call_tree_relabel_is_found() {
+        // A real (nested) call tree, not just a flat sequence.
+        let base = CallNode::new(
+            "entry",
+            vec![
+                CallNode::new("a", vec![CallNode::leaf("x")]),
+                CallNode::leaf("b"),
+            ],
+        );
+        let head = CallNode::new(
+            "entry",
+            vec![
+                CallNode::new("a", vec![CallNode::leaf("y")]),
+                CallNode::leaf("b"),
+            ],
+        );
+        let script = call_tree_diff(&base, &head);
+        assert_eq!(script.cost, 1);
+        assert_eq!(
+            script.ops,
+            vec![EditOp::Relabel {
+                from: "x".to_string(),
+                to: "y".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn call_tree_diff_is_deterministic() {
+        let base = seq(&["a", "b", "c", "d"]);
+        let head = seq(&["b", "a", "d", "e"]);
+        let first = call_tree_diff(&base, &head);
+        let second = call_tree_diff(&base, &head);
         assert_eq!(first, second);
     }
 }
