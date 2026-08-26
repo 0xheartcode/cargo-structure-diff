@@ -33,6 +33,16 @@ pub enum ConfigError {
         /// The glob compiler error.
         source: glob::PatternError,
     },
+    /// A `[calls]` glob (hot or io) was not a valid pattern.
+    #[error("invalid glob {glob:?} in calls.{field}: {source}")]
+    CallsGlob {
+        /// The offending glob string.
+        glob: String,
+        /// The field it came from (`hot` or `io`).
+        field: String,
+        /// The glob compiler error.
+        source: glob::PatternError,
+    },
     /// A layer referenced in the map or a forbid rule is not in `layers.order`.
     #[error("layer {0:?} is used but not declared in layers.order")]
     UnknownLayer(String),
@@ -54,6 +64,9 @@ pub struct Config {
     /// CI failure behaviour.
     #[serde(default)]
     pub ratchet: Ratchet,
+    /// Hot-path and I/O markers for the call graph.
+    #[serde(default)]
+    pub calls: Calls,
 }
 
 /// Declared strata, the module-to-layer mapping, and forbidden inter-layer edges.
@@ -116,6 +129,37 @@ pub struct Lint {
     pub warn: Vec<String>,
 }
 
+/// Call-graph markers for the `io_in_hot_path` lint.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Calls {
+    /// Globs matched against a caller function id, for example `crate::server::*`.
+    #[serde(default)]
+    pub hot: Vec<String>,
+    /// Globs matched against a callee's owning module id, for example `crate::db`.
+    #[serde(default)]
+    pub io: Vec<String>,
+}
+
+impl Calls {
+    /// Whether a function id matches any `hot` glob.
+    pub fn is_hot(&self, fn_id: &str) -> bool {
+        matches_any(&self.hot, fn_id)
+    }
+
+    /// Whether a module id matches any `io` glob.
+    pub fn is_io_module(&self, module_id: &str) -> bool {
+        matches_any(&self.io, module_id)
+    }
+}
+
+/// Whether `value` matches any compiled glob in `globs`.
+fn matches_any(globs: &[String], value: &str) -> bool {
+    globs
+        .iter()
+        .any(|g| glob::Pattern::new(g).ok().is_some_and(|p| p.matches(value)))
+}
+
 /// How the CI gate treats pre-existing violations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -137,6 +181,17 @@ pub struct Ratchet {
 
 fn default_ratchet_mode() -> RatchetMode {
     RatchetMode::NewOnly
+}
+
+/// Compile a `[calls]` glob, tagging errors with the field it came from.
+fn compile_calls_glob(glob: &str, field: &str) -> Result<(), ConfigError> {
+    glob::Pattern::new(glob)
+        .map(|_| ())
+        .map_err(|source| ConfigError::CallsGlob {
+            glob: glob.to_string(),
+            field: field.to_string(),
+            source,
+        })
 }
 
 impl Default for Ratchet {
@@ -177,6 +232,12 @@ impl Config {
         for rule in &self.layers.forbid {
             self.require_layer(&rule.from)?;
             self.require_layer(&rule.to)?;
+        }
+        for glob in &self.calls.hot {
+            compile_calls_glob(glob, "hot")?;
+        }
+        for glob in &self.calls.io {
+            compile_calls_glob(glob, "io")?;
         }
         Ok(())
     }
@@ -278,5 +339,45 @@ mode = "new-only"
         assert_eq!(c.layer_of("crates/app/src/api/routes.rs"), Some("api"));
         assert_eq!(c.layer_of("crates/app/src/infra/db.rs"), Some("infra"));
         assert_eq!(c.layer_of("crates/app/src/main.rs"), None);
+    }
+
+    const CALLS: &str = r#"
+[calls]
+hot = ["crate::server::*"]
+io  = ["crate::db", "crate::net::*"]
+"#;
+
+    #[test]
+    fn parses_calls_section() {
+        let c = Config::parse(CALLS).unwrap();
+        assert_eq!(c.calls.hot, ["crate::server::*"]);
+        assert_eq!(c.calls.io, ["crate::db", "crate::net::*"]);
+    }
+
+    #[test]
+    fn calls_defaults_are_empty() {
+        let c = Config::parse("").unwrap();
+        assert!(c.calls.hot.is_empty());
+        assert!(c.calls.io.is_empty());
+    }
+
+    #[test]
+    fn bad_calls_glob_is_rejected() {
+        let src = "[calls]\nhot = [\"a/***/b\"]\n";
+        let err = Config::parse(src).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::CallsGlob { ref field, .. } if field == "hot"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn is_hot_and_is_io_module_match() {
+        let c = Config::parse(CALLS).unwrap();
+        assert!(c.calls.is_hot("crate::server::handle"));
+        assert!(!c.calls.is_hot("crate::util::helper"));
+        assert!(c.calls.is_io_module("crate::db"));
+        assert!(c.calls.is_io_module("crate::net::http"));
+        assert!(!c.calls.is_io_module("crate::domain"));
     }
 }

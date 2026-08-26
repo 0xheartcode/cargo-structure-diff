@@ -9,6 +9,9 @@
 //! - `terminal_state_without_exit`: a Variant with an incoming but no outgoing transition.
 //! - `new_state_cycle`: a cycle among states (a Transitions SCC, or a self-transition).
 //!
+//! One rule for M4 over the call graph (Calls edges, SPEC.md 3.3):
+//! - `io_in_hot_path`: a call from a `calls.hot` function into a `calls.io` module.
+//!
 //! All are ratchet-aware. Under [`RatchetMode::NewOnly`] only violations introduced by a newly
 //! added edge fail, which is what lets a brownfield repo adopt the gate without a red day one.
 //! A lint runs only when it appears in the config `deny` or `warn` list, and its findings are
@@ -80,6 +83,10 @@ pub fn lint(head: &Graph, changes: &[Change], config: &Config) -> Vec<Finding> {
     }
     if let Some(sev) = severity_of("new_state_cycle") {
         findings.extend(new_state_cycle(head, config, &added_transitions, sev));
+    }
+    if let Some(sev) = severity_of("io_in_hot_path") {
+        let added_calls = added_call_edges(changes);
+        findings.extend(io_in_hot_path(head, config, &added_calls, sev));
     }
 
     findings.sort_by(|a, b| (&a.rule, &a.message).cmp(&(&b.rule, &b.message)));
@@ -380,6 +387,55 @@ fn new_state_cycle(
             severity,
             message: format!("state cycle: {}", names.join(" -> ")),
         });
+    }
+    findings
+}
+
+/// The `(from, to)` ids of `Calls` edges added between base and head.
+fn added_call_edges(changes: &[Change]) -> BTreeSet<(&StableId, &StableId)> {
+    changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::EdgeAdded(e) if e.kind == EdgeKind::Calls => Some((&e.from, &e.to)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The owning module id of a function id: the id minus its last `::segment`. Returns `None` when
+/// the id has no `::` (no enclosing module to attribute the call to).
+fn owning_module(fn_id: &str) -> Option<&str> {
+    fn_id.rsplit_once("::").map(|(module, _)| module)
+}
+
+/// io_in_hot_path: flag a `Calls` edge whose caller matches a `calls.hot` glob and whose callee's
+/// owning module matches a `calls.io` glob. Under new-only, only newly added calls are flagged;
+/// under all, any matching call is flagged.
+fn io_in_hot_path(
+    head: &Graph,
+    config: &Config,
+    added: &BTreeSet<(&StableId, &StableId)>,
+    severity: Severity,
+) -> Vec<Finding> {
+    let restrict = new_only(config);
+    let mut findings = Vec::new();
+    for e in &head.edges {
+        if e.kind != EdgeKind::Calls {
+            continue;
+        }
+        if restrict && !added.contains(&(&e.from, &e.to)) {
+            continue;
+        }
+        let Some(callee_owner) = owning_module(e.to.as_str()) else {
+            continue;
+        };
+        if config.calls.is_hot(e.from.as_str()) && config.calls.is_io_module(callee_owner) {
+            findings.push(Finding {
+                rule: "io_in_hot_path".to_string(),
+                severity,
+                message: format!("{} (hot) calls into {} (io)", e.from.as_str(), callee_owner),
+            });
+        }
     }
     findings
 }
@@ -838,6 +894,156 @@ deny = ["layering", "cycles"]
             edges: vec![transition("S::Open", "S::Done")],
         };
         assert!(lint(&head, &[], &cfg("")).is_empty());
+    }
+
+    fn calls(from: &str, to: &str) -> Edge {
+        Edge {
+            from: StableId::new(from),
+            to: StableId::new(to),
+            kind: EdgeKind::Calls,
+            span: SourceSpan {
+                file: "src/lib.rs".into(),
+                start: 0,
+                end: 1,
+            },
+            ordinal: None,
+        }
+    }
+
+    fn fn_node(id: &str) -> csd_ir::Node {
+        csd_ir::Node {
+            id: StableId::new(id),
+            kind: NodeKind::Fn,
+            span: SourceSpan {
+                file: "src/lib.rs".into(),
+                start: 0,
+                end: 1,
+            },
+            attrs: BTreeMap::new(),
+            fingerprint: None,
+        }
+    }
+
+    const CALLS: &str = r#"
+[calls]
+hot = ["crate::server::*"]
+io  = ["crate::db", "crate::net::*"]
+
+[lint]
+deny = ["io_in_hot_path"]
+"#;
+
+    const CALLS_ALL: &str = r#"
+[calls]
+hot = ["crate::server::*"]
+io  = ["crate::db", "crate::net::*"]
+
+[lint]
+deny = ["io_in_hot_path"]
+
+[ratchet]
+mode = "all"
+"#;
+
+    #[test]
+    fn new_io_call_from_hot_fn_trips() {
+        let head = Graph {
+            nodes: vec![
+                fn_node("crate::server::handle"),
+                fn_node("crate::db::query"),
+            ],
+            edges: vec![calls("crate::server::handle", "crate::db::query")],
+        };
+        let changes = vec![Change::EdgeAdded(calls(
+            "crate::server::handle",
+            "crate::db::query",
+        ))];
+        let f = lint(&head, &changes, &cfg(CALLS));
+        let io: Vec<_> = f.iter().filter(|f| f.rule == "io_in_hot_path").collect();
+        assert_eq!(io.len(), 1, "expected one io finding: {f:?}");
+        assert_eq!(io[0].severity, Severity::Deny);
+        assert_eq!(
+            io[0].message,
+            "crate::server::handle (hot) calls into crate::db (io)"
+        );
+    }
+
+    #[test]
+    fn preexisting_io_call_passes_under_ratchet() {
+        let head = Graph {
+            nodes: vec![
+                fn_node("crate::server::handle"),
+                fn_node("crate::db::query"),
+            ],
+            edges: vec![calls("crate::server::handle", "crate::db::query")],
+        };
+        // No EdgeAdded: the call predates the change, so new-only stays silent.
+        let f = lint(&head, &[], &cfg(CALLS));
+        assert!(f.iter().all(|f| f.rule != "io_in_hot_path"), "{f:?}");
+    }
+
+    #[test]
+    fn preexisting_io_call_trips_under_all_mode() {
+        let head = Graph {
+            nodes: vec![
+                fn_node("crate::server::handle"),
+                fn_node("crate::db::query"),
+            ],
+            edges: vec![calls("crate::server::handle", "crate::db::query")],
+        };
+        let f = lint(&head, &[], &cfg(CALLS_ALL));
+        let io: Vec<_> = f.iter().filter(|f| f.rule == "io_in_hot_path").collect();
+        assert_eq!(io.len(), 1, "all mode flags pre-existing calls: {f:?}");
+    }
+
+    #[test]
+    fn hot_call_into_non_io_does_not_trip() {
+        let head = Graph {
+            nodes: vec![
+                fn_node("crate::server::handle"),
+                fn_node("crate::domain::compute"),
+            ],
+            edges: vec![calls("crate::server::handle", "crate::domain::compute")],
+        };
+        let changes = vec![Change::EdgeAdded(calls(
+            "crate::server::handle",
+            "crate::domain::compute",
+        ))];
+        assert!(lint(&head, &changes, &cfg(CALLS_ALL))
+            .iter()
+            .all(|f| f.rule != "io_in_hot_path"));
+    }
+
+    #[test]
+    fn non_hot_call_into_io_does_not_trip() {
+        let head = Graph {
+            nodes: vec![fn_node("crate::worker::run"), fn_node("crate::db::query")],
+            edges: vec![calls("crate::worker::run", "crate::db::query")],
+        };
+        let changes = vec![Change::EdgeAdded(calls(
+            "crate::worker::run",
+            "crate::db::query",
+        ))];
+        assert!(lint(&head, &changes, &cfg(CALLS_ALL))
+            .iter()
+            .all(|f| f.rule != "io_in_hot_path"));
+    }
+
+    #[test]
+    fn io_in_hot_path_silent_when_not_selected() {
+        let head = Graph {
+            nodes: vec![
+                fn_node("crate::server::handle"),
+                fn_node("crate::db::query"),
+            ],
+            edges: vec![calls("crate::server::handle", "crate::db::query")],
+        };
+        let toml = "[calls]\nhot = [\"crate::server::*\"]\nio = [\"crate::db\"]\n";
+        let changes = vec![Change::EdgeAdded(calls(
+            "crate::server::handle",
+            "crate::db::query",
+        ))];
+        assert!(lint(&head, &changes, &cfg(toml)).is_empty());
     }
 
     #[test]
