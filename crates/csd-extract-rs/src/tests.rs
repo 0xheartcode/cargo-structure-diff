@@ -273,6 +273,108 @@ fn multi_crate_ids_are_namespaced_per_crate() {
         .any(|id| *id == "crate" || id.starts_with("crate::")));
 }
 
+/// A crate whose enum carries a state machine, exercising the transition idioms.
+fn state_fixture() -> Graph {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/lib.rs",
+        r#"
+pub enum Light { Red, Green, Yellow, Off }
+
+impl Light {
+    /// match-arm-returns-variant, mixing `Light::` and `Self::` and a bare name.
+    pub fn next(self) -> Light {
+        match self {
+            Light::Red => Light::Green,
+            Self::Green => Yellow,
+            Light::Yellow => Light::Red,
+            Light::Off => Light::Off, // self-loop: from == to, no edge
+        }
+    }
+
+    /// `*self = Variant` inside a block arm, and a direct assignment arm.
+    pub fn turn_off(&mut self) {
+        match self {
+            Light::Red => { *self = Light::Off; }
+            Self::Green => *self = Self::Off,
+            other => { let _ = other; } // binding, not a variant: no edge
+        }
+    }
+
+    /// An unrelated match on an integer must yield no transitions.
+    pub fn describe(&self) -> u8 {
+        match 3u8 {
+            0 => 1,
+            _ => 2,
+        }
+    }
+
+    /// Assigning a *different* enum's variant must not be read as a transition.
+    pub fn touch(&mut self) {
+        match self {
+            Light::Red => self.foreign = Mode::On,
+            _ => {}
+        }
+    }
+}
+
+pub enum Mode { On, Off }
+"#,
+    );
+    extract(root).unwrap()
+}
+
+fn transitions(g: &Graph) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = g
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Transitions)
+        .map(|e| (e.from.as_str().to_string(), e.to.as_str().to_string()))
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn enum_transitions_are_detected() {
+    let g = state_fixture();
+    let got = transitions(&g);
+    let want: Vec<(String, String)> = [
+        ("crate::Light::Green", "crate::Light::Off"),
+        ("crate::Light::Green", "crate::Light::Yellow"),
+        ("crate::Light::Red", "crate::Light::Green"),
+        ("crate::Light::Red", "crate::Light::Off"),
+        ("crate::Light::Yellow", "crate::Light::Red"),
+    ]
+    .iter()
+    .map(|(f, t)| (f.to_string(), t.to_string()))
+    .collect();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn no_spurious_transitions() {
+    let g = state_fixture();
+    let ts = transitions(&g);
+    // Self-loops are never emitted.
+    assert!(!ts.iter().any(|(f, t)| f == t));
+    // The unrelated integer match and the foreign-enum assignment produce nothing extra.
+    assert!(!ts
+        .iter()
+        .any(|(_, t)| t.contains("Mode") || t.starts_with("crate::Mode")));
+    // No transition ever lands on a non-Light node.
+    assert!(ts
+        .iter()
+        .all(|(f, t)| f.starts_with("crate::Light::") && t.starts_with("crate::Light::")));
+}
+
+#[test]
+fn transitions_are_deterministic() {
+    assert_eq!(transitions(&state_fixture()), transitions(&state_fixture()));
+}
+
 #[test]
 fn output_is_deterministic() {
     let a = fixture();

@@ -186,6 +186,22 @@ struct Extractor {
     seen_files: BTreeSet<PathBuf>,
     /// Raw `use` targets collected across the walk, resolved to edges in [`Extractor::finish`].
     uses: Vec<RawUse>,
+    /// Candidate enum state transitions, resolved to edges in [`Extractor::finish`].
+    transitions: Vec<RawTransition>,
+}
+
+/// One candidate state transition: two variant *names* of the same enum, resolved to actual
+/// [`NodeKind::Variant`] nodes in [`Extractor::finish`]. Collection is liberal; the membership
+/// check there is the precision guard, so a bare pattern that only binds is dropped.
+struct RawTransition {
+    /// The owning enum's id (`{module}::{Enum}`), assumed to be the impl's own module.
+    enum_id: String,
+    /// The from-variant name (unqualified).
+    from: String,
+    /// The to-variant name (unqualified).
+    to: String,
+    /// The arm the transition was read from.
+    span: SourceSpan,
 }
 
 /// One expanded `use` target: a single path (nested `{..}` groups are flattened before storage).
@@ -218,6 +234,7 @@ impl Extractor {
             seen_modules: BTreeSet::new(),
             seen_files: BTreeSet::new(),
             uses: Vec::new(),
+            transitions: Vec::new(),
         }
     }
 
@@ -275,6 +292,36 @@ impl Extractor {
                     }
                 }
             }
+        }
+
+        // Resolve candidate transitions: emit an edge only when both endpoints name a variant node
+        // actually emitted for that enum, and the arm changes variant. Deduped by (from, to).
+        let variant_ids: BTreeSet<String> = self
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Variant)
+            .map(|n| n.id.as_str().to_string())
+            .collect();
+        let mut transitions: BTreeMap<(String, String), SourceSpan> = BTreeMap::new();
+        for t in &self.transitions {
+            let from = format!("{}::{}", t.enum_id, t.from);
+            let to = format!("{}::{}", t.enum_id, t.to);
+            if from == to || !variant_ids.contains(&from) || !variant_ids.contains(&to) {
+                continue;
+            }
+            transitions
+                .entry((from, to))
+                .or_insert_with(|| t.span.clone());
+        }
+        for ((from, to), span) in transitions {
+            self.graph.edges.push(Edge {
+                from: StableId::new(from),
+                to: StableId::new(to),
+                kind: EdgeKind::Transitions,
+                span,
+                ordinal: None,
+            });
         }
         self.graph.normalize();
         Ok(self.graph)
@@ -417,8 +464,102 @@ impl Extractor {
                     collect_uses(arg, "", mod_path, is_pub, &span, src, &mut self.uses);
                 }
             }
+            "impl_item" => self.analyze_impl(node, ctx, mod_path),
             "mod_item" => self.emit_mod(node, ctx, mod_path, path_attr),
             _ => {}
+        }
+    }
+
+    /// Scan an `impl` block for enum state transitions (SPEC 3.4). No nodes are emitted; candidate
+    /// transitions are collected and resolved against the emitted variant set in [`Self::finish`].
+    /// The impl's `Self` type is assumed to live in the impl's own module (`mod_path`).
+    fn analyze_impl(&mut self, node: TsNode, ctx: &FileCtx, mod_path: &str) {
+        let src = ctx.src;
+        let Some(ty) = node.child_by_field_name("type") else {
+            return;
+        };
+        let enum_name = last_ident(ty, src);
+        if enum_name.is_empty() {
+            return;
+        }
+        let enum_id = format!("{mod_path}::{enum_name}");
+        let Some(body) = child_kind(node, "declaration_list") else {
+            return;
+        };
+        let mut cursor = body.walk();
+        for item in body.named_children(&mut cursor) {
+            if item.kind() == "function_item" {
+                self.analyze_method(item, &enum_id, &enum_name, ctx);
+            }
+        }
+    }
+
+    /// Read transitions out of one method whose receiver (or a parameter) is the enum type.
+    fn analyze_method(&mut self, node: TsNode, enum_id: &str, enum_name: &str, ctx: &FileCtx) {
+        let (src, file) = (ctx.src, ctx.file);
+        let Some(body) = node.child_by_field_name("body") else {
+            return;
+        };
+        let mut has_self = false;
+        let mut enum_params: BTreeSet<String> = BTreeSet::new();
+        if let Some(params) = child_kind(node, "parameters") {
+            let mut cursor = params.walk();
+            for param in params.named_children(&mut cursor) {
+                match param.kind() {
+                    "self_parameter" => has_self = true,
+                    "parameter" => {
+                        let is_enum = param
+                            .child_by_field_name("type")
+                            .map(|t| last_ident(t, src) == enum_name)
+                            .unwrap_or(false);
+                        if is_enum {
+                            if let Some(pat) = param.child_by_field_name("pattern") {
+                                if pat.kind() == "identifier" {
+                                    enum_params.insert(text(pat, src));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut matches = Vec::new();
+        collect_match_exprs(body, &mut matches);
+        for m in matches {
+            let Some(value) = m.child_by_field_name("value") else {
+                continue;
+            };
+            if !is_enum_scrutinee(value, has_self, &enum_params, src) {
+                continue;
+            }
+            let Some(block) = m.child_by_field_name("body") else {
+                continue;
+            };
+            let mut cursor = block.walk();
+            for arm in block.named_children(&mut cursor) {
+                if arm.kind() != "match_arm" {
+                    continue;
+                }
+                let Some(from) = arm
+                    .child_by_field_name("pattern")
+                    .and_then(|p| variant_from_pattern(p, enum_name, src))
+                else {
+                    continue;
+                };
+                let Some(value) = arm.child_by_field_name("value") else {
+                    continue;
+                };
+                for to in arm_to_variants(value, enum_name, src) {
+                    self.transitions.push(RawTransition {
+                        enum_id: enum_id.to_string(),
+                        from: from.clone(),
+                        to,
+                        span: span_of(arm, file),
+                    });
+                }
+            }
         }
     }
 
@@ -914,6 +1055,182 @@ fn child_kind<'a>(node: TsNode<'a>, kind: &str) -> Option<TsNode<'a>> {
     let mut cursor = node.walk();
     let found = node.children(&mut cursor).find(|c| c.kind() == kind);
     found
+}
+
+/// Collect every `match_expression` reachable under `node` (including nested ones).
+fn collect_match_exprs<'a>(node: TsNode<'a>, out: &mut Vec<TsNode<'a>>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "match_expression" {
+            out.push(child);
+        }
+        collect_match_exprs(child, out);
+    }
+}
+
+/// Whether a match scrutinee is the enum: `self`/`*self`/`&self` (in an impl of the enum) or a
+/// parameter typed as the enum.
+fn is_enum_scrutinee(
+    value: TsNode,
+    has_self: bool,
+    enum_params: &BTreeSet<String>,
+    src: &[u8],
+) -> bool {
+    match value.kind() {
+        "self" => has_self,
+        "identifier" => enum_params.contains(&text(value, src)),
+        "unary_expression" | "reference_expression" | "parenthesized_expression" => {
+            has_self && has_self_descendant(value)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `node` contains a `self` token (used for `*self` / `&self` scrutinees and targets).
+fn has_self_descendant(node: TsNode) -> bool {
+    let mut cursor = node.walk();
+    let found = node
+        .named_children(&mut cursor)
+        .any(|c| c.kind() == "self" || has_self_descendant(c));
+    found
+}
+
+/// The from-variant named by a `match_pattern`, if it resolves to this enum. The pattern is the
+/// first child; a trailing `if` guard is ignored.
+fn variant_from_pattern(match_pattern: TsNode, enum_name: &str, src: &[u8]) -> Option<String> {
+    let pat = match_pattern.named_child(0)?;
+    match pat.kind() {
+        "scoped_identifier" => scoped_variant(pat, enum_name, src),
+        "identifier" => Some(text(pat, src)),
+        "tuple_struct_pattern" | "struct_pattern" => pat
+            .child_by_field_name("type")
+            .and_then(|t| variant_from_type_path(t, enum_name, src)),
+        _ => None,
+    }
+}
+
+/// The to-variant(s) produced by a match arm: a direct variant expression, a `*self`/`self.field`
+/// assignment, or a returned variant. Bounded to the arm value and its direct statements.
+fn arm_to_variants(value: TsNode, enum_name: &str, src: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_tos(value, enum_name, src, &mut out);
+    out
+}
+
+fn collect_tos(node: TsNode, enum_name: &str, src: &[u8], out: &mut Vec<String>) {
+    match node.kind() {
+        "block" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_tos(child, enum_name, src, out);
+            }
+        }
+        "expression_statement" => {
+            if let Some(inner) = node.named_child(0) {
+                collect_tos(inner, enum_name, src, out);
+            }
+        }
+        "return_expression" => {
+            if let Some(inner) = node.named_child(0) {
+                if let Some(v) = variant_of_expr(inner, enum_name, src) {
+                    out.push(v);
+                }
+            }
+        }
+        "assignment_expression" => {
+            let self_target = node
+                .child_by_field_name("left")
+                .map(is_self_target)
+                .unwrap_or(false);
+            if self_target {
+                if let Some(v) = node
+                    .child_by_field_name("right")
+                    .and_then(|r| variant_of_expr(r, enum_name, src))
+                {
+                    out.push(v);
+                }
+            }
+        }
+        _ => {
+            if let Some(v) = variant_of_expr(node, enum_name, src) {
+                out.push(v);
+            }
+        }
+    }
+}
+
+/// Whether `left` is a `*self` or `self.field` assignment target.
+fn is_self_target(left: TsNode) -> bool {
+    match left.kind() {
+        "unary_expression" => has_self_descendant(left),
+        "field_expression" => left
+            .child_by_field_name("value")
+            .map(|v| v.kind() == "self")
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// The variant named by an expression that constructs one: `Enum::V`, `Self::V`, bare `V`,
+/// `Enum::V(..)`, or `Self::V { .. }`.
+fn variant_of_expr(node: TsNode, enum_name: &str, src: &[u8]) -> Option<String> {
+    match node.kind() {
+        "scoped_identifier" => scoped_variant(node, enum_name, src),
+        "identifier" | "type_identifier" => Some(text(node, src)),
+        "call_expression" => node
+            .child_by_field_name("function")
+            .and_then(|f| variant_of_expr(f, enum_name, src)),
+        "struct_expression" => node
+            .child_by_field_name("name")
+            .and_then(|t| variant_from_type_path(t, enum_name, src)),
+        _ => None,
+    }
+}
+
+/// The variant name from a `scoped_identifier` whose path is the enum or `Self`.
+fn scoped_variant(node: TsNode, enum_name: &str, src: &[u8]) -> Option<String> {
+    let path = node.child_by_field_name("path")?;
+    if !path_is_enum(path, enum_name, src) {
+        return None;
+    }
+    node.child_by_field_name("name").map(|n| text(n, src))
+}
+
+/// The variant name from a pattern/struct type path (`Enum::V`, `Self::V`, bare `V`).
+fn variant_from_type_path(node: TsNode, enum_name: &str, src: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" | "type_identifier" => Some(text(node, src)),
+        "scoped_identifier" | "scoped_type_identifier" => {
+            let path = node.child_by_field_name("path")?;
+            if !path_is_enum(path, enum_name, src) {
+                return None;
+            }
+            node.child_by_field_name("name").map(|n| text(n, src))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a scope path's trailing segment is the enum name or `Self`.
+fn path_is_enum(path: TsNode, enum_name: &str, src: &[u8]) -> bool {
+    let last = last_ident(path, src);
+    last == enum_name || last == "Self"
+}
+
+/// The trailing identifier of a possibly-scoped path or type (`a::b::T` -> `T`).
+fn last_ident(node: TsNode, src: &[u8]) -> String {
+    match node.kind() {
+        "scoped_identifier" | "scoped_type_identifier" => node
+            .child_by_field_name("name")
+            .map(|n| text(n, src))
+            .unwrap_or_default(),
+        "generic_type" => node
+            .child_by_field_name("type")
+            .or_else(|| node.named_child(0))
+            .map(|t| last_ident(t, src))
+            .unwrap_or_default(),
+        _ => text(node, src),
+    }
 }
 
 /// The outer-doc text (`///`) of a `line_comment`, or `None` for a regular comment.
