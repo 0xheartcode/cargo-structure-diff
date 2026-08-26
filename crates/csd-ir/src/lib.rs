@@ -12,10 +12,14 @@
 //!
 //! # What is implemented here
 //!
-//! The data model (this file) is the lead-owned seam and is stable. Behaviour that reads source,
-//! namely stable-id computation, structural fingerprints, and similarity scoring, is declared here
-//! as signatures and tracked in the backlog (see `BACKLOG.md`, area `ir`); it is intentionally not
-//! yet implemented at v0.0.0.
+//! The data model (this file) is the lead-owned seam and is stable. Structural fingerprints and
+//! similarity scoring live in [`fingerprint`]. Stable-id *derivation* (assigning a [`StableId`]
+//! that survives a rename, rather than wrapping a caller-provided string) is still deferred to the
+//! differ and tracked in the backlog (area `ir`/`diff`).
+
+pub mod fingerprint;
+
+pub use fingerprint::{doc_hash, similarity, similarity_weighted, Fingerprint, SimilarityWeights};
 
 use std::collections::BTreeMap;
 
