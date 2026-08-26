@@ -1,0 +1,14 @@
+[package]
+name = "csd-extract-rs"
+description = "Rust source to structural graph IR for cargo-structure-diff, via tree-sitter."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+csd-ir = { workspace = true }
+anyhow = { workspace = true }
+# tree-sitter grammars are added with the M0 extractor work (backlog `extract`).

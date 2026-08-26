@@ -1,0 +1,25 @@
+# cargo-structure-diff configuration (example; not yet consumed at v0.0.0)
+# See SPEC.md section 7 for the full schema.
+
+[layers]
+# declared architectural strata, top (allowed to depend down) to bottom
+order = ["api", "domain", "ports", "infra"]
+# modules are mapped to a layer by path glob (first match wins)
+map = [
+    { layer = "api",    glob = "crates/*/src/api/**" },
+    { layer = "domain", glob = "crates/*/src/domain/**" },
+    { layer = "ports",  glob = "crates/*/src/ports/**" },
+    { layer = "infra",  glob = "crates/*/src/infra/**" },
+]
+forbid = [{ from = "domain", to = "infra" }]
+
+[views]
+enabled = ["modules", "states"]
+
+[lint]
+deny = ["layering", "cycles", "unreachable_state"]
+warn = ["fan_in", "fan_out"]
+
+# default CI behaviour: fail only on violations NEW since the base ref
+[ratchet]
+mode = "new-only"

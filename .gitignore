@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# harness corpus and scratch output live outside the tree, but ignore any local spillover
+/corpus
+/.csd-cache
+*.log

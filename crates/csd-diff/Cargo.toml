@@ -1,0 +1,12 @@
+[package]
+name = "csd-diff"
+description = "Model diffing for cargo-structure-diff: set diff over graphs plus rename/move detection."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+csd-ir = { workspace = true }

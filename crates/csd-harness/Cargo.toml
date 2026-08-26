@@ -1,0 +1,20 @@
+[package]
+name = "csd-harness"
+description = "M0 validation harness for cargo-structure-diff: replay merged PRs and measure rename false positives. Never published."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "csd-harness"
+path = "src/main.rs"
+
+[dependencies]
+csd-ir = { workspace = true }
+csd-diff = { workspace = true }
+csd-extract-rs = { workspace = true }
+anyhow = { workspace = true }
