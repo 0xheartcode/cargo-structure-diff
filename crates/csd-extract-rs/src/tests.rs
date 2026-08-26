@@ -467,6 +467,131 @@ fn type_view_edges_are_deterministic() {
     );
 }
 
+/// A crate exercising the call graph: free fn to free fn, self/Self methods, and an unresolvable
+/// external call plus a method on an unknown receiver.
+fn calls_fixture() -> Graph {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/lib.rs",
+        r#"
+pub fn helper(x: u64) -> u64 {
+    x + 1
+}
+
+pub fn entry(x: u64) -> u64 {
+    let a = helper(x);
+    external_thing();
+    helper(a)
+}
+
+pub struct Widget;
+
+impl Widget {
+    pub fn assoc() -> u64 {
+        0
+    }
+
+    pub fn other(&self) -> u64 {
+        7
+    }
+
+    pub fn run(&self) -> u64 {
+        let a = self.other();
+        let b = Self::assoc();
+        let c = unknown.compute();
+        a + b + c
+    }
+}
+"#,
+    );
+    extract(root).unwrap()
+}
+
+fn calls(g: &Graph) -> Vec<(String, String, u32)> {
+    let mut v: Vec<(String, String, u32)> = g
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Calls)
+        .map(|e| {
+            (
+                e.from.as_str().to_string(),
+                e.to.as_str().to_string(),
+                e.ordinal.expect("Calls edges carry an ordinal"),
+            )
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn impl_methods_are_emitted_as_fn_nodes() {
+    let g = calls_fixture();
+    for id in [
+        "crate::Widget::assoc",
+        "crate::Widget::other",
+        "crate::Widget::run",
+    ] {
+        assert_eq!(node(&g, id).kind, NodeKind::Fn, "missing method fn {id}");
+    }
+}
+
+#[test]
+fn calls_edges_are_ordered_and_resolved() {
+    let g = calls_fixture();
+    // Free fn to free fn (twice, dense ordinals), and self/Self method calls. The external
+    // `external_thing()` and the `unknown.compute()` method call resolve to nothing.
+    assert_eq!(
+        calls(&g),
+        vec![
+            (
+                "crate::Widget::run".to_string(),
+                "crate::Widget::assoc".to_string(),
+                1
+            ),
+            (
+                "crate::Widget::run".to_string(),
+                "crate::Widget::other".to_string(),
+                0
+            ),
+            ("crate::entry".to_string(), "crate::helper".to_string(), 0),
+            ("crate::entry".to_string(), "crate::helper".to_string(), 1),
+        ]
+    );
+}
+
+#[test]
+fn unresolved_calls_are_counted_on_the_caller() {
+    let g = calls_fixture();
+    // `entry` has one external call; `run` has one method call on an unknown receiver.
+    assert_eq!(
+        node(&g, "crate::entry").attrs.get("unresolved_calls"),
+        Some(&"1".to_string())
+    );
+    assert_eq!(
+        node(&g, "crate::Widget::run").attrs.get("unresolved_calls"),
+        Some(&"1".to_string())
+    );
+    // Callees with only resolved (or no) calls carry no ceiling attr.
+    for id in [
+        "crate::helper",
+        "crate::Widget::other",
+        "crate::Widget::assoc",
+    ] {
+        assert!(
+            !node(&g, id).attrs.contains_key("unresolved_calls"),
+            "{id} should have no unresolved_calls attr"
+        );
+    }
+}
+
+#[test]
+fn calls_are_deterministic() {
+    assert_eq!(calls(&calls_fixture()), calls(&calls_fixture()));
+}
+
 #[test]
 fn output_is_deterministic() {
     let a = fixture();
