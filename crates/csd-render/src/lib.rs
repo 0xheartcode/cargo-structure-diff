@@ -1,8 +1,10 @@
 //! Render a graph and its delta as one annotated Mermaid diagram.
 //!
-//! Two views live here: [`render_module_view`] (a `flowchart` over `Module` nodes and `Uses`
-//! edges) and [`render_state_view`] (a `stateDiagram-v2` over `Variant` nodes and `Transitions`
-//! edges, SPEC.md 3.4). Both follow the project convention (SPEC.md section 4): the delta is
+//! Three views live here: [`render_module_view`] (a `flowchart` over `Module` nodes and `Uses`
+//! edges), [`render_state_view`] (a `stateDiagram-v2` over `Variant` nodes and `Transitions`
+//! edges, SPEC.md 3.4) and [`render_type_view`] (a `classDiagram` over `Struct`/`Enum`/`Trait`
+//! nodes with `Implements`/`Associates` relations, SPEC.md 3.2). All follow the project convention
+//! (SPEC.md section 4): the delta is
 //! colour-encoded onto a single drawing rather than diffing two images (green added, red-dashed
 //! removed, amber changed, gray unchanged context) and the graph is pruned to changed nodes, the
 //! endpoints of changed edges, and a two-hop neighbourhood, so a large system never renders in
@@ -13,7 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use csd_ir::{Change, EdgeKind, Graph, NodeKind, StableId};
+use csd_ir::{Change, EdgeKind, Fingerprint, Graph, NodeKind, StableId};
 
 /// How far from a changed node a context node is still drawn.
 const CONTEXT_HOPS: usize = 2;
@@ -161,6 +163,118 @@ pub fn render_state_view(head: &Graph, changes: &[Change]) -> String {
     out
 }
 
+/// Render the type view of `head` with `changes` colour-encoded, as a Mermaid `classDiagram`
+/// (SPEC.md 3.2).
+///
+/// Classes are [`NodeKind::Struct`], [`NodeKind::Enum`] and [`NodeKind::Trait`] nodes (traits carry
+/// a `<<trait>>` stereotype). Relations: [`EdgeKind::Implements`] renders as a realization
+/// `Type ..|> Trait` and [`EdgeKind::Associates`] as an association `Type --> Other`. Classes are
+/// coloured via the `:::` operator, reusing [`CLASS_DEFS`].
+///
+/// `classDiagram` cannot colour individual members, so per-member delta is carried as a text prefix
+/// on member lines (`+` added, `-` removed, `~` type changed, plain unchanged): see [`member_lines`].
+/// DOT HTML-like labels are the future path for true per-member background colour.
+///
+/// Pruning is one-hop (SPEC.md 3.2): changed classes plus the classes one relation away, tighter
+/// than the two-hop module/state views because a type graph fans out fast.
+pub fn render_type_view(head: &Graph, changes: &[Change]) -> String {
+    // Struct, Enum and Trait nodes all render as classes.
+    let mut nodes = collect_nodes(head, changes, NodeKind::Struct);
+    nodes.extend(collect_nodes(head, changes, NodeKind::Enum));
+    nodes.extend(collect_nodes(head, changes, NodeKind::Trait));
+
+    let node_class = classify_nodes(&nodes, changes);
+
+    // Implements (realization) and Associates (association) relations, tagged with their kind.
+    let mut relations: Vec<(&StableId, &StableId, EdgeKind, Class)> = Vec::new();
+    for (from, to, class) in collect_edges(head, changes, &nodes, EdgeKind::Implements) {
+        relations.push((from, to, EdgeKind::Implements, class));
+    }
+    for (from, to, class) in collect_edges(head, changes, &nodes, EdgeKind::Associates) {
+        relations.push((from, to, EdgeKind::Associates, class));
+    }
+    relations.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+
+    // One-hop prune: changed classes plus the classes one relation away.
+    let prune_edges: Vec<(&StableId, &StableId, Class)> =
+        relations.iter().map(|(f, t, _, c)| (*f, *t, *c)).collect();
+    let kept = prune_within(&nodes, &node_class, &prune_edges, 1);
+
+    let mut out = String::from("classDiagram\n");
+    out.push_str(CLASS_DEFS);
+    out.push('\n');
+
+    if kept.is_empty() {
+        out.push_str("    %% no structural changes in the type view\n");
+        return out;
+    }
+
+    // Stable c<i> handles in id order (class ids carry `::`/`<>`, so a raw id is not a valid name).
+    let handles: BTreeMap<&StableId, String> = kept
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, format!("c{i}")))
+        .collect();
+
+    // Node kind (for the trait stereotype) and the before/after fingerprints of Modified classes.
+    let kind_of: BTreeMap<&StableId, NodeKind> =
+        head.nodes.iter().map(|n| (&n.id, n.kind)).collect();
+    let modified: BTreeMap<&StableId, (&Fingerprint, &Fingerprint)> = changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::Modified { before, after } => {
+                match (before.fingerprint.as_ref(), after.fingerprint.as_ref()) {
+                    (Some(b), Some(a)) => Some((&after.id, (b, a))),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Declare each class, with a `<<trait>>` stereotype and (for Modified classes) member lines.
+    for id in &kept {
+        let handle = &handles[id];
+        let is_trait = kind_of.get(id).copied() == Some(NodeKind::Trait);
+        let members = modified.get(id).map(|(b, a)| member_lines(b, a));
+        let has_body = is_trait || members.as_ref().is_some_and(|m| !m.is_empty());
+        if has_body {
+            let _ = writeln!(out, "    class {}[\"{}\"] {{", handle, id.as_str());
+            if is_trait {
+                out.push_str("        <<trait>>\n");
+            }
+            if let Some(lines) = &members {
+                for line in lines {
+                    let _ = writeln!(out, "        {line}");
+                }
+            }
+            out.push_str("    }\n");
+        } else {
+            let _ = writeln!(out, "    class {}[\"{}\"]", handle, id.as_str());
+        }
+    }
+
+    // Colour each class via the ::: operator.
+    for id in &kept {
+        let class = node_class.get(id).copied().unwrap_or(Class::Context);
+        let _ = writeln!(out, "    class {}:::{}", handles[id], class.css());
+    }
+
+    // Relations in (from, to, kind) order; endpoints pruned away are skipped.
+    for (from, to, kind, _class) in &relations {
+        if !handles.contains_key(from) || !handles.contains_key(to) {
+            continue;
+        }
+        let arrow = match kind {
+            EdgeKind::Implements => "..|>",
+            _ => "-->",
+        };
+        let _ = writeln!(out, "    {} {} {}", handles[from], arrow, handles[to]);
+    }
+
+    out
+}
+
 use std::fmt::Write as _;
 
 /// Nodes of `kind` to consider: those in `head` plus any removed by the delta (absent from `head`).
@@ -253,11 +367,22 @@ fn collect_edges<'a>(
     edges
 }
 
-/// Keep changed nodes, the endpoints of changed edges, and everything within two hops of them.
+/// Keep changed nodes, the endpoints of changed edges, and everything within [`CONTEXT_HOPS`] of
+/// them.
 fn prune<'a>(
     nodes: &BTreeMap<&'a StableId, ()>,
     class: &BTreeMap<&'a StableId, Class>,
     edges: &[(&'a StableId, &'a StableId, Class)],
+) -> Vec<&'a StableId> {
+    prune_within(nodes, class, edges, CONTEXT_HOPS)
+}
+
+/// Like [`prune`] but with a caller-chosen neighbourhood radius. The type view passes `hops = 1`.
+fn prune_within<'a>(
+    nodes: &BTreeMap<&'a StableId, ()>,
+    class: &BTreeMap<&'a StableId, Class>,
+    edges: &[(&'a StableId, &'a StableId, Class)],
+    hops: usize,
 ) -> Vec<&'a StableId> {
     // Seed: changed nodes plus endpoints of added/removed edges.
     let mut seed: BTreeSet<&StableId> = class.keys().copied().collect();
@@ -271,7 +396,7 @@ fn prune<'a>(
         return Vec::new();
     }
 
-    // Undirected adjacency over the module edges.
+    // Undirected adjacency over the edges.
     let mut adj: BTreeMap<&StableId, Vec<&StableId>> = BTreeMap::new();
     for (from, to, _) in edges {
         adj.entry(from).or_default().push(to);
@@ -284,7 +409,7 @@ fn prune<'a>(
         if !kept.insert(id) {
             continue;
         }
-        if depth == CONTEXT_HOPS {
+        if depth == hops {
             continue;
         }
         if let Some(neighbours) = adj.get(id) {
@@ -302,10 +427,59 @@ fn prune<'a>(
         .collect()
 }
 
+/// The member name of a fingerprint member entry: the text before the first `:` (a `name: Type`
+/// signature), or the whole entry for a bare name.
+fn member_name(entry: &str) -> &str {
+    entry.split(':').next().unwrap_or(entry).trim()
+}
+
+/// Per-member delta lines for a Modified class, as Mermaid member lines with a text prefix.
+///
+/// `classDiagram` cannot colour individual members (SPEC.md 3.2), so the delta is carried inline:
+/// `+name` added, `-name` removed, `~name` type changed, plain `name` unchanged. Members are keyed
+/// by [`member_name`] and emitted in sorted order for determinism. A persisting member is `~` when
+/// its signature (name plus type) differs; for bare untyped members, which carry no per-member
+/// type, the aggregate `field_types` multiset is the best-effort change signal.
+fn member_lines(before: &Fingerprint, after: &Fingerprint) -> Vec<String> {
+    let index = |set: &BTreeSet<String>| -> BTreeMap<String, String> {
+        set.iter()
+            .map(|e| (member_name(e).to_string(), e.clone()))
+            .collect()
+    };
+    let b = index(&before.members);
+    let a = index(&after.members);
+    let field_types_changed = before.field_types != after.field_types;
+
+    let mut names: BTreeSet<&String> = BTreeSet::new();
+    names.extend(b.keys());
+    names.extend(a.keys());
+
+    let mut lines = Vec::new();
+    for name in names {
+        let line = match (b.get(name), a.get(name)) {
+            (None, Some(_)) => format!("+{name}"),
+            (Some(_), None) => format!("-{name}"),
+            (Some(be), Some(ae)) => {
+                let typed = be.contains(':') || ae.contains(':');
+                let changed = if typed { be != ae } else { field_types_changed };
+                if changed {
+                    format!("~{name}")
+                } else {
+                    name.clone()
+                }
+            }
+            // `names` is the union of the two key sets, so at least one side is present.
+            (None, None) => continue,
+        };
+        lines.push(line);
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use csd_ir::{Edge, EdgeKind, Node, SourceSpan};
+    use csd_ir::{Edge, EdgeKind, Fingerprint, Node, SourceSpan};
 
     fn span() -> SourceSpan {
         SourceSpan {
@@ -350,6 +524,35 @@ mod tests {
             from: StableId::new(from),
             to: StableId::new(to),
             kind: EdgeKind::Transitions,
+            span: span(),
+            ordinal: None,
+        }
+    }
+
+    fn type_node(id: &str, kind: NodeKind, fp: Option<Fingerprint>) -> Node {
+        Node {
+            id: StableId::new(id),
+            kind,
+            span: span(),
+            attrs: BTreeMap::new(),
+            fingerprint: fp,
+        }
+    }
+
+    fn fingerprint(members: &[&str], fields: &[(&str, u32)]) -> Fingerprint {
+        Fingerprint {
+            members: members.iter().map(|s| s.to_string()).collect(),
+            field_types: fields.iter().map(|(t, c)| (t.to_string(), *c)).collect(),
+            neighbors: BTreeSet::new(),
+            doc_hash: 0,
+        }
+    }
+
+    fn relation(from: &str, to: &str, kind: EdgeKind) -> Edge {
+        Edge {
+            from: StableId::new(from),
+            to: StableId::new(to),
+            kind,
             span: span(),
             ordinal: None,
         }
@@ -533,5 +736,116 @@ mod tests {
             !out.contains("crate::S::d"),
             "3-hop state must be pruned:\n{out}"
         );
+    }
+
+    #[test]
+    fn type_empty_delta_renders_no_changes() {
+        let head = Graph {
+            nodes: vec![type_node("crate::Order", NodeKind::Struct, None)],
+            edges: vec![],
+        };
+        let out = render_type_view(&head, &[]);
+        assert!(out.starts_with("classDiagram\n"));
+        assert!(out.contains("classDef added"));
+        assert!(out.contains("%% no structural changes in the type view"));
+        // Nothing was changed, so no class lines are drawn.
+        assert!(!out.contains(":::"));
+        assert!(!out.contains("class c"));
+    }
+
+    #[test]
+    fn type_delta_golden() {
+        // Order (struct) gains an `Implements` realization of the Billable trait, and is Modified:
+        // a member added (`customer`), one unchanged (`id`), one type-changed (`total`).
+        let before = fingerprint(&["id: u64", "total: Money"], &[("u64", 1), ("Money", 1)]);
+        let after = fingerprint(
+            &["customer: CustomerId", "id: u64", "total: Cents"],
+            &[("u64", 1), ("Cents", 1), ("CustomerId", 1)],
+        );
+        let head = Graph {
+            nodes: vec![
+                type_node("crate::Order", NodeKind::Struct, Some(after.clone())),
+                type_node("crate::Billable", NodeKind::Trait, None),
+            ],
+            edges: vec![relation(
+                "crate::Order",
+                "crate::Billable",
+                EdgeKind::Implements,
+            )],
+        };
+        let changes = vec![
+            Change::Modified {
+                before: type_node("crate::Order", NodeKind::Struct, Some(before)),
+                after: type_node("crate::Order", NodeKind::Struct, Some(after)),
+            },
+            Change::EdgeAdded(relation(
+                "crate::Order",
+                "crate::Billable",
+                EdgeKind::Implements,
+            )),
+        ];
+        let out = render_type_view(&head, &changes);
+        // Ids sort Billable < Order, so c0 is the trait and c1 the struct.
+        let expected = concat!(
+            "classDiagram\n",
+            "    classDef added fill:#f0fdf4,stroke:#22c55e,stroke-width:2px\n",
+            "    classDef removed fill:#fef2f2,stroke:#ef4444,stroke-width:2px,stroke-dasharray:4 4\n",
+            "    classDef changed fill:#fffbeb,stroke:#f59e0b,stroke-width:2px\n",
+            "    classDef context fill:#ffffff,stroke:#d1d5db,color:#9ca3af\n",
+            "    class c0[\"crate::Billable\"] {\n",
+            "        <<trait>>\n",
+            "    }\n",
+            "    class c1[\"crate::Order\"] {\n",
+            "        +customer\n",
+            "        id\n",
+            "        ~total\n",
+            "    }\n",
+            "    class c0:::context\n",
+            "    class c1:::changed\n",
+            "    c1 ..|> c0\n",
+        );
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn type_far_context_is_pruned() {
+        // A modified; A --> B --> C via Associates. One-hop pruning keeps B, drops C.
+        let head = Graph {
+            nodes: vec![
+                type_node("crate::A", NodeKind::Struct, None),
+                type_node("crate::B", NodeKind::Struct, None),
+                type_node("crate::C", NodeKind::Struct, None),
+            ],
+            edges: vec![
+                relation("crate::A", "crate::B", EdgeKind::Associates),
+                relation("crate::B", "crate::C", EdgeKind::Associates),
+            ],
+        };
+        let changes = vec![Change::Modified {
+            before: type_node("crate::A", NodeKind::Struct, None),
+            after: type_node("crate::A", NodeKind::Struct, None),
+        }];
+        let out = render_type_view(&head, &changes);
+        assert!(out.contains("[\"crate::A\"]"));
+        assert!(out.contains("class c0:::changed") || out.contains(":::changed"));
+        assert!(
+            out.contains("crate::B"),
+            "1-hop context must be kept:\n{out}"
+        );
+        assert!(
+            !out.contains("crate::C"),
+            "2-hop class must be pruned by one-hop rule:\n{out}"
+        );
+    }
+
+    #[test]
+    fn member_lines_bare_names_use_field_types_signal() {
+        // Untyped members: names unchanged but the field-type multiset changed -> `~`.
+        let before = fingerprint(&["amount"], &[("Money", 1)]);
+        let after = fingerprint(&["amount"], &[("Cents", 1)]);
+        assert_eq!(member_lines(&before, &after), vec!["~amount".to_string()]);
+        // Field types unchanged -> plain.
+        let same = fingerprint(&["amount"], &[("Money", 1)]);
+        assert_eq!(member_lines(&before, &same), vec!["amount".to_string()]);
     }
 }
