@@ -101,6 +101,10 @@ pub struct Node {
     pub span: SourceSpan,
     /// Free-form, view-specific attributes (kept sorted by key via `BTreeMap`).
     pub attrs: BTreeMap<String, String>,
+    /// Name-independent structural summary used by the differ's rename/move matcher. Set by the
+    /// extractor for kinds that have structure worth matching (types, traits, functions); `None`
+    /// for kinds where it does not apply (for example modules).
+    pub fingerprint: Option<Fingerprint>,
 }
 
 /// An edge in the structural graph.
@@ -191,6 +195,7 @@ mod tests {
             kind: NodeKind::Module,
             span: span(),
             attrs: BTreeMap::new(),
+            fingerprint: None,
         }
     }
 
