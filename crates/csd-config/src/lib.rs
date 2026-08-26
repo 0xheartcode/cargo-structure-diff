@@ -95,9 +95,13 @@ pub struct Forbid {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Views {
-    /// View names, for example `modules`, `states`.
+    /// View names, for example `modules`, `states`, `types`, `calls`.
     #[serde(default)]
     pub enabled: Vec<String>,
+    /// Entry-point function id for the `calls` sequence slice (for example `crate::main`). When
+    /// unset, the CLI picks the first function with outgoing calls.
+    #[serde(default)]
+    pub entry: Option<String>,
 }
 
 /// Lint selection: `deny` fails the build, `warn` only reports.

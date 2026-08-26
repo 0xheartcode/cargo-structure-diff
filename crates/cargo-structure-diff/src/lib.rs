@@ -16,9 +16,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::{bail, Context, Result};
 use csd_config::Config;
 use csd_diff::{diff, DiffOptions, FileRename};
-use csd_ir::{Change, Graph};
+use csd_ir::{Change, EdgeKind, Graph, StableId};
 use csd_lint::{has_denials, lint, Finding, Severity};
-use csd_render::{render_module_view, render_state_view, render_type_view};
+use csd_render::{render_call_view, render_module_view, render_state_view, render_type_view};
 
 /// Default base ref when `--base` is omitted.
 const DEFAULT_BASE: &str = "main";
@@ -227,11 +227,28 @@ fn render_views(head: &Graph, changes: &[Change], config: &Config) -> Vec<ViewDi
             "modules" => render_module_view(head, changes),
             "states" => render_state_view(head, changes),
             "types" => render_type_view(head, changes),
+            "calls" => render_call_view(head, changes, &call_entry(head, config)),
             _ => continue,
         };
         diagrams.push(ViewDiagram { view, mermaid });
     }
     diagrams
+}
+
+/// The entry function for the calls sequence slice: the configured `views.entry` when set,
+/// otherwise the lowest-id function that has an outgoing call (deterministic). Falls back to an
+/// empty id, which the renderer reports as no calls.
+fn call_entry(head: &Graph, config: &Config) -> StableId {
+    if let Some(entry) = &config.views.entry {
+        return StableId::new(entry.clone());
+    }
+    head.edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Calls)
+        .map(|e| &e.from)
+        .min()
+        .cloned()
+        .unwrap_or_else(|| StableId::new(""))
 }
 
 /// Extract the base ref by checking it out into a throwaway detached worktree.
@@ -563,6 +580,51 @@ deny = [\"layering\", \"cycles\"]
             types.mermaid.contains("crate::B"),
             "the added type should appear:\n{}",
             types.mermaid
+        );
+    }
+
+    #[test]
+    fn calls_view_renders_a_sequence_diagram() {
+        let repo = TmpRepo::new("calls");
+        let dir = &repo.path;
+        git_ok(dir, &["-c", "init.defaultBranch=main", "init", "-q"]);
+        write(
+            dir,
+            ".csd.toml",
+            "[views]\nenabled = [\"calls\"]\nentry = \"crate::entry\"\n",
+        );
+        write(
+            dir,
+            "src/lib.rs",
+            "pub fn helper() {}\npub fn entry() { helper(); }\n",
+        );
+        git_ok(dir, &["add", "-A"]);
+        git_ok(dir, &["commit", "-q", "-m", "base"]);
+        // Head adds a second call from the entry point.
+        write(
+            dir,
+            "src/lib.rs",
+            "pub fn helper() {}\npub fn helper2() {}\npub fn entry() { helper(); helper2(); }\n",
+        );
+
+        let config = Config::load(&dir.join(".csd.toml")).unwrap();
+        let report = analyze(dir, "main", &config).unwrap();
+
+        assert_eq!(report.exit_code(), 0, "no lints denied, so exit 0");
+        let calls = report
+            .diagrams
+            .iter()
+            .find(|d| d.view == "calls")
+            .expect("the calls view is enabled");
+        assert!(
+            calls.mermaid.contains("sequenceDiagram"),
+            "sequence diagram expected:\n{}",
+            calls.mermaid
+        );
+        assert!(
+            calls.mermaid.contains("helper2"),
+            "the newly called fn should appear:\n{}",
+            calls.mermaid
         );
     }
 
