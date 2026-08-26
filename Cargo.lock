@@ -58,6 +58,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "csd-goldens"
+version = "0.0.0"
+dependencies = [
+ "csd-diff",
+ "csd-extract-rs",
+ "csd-ir",
+ "tempfile",
+]
+
+[[package]]
 name = "csd-harness"
 version = "0.0.0"
 dependencies = [
