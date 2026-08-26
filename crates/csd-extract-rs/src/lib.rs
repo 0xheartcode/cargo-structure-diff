@@ -31,8 +31,11 @@
 //! tree-sitter gives syntax, not name resolution (SPEC 3.1 amendment). The precision-first
 //! mini-resolver (backlog `extract-resolver`, id `bb67bbb`) turns a `use` target into an
 //! [`EdgeKind::Uses`] edge from the referencing module to the target module *only* when it is
-//! certain: explicit intra-crate paths (`crate::`, `self::`, `super::`) and intra-crate `pub use`
-//! re-export chains. Globs (`use foo::*`), preludes, and external crates (`std::`, third-party)
+//! certain: explicit intra-crate paths (`crate::`, `self::`, `super::`), intra-crate `pub use`
+//! re-export chains, and (backlog `extract-crossrate`, id `422be96`) cross-crate paths whose first
+//! segment names a sibling workspace crate emitted by this extraction, which resolve to the deepest
+//! existing module along the path (else that crate's root) so the module view shows the workspace
+//! dependency graph. Globs (`use foo::*`), preludes, and external crates (`std::`, third-party)
 //! stay unresolved. A missed edge only costs coverage; a false edge costs a spurious red CI build,
 //! which costs trust, so when unsure we do not emit. Targets that stay unresolved are recorded on
 //! the module node in the `uses` attribute (comma-separated, sorted) so nothing is lost.
@@ -311,6 +314,14 @@ impl Extractor {
             .map(|n| n.id.as_str().to_string())
             .collect();
         let reexports = self.build_reexports();
+        // Known workspace crate names: the single-segment module ids are the per-crate top-level
+        // module nodes (`csd_ir`, `csd_diff`, ..), i.e. the crate-name prefixes this extraction
+        // emitted. A `use` whose first segment names one is a sibling-crate reference.
+        let crate_names: BTreeSet<String> = module_ids
+            .iter()
+            .filter(|id| !id.contains("::"))
+            .cloned()
+            .collect();
 
         // Resolved edges keyed by (from, to) so repeated uses collapse to one edge (first span).
         let mut edges: BTreeMap<(String, String), SourceSpan> = BTreeMap::new();
@@ -318,7 +329,7 @@ impl Extractor {
         let mut unresolved: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
         for u in &self.uses {
-            match resolve_use(u, &module_ids, &reexports) {
+            match resolve_use(u, &module_ids, &reexports, &crate_names) {
                 Some(target) if target != u.module => {
                     edges
                         .entry((u.module.clone(), target))
@@ -1104,17 +1115,48 @@ fn normalize_path(path: &str, module: &str) -> Option<String> {
 /// Resolve one `use` target to the module it references, or `None` when uncertain. Globs are never
 /// resolved. Explicit intra-crate paths and `pub use` re-export chains are followed to the owning
 /// module of the final item.
+///
+/// Cross-crate (backlog `extract-crossrate`, id `422be96`): when the path is not intra-crate but its
+/// first segment names a sibling workspace crate (a crate root emitted by this extraction), it
+/// resolves to the deepest existing module node along the path, else that crate's root. Non-workspace
+/// first segments (`std`, `tokio`, `serde`, ..) still stay unresolved so no external edge is invented.
 fn resolve_use(
     u: &RawUse,
     module_ids: &BTreeSet<String>,
     reexports: &BTreeMap<(String, String), String>,
+    crate_names: &BTreeSet<String>,
 ) -> Option<String> {
     if u.glob {
         return None;
     }
-    let abs = normalize_path(&u.path, &u.module)?;
-    let resolved = follow_reexports(abs, reexports);
-    owning_module(&resolved, module_ids)
+    if let Some(abs) = normalize_path(&u.path, &u.module) {
+        let resolved = follow_reexports(abs, reexports);
+        return owning_module(&resolved, module_ids);
+    }
+    // Not intra-crate: resolve only if the first segment names a known workspace crate. The own
+    // crate name resolves like intra-crate; a self-loop (target == declaring module) is dropped by
+    // the caller's `target != u.module` guard, so no crate->crate self-edge is emitted.
+    let first = u.path.split("::").find(|s| !s.is_empty())?;
+    if !crate_names.contains(first) {
+        return None;
+    }
+    let resolved = follow_reexports(u.path.clone(), reexports);
+    deepest_module(&resolved, module_ids)
+}
+
+/// The deepest prefix of `path` that names a known module node, walking segments off the tail. For a
+/// sibling-crate path this is the item's owning module, else a deeper module, else the crate root.
+fn deepest_module(path: &str, module_ids: &BTreeSet<String>) -> Option<String> {
+    let mut cur = path;
+    loop {
+        if module_ids.contains(cur) {
+            return Some(cur.to_string());
+        }
+        match cur.rsplit_once("::") {
+            Some((parent, _)) => cur = parent,
+            None => return None,
+        }
+    }
 }
 
 /// Follow `pub use` re-export bindings until the path no longer names a re-export. Bounded to

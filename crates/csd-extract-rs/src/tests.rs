@@ -273,6 +273,50 @@ fn multi_crate_ids_are_namespaced_per_crate() {
         .any(|id| *id == "crate" || id.starts_with("crate::")));
 }
 
+#[test]
+fn cross_crate_use_resolves_to_sibling_crate_module() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // `alpha` depends on `beta`; a `use beta::Thing` should become an edge alpha -> beta.
+    write(
+        root,
+        "alpha/src/lib.rs",
+        "use beta::Thing;\nuse std::sync::Arc;\npub fn run(t: Thing) -> Arc<u8> { todo!() }\n",
+    );
+    write(root, "beta/src/lib.rs", "pub struct Thing;\n");
+    let g = extract(root).unwrap();
+    // The cross-crate use resolves to beta's crate-root module node.
+    assert!(
+        g.edges.iter().any(|e| e.kind == EdgeKind::Uses
+            && e.from.as_str() == "alpha"
+            && e.to.as_str() == "beta"),
+        "expected a Uses edge alpha -> beta"
+    );
+    // The external `use std::sync::Arc` produces no edge.
+    assert!(!g.edges.iter().any(|e| e.to.as_str().starts_with("std")));
+    // The unresolved external target is still parked; the resolved sibling-crate one is not.
+    let uses = node(&g, "alpha").attrs.get("uses").unwrap();
+    assert!(uses.contains("std::sync::Arc"));
+    assert!(!uses.contains("beta::Thing"));
+}
+
+#[test]
+fn cross_crate_use_targets_deepest_existing_module() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // `alpha` imports an item nested in beta's `inner` module: the edge targets `beta::inner`.
+    write(root, "alpha/src/lib.rs", "use beta::inner::Widget;\n");
+    write(root, "beta/src/lib.rs", "pub mod inner;\n");
+    write(root, "beta/src/inner.rs", "pub struct Widget;\n");
+    let g = extract(root).unwrap();
+    assert!(
+        g.edges.iter().any(|e| e.kind == EdgeKind::Uses
+            && e.from.as_str() == "alpha"
+            && e.to.as_str() == "beta::inner"),
+        "expected a Uses edge alpha -> beta::inner"
+    );
+}
+
 /// A crate whose enum carries a state machine, exercising the transition idioms.
 fn state_fixture() -> Graph {
     let dir = tempfile::tempdir().unwrap();
