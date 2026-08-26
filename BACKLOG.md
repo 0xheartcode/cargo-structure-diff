@@ -12,23 +12,23 @@ Dependencies are not a native git-issue field, so each issue body carries a
 ```
 14c3416 [closed] ir: implement StableId, structural fingerprints and similarity scoring
         labels:area:ir, blocking, type:feat priority:critical milestone:m0
-775ae67 [open] diff: rename/move matcher with fingerprint similarity and threshold
+775ae67 [closed] diff: rename/move matcher with fingerprint similarity and threshold
         labels:area:diff, blocking, type:feat priority:critical milestone:m0
-0a83140 [open] extract-rs: module tree and use-path collection via tree-sitter
+0a83140 [closed] extract-rs: module tree and use-path collection via tree-sitter
         labels:area:extract, blocking, type:feat priority:high milestone:m0
 87f08db [open] harness: threshold sweep and metrics
         labels:area:harness, blocking, type:feat priority:high milestone:m0
-b951fc4 [open] harness: git worktree materialization and IR cache by SHA
+b951fc4 [closed] harness: git worktree materialization and IR cache by SHA
         labels:area:harness, blocking, type:feat priority:high milestone:m0
 bb67bbb [open] extract-rs: precision-first use-path mini-resolver
         labels:area:extract, blocking, type:feat priority:high milestone:m1
-c1b3a2b [open] diff: flat set diff over nodes and edges
+c1b3a2b [closed] diff: flat set diff over nodes and edges
         labels:area:diff, blocking, type:feat priority:high milestone:m0
-ff3a772 [open] extract-rs: item nodes with member fingerprints
+ff3a772 [closed] extract-rs: item nodes with member fingerprints
         labels:area:extract, independent, type:feat priority:high milestone:m0
 25768fb [open] harness: generate M0-REPORT.md go/no-go artifact
         labels:area:harness, blocking, type:docs priority:medium milestone:m0
-4a971c7 [open] diff: seed module-level Moved from git file-rename signal
+4a971c7 [closed] diff: seed module-level Moved from git file-rename signal
         labels:area:diff, independent, type:feat priority:medium milestone:m0
 ad3822a [closed] harness: corpus clone and first-parent pair walker
         labels:area:harness, independent, type:feat priority:medium milestone:m0
