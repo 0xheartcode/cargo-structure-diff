@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::Path;
 
-use csd_ir::{Graph, Node, NodeKind};
+use csd_ir::{EdgeKind, Graph, Node, NodeKind};
 
 use super::extract;
 
@@ -198,14 +198,79 @@ fn enum_and_trait_and_fn_fingerprints() {
 }
 
 #[test]
-fn unresolved_use_paths_recorded_not_edged() {
+fn intra_crate_use_resolves_external_use_stays_unresolved() {
     let g = fixture();
-    // No edges are emitted: resolution is deferred to the resolver (bb67bbb).
-    assert!(g.edges.is_empty());
-    // Raw use targets are parked on the module node instead.
+    // `use crate::money::Money` resolves to a Uses edge to the item's owning module.
+    assert!(g.edges.iter().any(|e| e.kind == EdgeKind::Uses
+        && e.from.as_str() == "crate"
+        && e.to.as_str() == "crate::money"));
+    // `use std::sync::Arc` is external, so no edge points into std or any external crate.
+    assert!(!g.edges.iter().any(|e| e.to.as_str().starts_with("std")));
+    // The unresolved external target is still recorded; the resolved one is not.
     let uses = node(&g, "crate").attrs.get("uses").unwrap();
-    assert!(uses.contains("crate::money::Money"));
     assert!(uses.contains("std::sync::Arc"));
+    assert!(!uses.contains("crate::money::Money"));
+}
+
+#[test]
+fn pub_use_reexport_chain_resolves_to_owning_module() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/lib.rs",
+        "pub mod inner;\npub mod facade;\npub mod consumer;\n",
+    );
+    write(root, "src/inner.rs", "pub struct Widget;\n");
+    write(root, "src/facade.rs", "pub use crate::inner::Widget;\n");
+    write(root, "src/consumer.rs", "use crate::facade::Widget;\n");
+    let g = extract(root).unwrap();
+    // consumer imports through facade's re-export; the edge targets the owning module `inner`.
+    assert!(g.edges.iter().any(|e| e.kind == EdgeKind::Uses
+        && e.from.as_str() == "crate::consumer"
+        && e.to.as_str() == "crate::inner"));
+    // No edge lands on the re-exporting facade module.
+    assert!(!g
+        .edges
+        .iter()
+        .any(|e| e.from.as_str() == "crate::consumer" && e.to.as_str() == "crate::facade"));
+}
+
+#[test]
+fn multi_crate_ids_are_namespaced_per_crate() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "alpha/src/lib.rs",
+        "pub mod util;\npub struct Thing;\n",
+    );
+    write(root, "alpha/src/util.rs", "pub struct Helper;\n");
+    write(
+        root,
+        "beta/src/lib.rs",
+        "pub mod util;\npub struct Thing;\n",
+    );
+    write(root, "beta/src/util.rs", "pub struct Helper;\n");
+    let g = extract(root).unwrap();
+    let ids: Vec<&str> = g.nodes.iter().map(|n| n.id.as_str()).collect();
+    // Each crate is namespaced by its directory name, so identical paths no longer collide.
+    for id in [
+        "alpha",
+        "alpha::Thing",
+        "alpha::util",
+        "alpha::util::Helper",
+        "beta",
+        "beta::Thing",
+        "beta::util",
+        "beta::util::Helper",
+    ] {
+        assert!(ids.contains(&id), "missing id {id}");
+    }
+    // Nothing falls back to the shared `crate::` prefix.
+    assert!(!ids
+        .iter()
+        .any(|id| *id == "crate" || id.starts_with("crate::")));
 }
 
 #[test]
