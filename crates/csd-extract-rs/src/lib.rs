@@ -13,6 +13,19 @@
 //!   corresponding items, each with a [`Fingerprint`] (see [`csd_ir::fingerprint`]).
 //! - [`NodeKind::Variant`] for each enum variant (the state-machine view of SPEC 3.4).
 //!
+//! Inherent and trait `impl` methods are emitted as [`NodeKind::Fn`] nodes under their Self type
+//! (`{Self-type}::method`), alongside free functions.
+//!
+//! # Call graph
+//!
+//! Fn bodies are walked for call and method-call expressions in source order (SPEC 3.3). Each is
+//! turned into an [`EdgeKind::Calls`] edge from the caller Fn to the callee Fn, carrying a dense
+//! per-caller `ordinal` so the sequence is preserved. Resolution is precision-first: free-fn calls
+//! resolve through the same intra-crate rules as `use`, and `self.method()` / `Self::method()`
+//! resolve to `{Self-type}::method`. Method calls on unknown receivers and `dyn`/generic calls have
+//! no statically known callee and are never invented; each such unresolved call is counted on the
+//! caller node's `unresolved_calls` attribute so the fidelity ceiling stays visible.
+//!
 //! # `use`-path resolution
 //!
 //! tree-sitter gives syntax, not name resolution (SPEC 3.1 amendment). The precision-first
@@ -192,6 +205,22 @@ struct Extractor {
     impls: Vec<RawImplements>,
     /// Candidate type associations from a field type, resolved in [`Extractor::finish`].
     associates: Vec<RawAssociates>,
+    /// Call sites collected from Fn bodies, resolved to [`EdgeKind::Calls`] edges in
+    /// [`Extractor::finish`]. Push order within a caller is source order.
+    calls: Vec<RawCall>,
+}
+
+/// One call site read from a caller Fn body. `callee` is the resolved candidate id, or `None` when
+/// the call could not be resolved confidently (a method on a non-`self` receiver, a `dyn`/generic
+/// call, or a path that is not certainly intra-crate). Membership in the emitted Fn set is
+/// confirmed in [`Extractor::finish`]; a candidate that names no emitted Fn counts as unresolved.
+struct RawCall {
+    /// The calling Fn node's id.
+    caller: String,
+    /// The resolved callee id, or `None` when unresolved.
+    callee: Option<String>,
+    /// Where the call is written.
+    span: SourceSpan,
 }
 
 /// One candidate realization: an `impl Trait for Type` block. Both the type and trait names are
@@ -267,6 +296,7 @@ impl Extractor {
             transitions: Vec::new(),
             impls: Vec::new(),
             associates: Vec::new(),
+            calls: Vec::new(),
         }
     }
 
@@ -422,6 +452,54 @@ impl Extractor {
             });
         }
 
+        // Call graph (SPEC 3.3). Emit a Calls edge only when the callee names a Fn node this
+        // extractor emitted; the ordinal is dense per caller in source order. Every call that does
+        // not resolve to an emitted Fn bumps the caller's `unresolved_calls` count so the fidelity
+        // ceiling stays visible. Deduped by (from, to, ordinal).
+        let fn_ids: BTreeSet<String> = self
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Fn)
+            .map(|n| n.id.as_str().to_string())
+            .collect();
+        let mut next_ordinal: BTreeMap<String, u32> = BTreeMap::new();
+        let mut unresolved_calls: BTreeMap<String, u32> = BTreeMap::new();
+        let mut seen: BTreeSet<(String, String, u32)> = BTreeSet::new();
+        let mut call_edges: Vec<Edge> = Vec::new();
+        for c in &self.calls {
+            match &c.callee {
+                Some(id) if fn_ids.contains(id) => {
+                    let slot = next_ordinal.entry(c.caller.clone()).or_insert(0);
+                    let ordinal = *slot;
+                    if seen.insert((c.caller.clone(), id.clone(), ordinal)) {
+                        call_edges.push(Edge {
+                            from: StableId::new(c.caller.clone()),
+                            to: StableId::new(id.clone()),
+                            kind: EdgeKind::Calls,
+                            span: c.span.clone(),
+                            ordinal: Some(ordinal),
+                        });
+                        *slot += 1;
+                    }
+                }
+                _ => {
+                    *unresolved_calls.entry(c.caller.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        self.graph.edges.extend(call_edges);
+        for node in &mut self.graph.nodes {
+            if node.kind == NodeKind::Fn {
+                if let Some(n) = unresolved_calls.get(node.id.as_str()) {
+                    if *n > 0 {
+                        node.attrs
+                            .insert("unresolved_calls".to_string(), n.to_string());
+                    }
+                }
+            }
+        }
+
         self.graph.normalize();
         Ok(self.graph)
     }
@@ -555,7 +633,10 @@ impl Extractor {
                 if let Some(name) = child_name(node, src) {
                     let id = format!("{mod_path}::{name}");
                     let fp = fn_fingerprint(node, src, doc);
-                    self.push(id, NodeKind::Fn, span_of(node, file), Some(fp));
+                    self.push(id.clone(), NodeKind::Fn, span_of(node, file), Some(fp));
+                    if let Some(body) = node.child_by_field_name("body") {
+                        self.collect_calls(body, &id, mod_path, None, ctx);
+                    }
                 }
             }
             "use_declaration" => {
@@ -598,15 +679,63 @@ impl Extractor {
             return;
         }
         let enum_id = format!("{mod_path}::{enum_name}");
+        // Self-type id for method node ids and `self`/`Self` call resolution. Precision-first: a
+        // bare or intra-crate type resolves; anything else parks methods under the impl's module.
+        let self_type =
+            resolve_local(&type_path_text(ty, src), mod_path).unwrap_or_else(|| enum_id.clone());
         let Some(body) = child_kind(node, "declaration_list") else {
             return;
         };
+        let mut docs: Vec<String> = Vec::new();
+        let mut cfg_test = false;
         let mut cursor = body.walk();
         for item in body.named_children(&mut cursor) {
-            if item.kind() == "function_item" {
-                self.analyze_method(item, &enum_id, &enum_name, ctx);
+            match item.kind() {
+                "line_comment" => {
+                    if let Some(text) = outer_doc_text(item, src) {
+                        docs.push(text);
+                    }
+                    continue;
+                }
+                "attribute_item" => {
+                    if matches!(attribute_kind(item, src), AttrKind::CfgTest) {
+                        cfg_test = true;
+                    }
+                    continue;
+                }
+                "block_comment" => continue,
+                _ => {}
             }
+            if item.kind() == "function_item" && !cfg_test {
+                if let Some(name) = child_name(item, src) {
+                    let doc = docs.join("");
+                    let id = format!("{self_type}::{name}");
+                    let fp = fn_fingerprint(item, src, &doc);
+                    self.push(id.clone(), NodeKind::Fn, span_of(item, file), Some(fp));
+                    if let Some(mbody) = item.child_by_field_name("body") {
+                        self.collect_calls(mbody, &id, mod_path, Some(&self_type), ctx);
+                    }
+                    self.analyze_method(item, &enum_id, &enum_name, ctx);
+                }
+            }
+            docs.clear();
+            cfg_test = false;
         }
+    }
+
+    /// Walk a Fn body for call and method-call expressions in source order, resolving each to a
+    /// candidate callee id (or `None`). Nested `function_item`s own their own calls and are skipped.
+    fn collect_calls(
+        &mut self,
+        body: TsNode,
+        caller: &str,
+        module: &str,
+        self_type: Option<&str>,
+        ctx: &FileCtx,
+    ) {
+        let mut out = Vec::new();
+        walk_calls(body, caller, module, self_type, ctx.src, ctx.file, &mut out);
+        self.calls.extend(out);
     }
 
     /// Read transitions out of one method whose receiver (or a parameter) is the enum type.
@@ -1299,6 +1428,64 @@ fn resolve_local(path: &str, module: &str) -> Option<String> {
         None
     } else {
         Some(format!("{module}::{path}"))
+    }
+}
+
+/// Walk `node` in source order, recording each `call_expression` as a [`RawCall`]. Method calls are
+/// `call_expression`s whose function is a `field_expression` (`self.other()`). Recursion is
+/// pre-order so an outer call precedes calls in its arguments. Nested `function_item`s are skipped
+/// so their calls are not attributed to the enclosing caller.
+fn walk_calls(
+    node: TsNode,
+    caller: &str,
+    module: &str,
+    self_type: Option<&str>,
+    src: &[u8],
+    file: &str,
+    out: &mut Vec<RawCall>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "function_item" {
+            continue;
+        }
+        if child.kind() == "call_expression" {
+            out.push(RawCall {
+                caller: caller.to_string(),
+                callee: resolve_call(child, module, self_type, src),
+                span: span_of(child, file),
+            });
+        }
+        walk_calls(child, caller, module, self_type, src, file, out);
+    }
+}
+
+/// Resolve a `call_expression`'s callee, precision-first. A bare `foo()` binds to the caller's
+/// module; `crate::`/`self::`/`super::` paths normalise; `Self::assoc()` and `self.method()` bind
+/// to the Self type. Any other scoped path or receiver stays unresolved (`None`) since the callee
+/// is not known statically (SPEC 3.3 ceiling).
+fn resolve_call(node: TsNode, module: &str, self_type: Option<&str>, src: &[u8]) -> Option<String> {
+    let func = node.child_by_field_name("function")?;
+    match func.kind() {
+        "identifier" => resolve_local(&text(func, src), module),
+        "scoped_identifier" => {
+            let full = text(func, src);
+            if full.split("::").next() == Some("Self") {
+                let name = full.rsplit("::").next()?;
+                self_type.map(|st| format!("{st}::{name}"))
+            } else {
+                resolve_local(&full, module)
+            }
+        }
+        "field_expression" => {
+            let value = func.child_by_field_name("value")?;
+            if value.kind() != "self" {
+                return None;
+            }
+            let field = func.child_by_field_name("field")?;
+            self_type.map(|st| format!("{st}::{}", text(field, src)))
+        }
+        _ => None,
     }
 }
 
