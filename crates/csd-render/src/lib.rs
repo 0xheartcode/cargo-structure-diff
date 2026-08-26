@@ -1,16 +1,19 @@
-//! Render the module view as one annotated Mermaid `flowchart`.
+//! Render a graph and its delta as one annotated Mermaid diagram.
 //!
-//! Following the project convention (SPEC.md section 4) the delta is colour-encoded onto a single
-//! drawing rather than diffing two images: green added, red-dashed removed, amber changed, gray
-//! unchanged context. The graph is pruned to changed nodes (and the endpoints of changed edges)
-//! plus a two-hop neighbourhood, so a large system never renders in full.
+//! Two views live here: [`render_module_view`] (a `flowchart` over `Module` nodes and `Uses`
+//! edges) and [`render_state_view`] (a `stateDiagram-v2` over `Variant` nodes and `Transitions`
+//! edges, SPEC.md 3.4). Both follow the project convention (SPEC.md section 4): the delta is
+//! colour-encoded onto a single drawing rather than diffing two images (green added, red-dashed
+//! removed, amber changed, gray unchanged context) and the graph is pruned to changed nodes, the
+//! endpoints of changed edges, and a two-hop neighbourhood, so a large system never renders in
+//! full. The colouring ([`Class`]/[`CLASS_DEFS`]) and pruning ([`prune`]) are shared.
 //!
-//! Output is deterministic: nodes are emitted in id order with stable `n<i>` handles, edges in
+//! Output is deterministic: nodes are emitted in id order with stable handles, edges in
 //! `(from, to)` order.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use csd_ir::{Change, Graph, NodeKind, StableId};
+use csd_ir::{Change, EdgeKind, Graph, NodeKind, StableId};
 
 /// How far from a changed node a context node is still drawn.
 const CONTEXT_HOPS: usize = 2;
@@ -49,9 +52,9 @@ impl Class {
 /// `changes` is the delta from `csd_diff::diff`. Removed nodes and edges are recovered from the
 /// delta, since they are absent from `head`. Only `Module` nodes and `Uses` edges participate.
 pub fn render_module_view(head: &Graph, changes: &[Change]) -> String {
-    let nodes = collect_nodes(head, changes);
+    let nodes = collect_nodes(head, changes, NodeKind::Module);
     let node_class = classify_nodes(&nodes, changes);
-    let edges = collect_edges(head, changes, &nodes);
+    let edges = collect_edges(head, changes, &nodes, EdgeKind::Uses);
 
     let kept = prune(&nodes, &node_class, &edges);
 
@@ -101,19 +104,80 @@ pub fn render_module_view(head: &Graph, changes: &[Change]) -> String {
     out
 }
 
+/// Render the state-machine view of `head` with `changes` colour-encoded, as a Mermaid
+/// `stateDiagram-v2` (SPEC.md 3.4).
+///
+/// States are [`NodeKind::Variant`] nodes; transitions are [`EdgeKind::Transitions`] edges. Removed
+/// states and transitions are recovered from the delta, since they are absent from `head`. Each
+/// state is declared with its variant id as the label (`state "crate::Status::Active" as s0`) and
+/// coloured via the `:::` operator, reusing [`CLASS_DEFS`]. Added transitions carry a `+` label and
+/// removed a `-` label; `stateDiagram-v2` has no dashed transition arrow, so the removed colouring
+/// shows on the state border (via `:::removed`) rather than the edge.
+pub fn render_state_view(head: &Graph, changes: &[Change]) -> String {
+    let nodes = collect_nodes(head, changes, NodeKind::Variant);
+    let node_class = classify_nodes(&nodes, changes);
+    let edges = collect_edges(head, changes, &nodes, EdgeKind::Transitions);
+
+    let kept = prune(&nodes, &node_class, &edges);
+
+    let mut out = String::from("stateDiagram-v2\n");
+    out.push_str(CLASS_DEFS);
+    out.push('\n');
+
+    if kept.is_empty() {
+        out.push_str("    %% no structural changes in the state view\n");
+        return out;
+    }
+
+    // Stable s<i> handles in id order.
+    let handles: BTreeMap<&StableId, String> = kept
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, format!("s{i}")))
+        .collect();
+
+    // Declare each state, labelled with its variant id.
+    for id in &kept {
+        let _ = writeln!(out, "    state \"{}\" as {}", id.as_str(), handles[id]);
+    }
+    // Colour each state via the ::: operator.
+    for id in &kept {
+        let class = node_class.get(id).copied().unwrap_or(Class::Context);
+        let _ = writeln!(out, "    {}:::{}", handles[id], class.css());
+    }
+    // Transitions in (from, to) order; added/removed carry a marker label.
+    for (from, to, class) in &edges {
+        if !handles.contains_key(from) || !handles.contains_key(to) {
+            continue;
+        }
+        let label = match class {
+            Class::Added => " : +",
+            Class::Removed => " : -",
+            _ => "",
+        };
+        let _ = writeln!(out, "    {} --> {}{}", handles[from], handles[to], label);
+    }
+
+    out
+}
+
 use std::fmt::Write as _;
 
-/// Module nodes to consider: those in `head` plus any removed by the delta (absent from `head`).
-fn collect_nodes<'a>(head: &'a Graph, changes: &'a [Change]) -> BTreeMap<&'a StableId, ()> {
+/// Nodes of `kind` to consider: those in `head` plus any removed by the delta (absent from `head`).
+fn collect_nodes<'a>(
+    head: &'a Graph,
+    changes: &'a [Change],
+    kind: NodeKind,
+) -> BTreeMap<&'a StableId, ()> {
     let mut nodes: BTreeMap<&StableId, ()> = BTreeMap::new();
     for n in &head.nodes {
-        if n.kind == NodeKind::Module {
+        if n.kind == kind {
             nodes.insert(&n.id, ());
         }
     }
     for c in changes {
         if let Change::Removed(n) = c {
-            if n.kind == NodeKind::Module {
+            if n.kind == kind {
                 nodes.insert(&n.id, ());
             }
         }
@@ -121,7 +185,7 @@ fn collect_nodes<'a>(head: &'a Graph, changes: &'a [Change]) -> BTreeMap<&'a Sta
     nodes
 }
 
-/// Colour each module node from the delta. Unlisted nodes are context.
+/// Colour each collected node from the delta. Unlisted nodes are context.
 fn classify_nodes<'a>(
     nodes: &BTreeMap<&'a StableId, ()>,
     changes: &'a [Change],
@@ -147,24 +211,25 @@ fn classify_nodes<'a>(
     class
 }
 
-/// `Uses` edges to draw: head edges (added or context) plus edges the delta removed. Only edges
-/// whose endpoints are both module nodes are kept.
+/// Edges of `kind` to draw: head edges (added or context) plus edges the delta removed. Only edges
+/// whose endpoints are both kept nodes are considered.
 fn collect_edges<'a>(
     head: &'a Graph,
     changes: &'a [Change],
     nodes: &BTreeMap<&'a StableId, ()>,
+    kind: EdgeKind,
 ) -> Vec<(&'a StableId, &'a StableId, Class)> {
     let added: BTreeSet<(&StableId, &StableId)> = changes
         .iter()
         .filter_map(|c| match c {
-            Change::EdgeAdded(e) if e.kind == csd_ir::EdgeKind::Uses => Some((&e.from, &e.to)),
+            Change::EdgeAdded(e) if e.kind == kind => Some((&e.from, &e.to)),
             _ => None,
         })
         .collect();
 
     let mut edges: Vec<(&StableId, &StableId, Class)> = Vec::new();
     for e in &head.edges {
-        if e.kind != csd_ir::EdgeKind::Uses {
+        if e.kind != kind {
             continue;
         }
         if !nodes.contains_key(&e.from) || !nodes.contains_key(&e.to) {
@@ -179,10 +244,7 @@ fn collect_edges<'a>(
     }
     for c in changes {
         if let Change::EdgeRemoved(e) = c {
-            if e.kind == csd_ir::EdgeKind::Uses
-                && nodes.contains_key(&e.from)
-                && nodes.contains_key(&e.to)
-            {
+            if e.kind == kind && nodes.contains_key(&e.from) && nodes.contains_key(&e.to) {
                 edges.push((&e.from, &e.to, Class::Removed));
             }
         }
@@ -273,6 +335,26 @@ mod tests {
         }
     }
 
+    fn variant(id: &str) -> Node {
+        Node {
+            id: StableId::new(id),
+            kind: NodeKind::Variant,
+            span: span(),
+            attrs: BTreeMap::new(),
+            fingerprint: None,
+        }
+    }
+
+    fn transition(from: &str, to: &str) -> Edge {
+        Edge {
+            from: StableId::new(from),
+            to: StableId::new(to),
+            kind: EdgeKind::Transitions,
+            span: span(),
+            ordinal: None,
+        }
+    }
+
     #[test]
     fn empty_delta_renders_no_changes() {
         let head = Graph {
@@ -350,6 +432,106 @@ mod tests {
         assert!(
             !out.contains("crate::d"),
             "3-hop node must be pruned:\n{out}"
+        );
+    }
+
+    #[test]
+    fn state_empty_delta_renders_no_changes() {
+        let head = Graph {
+            nodes: vec![
+                variant("crate::Status::Active"),
+                variant("crate::Status::Closed"),
+            ],
+            edges: vec![],
+        };
+        let out = render_state_view(&head, &[]);
+        assert!(out.starts_with("stateDiagram-v2\n"));
+        assert!(out.contains("classDef added"));
+        assert!(out.contains("%% no structural changes in the state view"));
+        // Nothing was changed, so no state lines are drawn.
+        assert!(!out.contains(":::"));
+        assert!(!out.contains("state \""));
+    }
+
+    #[test]
+    fn state_added_transition_golden() {
+        // A newly added transition Active -> Closed; both states already exist in head.
+        let head = Graph {
+            nodes: vec![
+                variant("crate::Status::Active"),
+                variant("crate::Status::Closed"),
+            ],
+            edges: vec![transition("crate::Status::Active", "crate::Status::Closed")],
+        };
+        let changes = vec![Change::EdgeAdded(transition(
+            "crate::Status::Active",
+            "crate::Status::Closed",
+        ))];
+        let out = render_state_view(&head, &changes);
+        let expected = concat!(
+            "stateDiagram-v2\n",
+            "    classDef added fill:#f0fdf4,stroke:#22c55e,stroke-width:2px\n",
+            "    classDef removed fill:#fef2f2,stroke:#ef4444,stroke-width:2px,stroke-dasharray:4 4\n",
+            "    classDef changed fill:#fffbeb,stroke:#f59e0b,stroke-width:2px\n",
+            "    classDef context fill:#ffffff,stroke:#d1d5db,color:#9ca3af\n",
+            "    state \"crate::Status::Active\" as s0\n",
+            "    state \"crate::Status::Closed\" as s1\n",
+            "    s0:::context\n",
+            "    s1:::context\n",
+            "    s0 --> s1 : +\n",
+        );
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn state_removed_transition_recovered_from_delta() {
+        // The removed transition is absent from head; it is recovered from the delta.
+        let head = Graph {
+            nodes: vec![
+                variant("crate::Status::Active"),
+                variant("crate::Status::Closed"),
+            ],
+            edges: vec![],
+        };
+        let changes = vec![Change::EdgeRemoved(transition(
+            "crate::Status::Active",
+            "crate::Status::Closed",
+        ))];
+        let out = render_state_view(&head, &changes);
+        assert!(out.contains("state \"crate::Status::Active\" as s0"));
+        assert!(out.contains("state \"crate::Status::Closed\" as s1"));
+        // Removed transitions carry a `-` marker (stateDiagram-v2 has no dashed arrow).
+        assert!(
+            out.contains("    s0 --> s1 : -"),
+            "removed marker missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn state_far_context_is_pruned() {
+        // d is three hops from the changed state a, so it is dropped.
+        let head = Graph {
+            nodes: vec![
+                variant("crate::S::a"),
+                variant("crate::S::b"),
+                variant("crate::S::c"),
+                variant("crate::S::d"),
+            ],
+            edges: vec![
+                transition("crate::S::a", "crate::S::b"),
+                transition("crate::S::b", "crate::S::c"),
+                transition("crate::S::c", "crate::S::d"),
+            ],
+        };
+        let changes = vec![Change::Added(variant("crate::S::a"))];
+        let out = render_state_view(&head, &changes);
+        assert!(out.contains("state \"crate::S::a\" as s0"));
+        assert!(out.contains(":::added"));
+        assert!(out.contains("crate::S::b"));
+        assert!(out.contains("crate::S::c"));
+        assert!(
+            !out.contains("crate::S::d"),
+            "3-hop state must be pruned:\n{out}"
         );
     }
 }
