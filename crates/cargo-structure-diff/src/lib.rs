@@ -9,14 +9,15 @@
 //! The real work lives in [`analyze`] so both binaries stay thin and the pipeline is testable
 //! without touching the process working directory.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{bail, Context, Result};
 use csd_config::Config;
-use csd_diff::{diff, DiffOptions, FileRename};
-use csd_ir::{Change, EdgeKind, Graph, StableId};
+use csd_diff::{diff, member_diff, DiffOptions, FileRename};
+use csd_ir::{Change, EdgeKind, Graph, NodeKind, StableId};
 use csd_lint::{has_denials, lint, Finding, Severity};
 use csd_render::{render, Format, RenderOpts, View};
 
@@ -31,23 +32,30 @@ const HELP: &str = "\
 cargo-structure-diff: structural diff and architectural lint gate
 
 USAGE:
-    csd diff [--base <ref>] [--show] [--full] [--scope <glob>]... [--format <fmt>]
+    csd diff [--base <ref>] [--show] [--full] [--list] [--scope <glob>]... [--format <fmt>]
     csd trace [--base <ref>] [--cmd <shell command>]
+    csd doc [-o <file>|--out <file>]
     cargo structure-diff diff [--base <ref>] [--show]
 
 OPTIONS:
     --base <ref>    Base git ref to diff against (default: main)
     --show          diff: print every rendered view even when nothing denies
     --full          diff: render the whole graph, not just the pruned delta
+    --list          diff: print a one-line-per-change textual summary of the delta
     --scope <glob>  diff: only render nodes whose source path matches <glob>
                     (repeatable; crossing edges show an external stub)
     --format <fmt>  diff: diagram syntax, one of mermaid|dot|ascii (default: mermaid)
     --cmd <cmd>     trace: shell command that emits Mermaid (default: cargo test)
+    -o, --out <f>   doc: write the report to <file> instead of stdout
     -h, --help      Print this help
 
 trace mode is opt-in and observational: it runs <cmd> in the base and head
 worktrees, extracts the emitted `sequenceDiagram` Mermaid blocks, and diffs the
 observed traces as a set. It exits 0 (2 only if the command fails to run).
+
+doc mode is observational: it extracts the current working tree and emits a
+self-contained Markdown structure report (one Mermaid diagram per enabled view,
+plus a module index). No base, no delta. It exits 0 on success, 2 on error.
 ";
 
 /// A parsed invocation.
@@ -65,6 +73,8 @@ pub enum Cmd {
         full: bool,
         /// Path globs; only nodes whose source path matches render (empty means all).
         scope: Vec<String>,
+        /// Print a deterministic one-line-per-change textual summary of the delta.
+        list: bool,
         /// Diagram output syntax.
         format: Format,
     },
@@ -74,6 +84,11 @@ pub enum Cmd {
         base: String,
         /// The shell command that emits Mermaid on stdout.
         cmd: String,
+    },
+    /// Emit a whole-codebase structure report (snapshot of head, no delta).
+    Doc {
+        /// Output file; `None` writes to stdout.
+        out: Option<String>,
     },
 }
 
@@ -151,8 +166,10 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
     let mut cmd = DEFAULT_TRACE_CMD.to_string();
     let mut show = false;
     let mut full = false;
+    let mut list = false;
     let mut scope: Vec<String> = Vec::new();
     let mut format = Format::default();
+    let mut out: Option<String> = None;
     let mut sub: Option<&str> = None;
     let mut i = 0;
     while i < args.len() {
@@ -161,7 +178,16 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
             "-h" | "--help" => return Ok(Cmd::Help),
             "--show" => show = true,
             "--full" => full = true,
-            "diff" | "trace" if sub.is_none() => sub = Some(arg),
+            "--list" => list = true,
+            "diff" | "trace" | "doc" if sub.is_none() => sub = Some(arg),
+            "-o" | "--out" => {
+                i += 1;
+                let value = args.get(i).context("--out requires a value")?;
+                out = Some(value.clone());
+            }
+            _ if arg.starts_with("--out=") => {
+                out = Some(arg["--out=".len()..].to_string());
+            }
             "--base" => {
                 i += 1;
                 let value = args.get(i).context("--base requires a value")?;
@@ -200,14 +226,16 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
     }
     match sub {
         Some("trace") => Ok(Cmd::Trace { base, cmd }),
+        Some("doc") => Ok(Cmd::Doc { out }),
         Some(_) => Ok(Cmd::Diff {
             base,
             show,
             full,
             scope,
+            list,
             format,
         }),
-        None => bail!("expected the `diff` or `trace` subcommand; try --help"),
+        None => bail!("expected the `diff`, `trace`, or `doc` subcommand; try --help"),
     }
 }
 
@@ -241,6 +269,7 @@ pub fn run(args: &[String]) -> i32 {
             show,
             full,
             scope,
+            list,
             format,
         } => {
             let opts = RenderOpts {
@@ -249,7 +278,7 @@ pub fn run(args: &[String]) -> i32 {
                 entry: None,
                 format,
             };
-            match run_diff(&base, show, &opts) {
+            match run_diff(&base, show, list, &opts) {
                 Ok(code) => code,
                 Err(e) => {
                     eprintln!("error: {e:#}");
@@ -264,16 +293,210 @@ pub fn run(args: &[String]) -> i32 {
                 2
             }
         },
+        Cmd::Doc { out } => match run_doc(out.as_deref()) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                2
+            }
+        },
     }
 }
 
 /// Resolve the repo root, load config, run the pipeline, and print the report.
-fn run_diff(base: &str, show: bool, opts: &RenderOpts) -> Result<i32> {
+///
+/// With `list`, a deterministic one-line-per-change summary is printed to stdout before the
+/// diagrams; it composes with `show` and does not affect the exit code.
+fn run_diff(base: &str, show: bool, list: bool, opts: &RenderOpts) -> Result<i32> {
     let repo = repo_root()?;
     let config = load_config(&repo)?;
     let report = analyze(&repo, base, &config, opts)?;
     report.print(base, show);
+    if list {
+        for line in change_list(&report.changes) {
+            println!("{line}");
+        }
+    }
     Ok(report.exit_code())
+}
+
+/// Format the delta as a deterministic, reviewer-friendly change list, one line per change.
+///
+/// The order follows `csd_diff::diff`'s stable sort (added nodes, removed, modified, moved, then
+/// edge add/remove), so the list is byte-stable across runs. See [`change_line`] for the formats.
+fn change_list(changes: &[Change]) -> Vec<String> {
+    changes.iter().map(change_line).collect()
+}
+
+/// One textual line for a single [`Change`] (lowercase kinds).
+///
+/// - `+ <kind> <id>` / `- <kind> <id>` for an added / removed node.
+/// - `~ <kind> <id>` for a modified node, with `(+f ~g -h)` member detail appended when the
+///   before/after fingerprints differ (added `+`, changed `~`, removed `-`).
+/// - `> moved <id> from <from> to <to>` for a re-parented node.
+/// - `+ edge <from> -> <to> (<kind>)` / `- edge ...` for an added / removed edge.
+fn change_line(change: &Change) -> String {
+    match change {
+        Change::Added(n) => format!("+ {} {}", node_kind_name(n.kind), n.id.as_str()),
+        Change::Removed(n) => format!("- {} {}", node_kind_name(n.kind), n.id.as_str()),
+        Change::Modified { before, after } => {
+            let head = format!("~ {} {}", node_kind_name(after.kind), after.id.as_str());
+            match member_detail(before, after) {
+                Some(detail) => format!("{head} {detail}"),
+                None => head,
+            }
+        }
+        Change::Moved { node, from, to } => format!(
+            "> moved {} from {} to {}",
+            node.as_str(),
+            from.as_str(),
+            to.as_str()
+        ),
+        Change::EdgeAdded(e) => format!(
+            "+ edge {} -> {} ({})",
+            e.from.as_str(),
+            e.to.as_str(),
+            edge_kind_name(e.kind)
+        ),
+        Change::EdgeRemoved(e) => format!(
+            "- edge {} -> {} ({})",
+            e.from.as_str(),
+            e.to.as_str(),
+            edge_kind_name(e.kind)
+        ),
+    }
+}
+
+/// The `(+f ~g -h)` per-member detail for a modified node, or `None` when nothing differs at the
+/// member level (a bare `~` line). Parts are ordered added, changed, removed.
+fn member_detail(before: &csd_ir::Node, after: &csd_ir::Node) -> Option<String> {
+    let delta = member_diff(before, after);
+    if delta.added.is_empty() && delta.changed.is_empty() && delta.removed.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    parts.extend(delta.added.iter().map(|m| format!("+{m}")));
+    parts.extend(delta.changed.iter().map(|m| format!("~{m}")));
+    parts.extend(delta.removed.iter().map(|m| format!("-{m}")));
+    Some(format!("({})", parts.join(" ")))
+}
+
+/// The lowercase name of a [`NodeKind`] for the textual change list.
+fn node_kind_name(kind: NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Module => "module",
+        NodeKind::Struct => "struct",
+        NodeKind::Enum => "enum",
+        NodeKind::Trait => "trait",
+        NodeKind::Fn => "fn",
+        NodeKind::Variant => "variant",
+        NodeKind::Table => "table",
+    }
+}
+
+/// The lowercase name of an [`EdgeKind`] for the textual change list.
+fn edge_kind_name(kind: EdgeKind) -> &'static str {
+    match kind {
+        EdgeKind::Uses => "uses",
+        EdgeKind::Implements => "implements",
+        EdgeKind::Associates => "associates",
+        EdgeKind::Calls => "calls",
+        EdgeKind::Transitions => "transitions",
+        EdgeKind::ForeignKey => "foreignkey",
+    }
+}
+
+/// Default views for `csd doc` when `views.enabled` is empty: every view csd knows.
+const DOC_DEFAULT_VIEWS: &[&str] = &["modules", "types", "states", "calls", "callgraph", "schema"];
+
+/// Emit the whole-codebase structure report (a snapshot of head, not a delta).
+///
+/// Extracts the current working tree once, renders each enabled view as a full snapshot (empty
+/// delta, `full = true`, so the whole graph is drawn as context with no delta colour), and writes a
+/// single self-contained Markdown document to `out` or stdout. Observational: exits 0 on success.
+fn run_doc(out: Option<&str>) -> Result<i32> {
+    let repo = repo_root()?;
+    let config = load_config(&repo)?;
+    let head = extract_head(&repo)?;
+    let doc = doc_markdown(&head, &config);
+    emit_doc(&doc, out)?;
+    Ok(0)
+}
+
+/// Write the rendered report to `out`, or stdout when `out` is `None`.
+fn emit_doc(doc: &str, out: Option<&str>) -> Result<()> {
+    match out {
+        Some(path) => std::fs::write(path, doc).with_context(|| format!("failed to write {path}")),
+        None => {
+            print!("{doc}");
+            Ok(())
+        }
+    }
+}
+
+/// Render the head graph as a self-contained Markdown structure report: a title, a generated-by
+/// note, a module index, then one section per enabled view with the diagram in a ```mermaid fenced
+/// block (GitHub and VS Code render these). An HTML variant is a future option (SchemaSpy-style).
+fn doc_markdown(head: &Graph, config: &Config) -> String {
+    // Snapshot options: draw the whole graph as context, with no delta colour, as Mermaid.
+    let snapshot = |view: View| -> String {
+        render(
+            view,
+            head,
+            &[],
+            &RenderOpts {
+                full: true,
+                scope: Vec::new(),
+                entry: Some(call_entry(head, config)),
+                format: Format::Mermaid,
+            },
+        )
+    };
+
+    let enabled: Vec<String> = if config.views.enabled.is_empty() {
+        DOC_DEFAULT_VIEWS.iter().map(|s| s.to_string()).collect()
+    } else {
+        config.views.enabled.clone()
+    };
+
+    let mut out = String::from("# Structure report\n\n");
+    out.push_str(
+        "Generated by cargo-structure-diff (`csd doc`): a snapshot of the current working tree.\n\n",
+    );
+
+    out.push_str("## Module index\n\n");
+    let modules: Vec<&str> = head
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Module)
+        .map(|n| n.id.as_str())
+        .collect();
+    if modules.is_empty() {
+        out.push_str("_No modules found._\n\n");
+    } else {
+        for id in modules {
+            let _ = writeln!(out, "- `{id}`");
+        }
+        out.push('\n');
+    }
+
+    for name in enabled {
+        let view = match name.as_str() {
+            "modules" => View::Modules,
+            "states" => View::States,
+            "types" => View::Types,
+            "calls" => View::Calls,
+            "callgraph" => View::CallGraph,
+            "schema" => View::Schema,
+            _ => continue,
+        };
+        let _ = writeln!(out, "## {name} view\n");
+        out.push_str("```mermaid\n");
+        out.push_str(&snapshot(view));
+        out.push_str("\n```\n\n");
+    }
+
+    out
 }
 
 /// Run `cmd` in the base worktree and in the head working tree, extract the emitted
@@ -415,11 +638,7 @@ fn load_config(repo: &Path) -> Result<Config> {
 /// error. Head is the working tree as-is. This is testable without changing the process cwd.
 pub fn analyze(repo: &Path, base: &str, config: &Config, opts: &RenderOpts) -> Result<Report> {
     let base_graph = base_graph(repo, base)?;
-    let mut head_graph =
-        csd_extract_rs::extract(repo).context("failed to extract head working tree")?;
-    let head_schema =
-        csd_extract_db::extract_schema(repo).context("failed to extract head schema")?;
-    merge_schema(&mut head_graph, head_schema);
+    let head_graph = extract_head(repo)?;
     let file_renames = file_renames(repo, base)?;
     let changes = diff(
         &base_graph,
@@ -436,6 +655,15 @@ pub fn analyze(repo: &Path, base: &str, config: &Config, opts: &RenderOpts) -> R
         findings,
         diagrams,
     })
+}
+
+/// Extract the current working tree as one head graph: the Rust module graph merged with the
+/// schema graph, so the schema view and schema lints see the same head both `diff` and `doc` use.
+fn extract_head(repo: &Path) -> Result<Graph> {
+    let mut head = csd_extract_rs::extract(repo).context("failed to extract head working tree")?;
+    let schema = csd_extract_db::extract_schema(repo).context("failed to extract head schema")?;
+    merge_schema(&mut head, schema);
+    Ok(head)
 }
 
 /// Merge a schema-view graph's `Table` nodes and `ForeignKey` edges into `graph`, then renormalize
@@ -983,6 +1211,7 @@ deny = [\"layering\", \"cycles\"]
                 show: false,
                 full: true,
                 scope: vec!["src/a/**".to_string(), "src/b/**".to_string()],
+                list: false,
                 format: Format::Dot,
             }
         );
@@ -1109,6 +1338,7 @@ deny = [\"layering\", \"cycles\"]
                 show: false,
                 full: false,
                 scope: Vec::new(),
+                list: false,
                 format: Format::Mermaid,
             }
         );
@@ -1123,6 +1353,7 @@ deny = [\"layering\", \"cycles\"]
             show: false,
             full: false,
             scope: Vec::new(),
+            list: false,
             format: Format::Mermaid,
         };
         assert_eq!(split, want);
@@ -1139,6 +1370,7 @@ deny = [\"layering\", \"cycles\"]
                 show: true,
                 full: false,
                 scope: Vec::new(),
+                list: false,
                 format: Format::Mermaid,
             }
         );
@@ -1269,5 +1501,111 @@ trailing noise
             1,
             "only main worktree remains:\n{list}"
         );
+    }
+
+    #[test]
+    fn parse_reads_list_flag() {
+        let cmd = parse_args(&["diff".into(), "--list".into()]).unwrap();
+        assert_eq!(
+            cmd,
+            Cmd::Diff {
+                base: "main".to_string(),
+                show: false,
+                full: false,
+                scope: Vec::new(),
+                list: true,
+                format: Format::Mermaid,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_doc_defaults_and_out() {
+        assert_eq!(
+            parse_args(&["doc".to_string()]).unwrap(),
+            Cmd::Doc { out: None }
+        );
+        let split = parse_args(&["doc".into(), "-o".into(), "out.md".into()]).unwrap();
+        let long = parse_args(&["doc".into(), "--out".into(), "out.md".into()]).unwrap();
+        let joined = parse_args(&["doc".into(), "--out=out.md".into()]).unwrap();
+        let want = Cmd::Doc {
+            out: Some("out.md".to_string()),
+        };
+        assert_eq!(split, want);
+        assert_eq!(long, want);
+        assert_eq!(joined, want);
+    }
+
+    #[test]
+    fn change_list_reports_added_removed_and_member_delta() {
+        let repo = TmpRepo::new("list");
+        let dir = &repo.path;
+        git_ok(dir, &["-c", "init.defaultBranch=main", "init", "-q"]);
+        write(dir, ".csd.toml", "[views]\nenabled = [\"types\"]\n");
+        write(
+            dir,
+            "src/lib.rs",
+            "pub struct Order { pub id: u64 }\npub struct Gone { pub x: u64 }\n",
+        );
+        git_ok(dir, &["add", "-A"]);
+        git_ok(dir, &["commit", "-q", "-m", "base"]);
+        // Head: add a field to Order, remove the Gone struct, add a free fn.
+        write(
+            dir,
+            "src/lib.rs",
+            "pub struct Order { pub id: u64, pub total: u64 }\npub fn added_fn() {}\n",
+        );
+
+        let config = Config::load(&dir.join(".csd.toml")).unwrap();
+        let report = analyze(dir, "main", &config, &RenderOpts::default()).unwrap();
+        let lines = change_list(&report.changes);
+
+        assert!(
+            lines.contains(&"+ fn crate::added_fn".to_string()),
+            "an added fn line is expected:\n{lines:#?}"
+        );
+        assert!(
+            lines.contains(&"- struct crate::Gone".to_string()),
+            "a removed struct line is expected:\n{lines:#?}"
+        );
+        assert!(
+            lines.contains(&"~ struct crate::Order (+total)".to_string()),
+            "a modified struct with member detail is expected:\n{lines:#?}"
+        );
+
+        // Deterministic: a second analyze produces the same list.
+        let again = analyze(dir, "main", &config, &RenderOpts::default()).unwrap();
+        assert_eq!(lines, change_list(&again.changes), "the list is stable");
+    }
+
+    #[test]
+    fn doc_snapshot_has_title_module_index_and_mermaid_per_view() {
+        let repo = all_views_repo("doc");
+        let dir = &repo.path;
+        let config = Config::load(&dir.join(".csd.toml")).unwrap();
+        let head = extract_head(dir).unwrap();
+        let doc = doc_markdown(&head, &config);
+
+        assert!(
+            doc.starts_with("# "),
+            "the report opens with an H1 title:\n{doc}"
+        );
+        assert!(
+            doc.contains("## Module index"),
+            "a module index section is expected:\n{doc}"
+        );
+        assert!(
+            doc.contains("- `crate::a`"),
+            "the module index lists a module id:\n{doc}"
+        );
+        // One ```mermaid block per enabled view (six here).
+        let fences = doc.matches("```mermaid").count();
+        assert_eq!(fences, 6, "one mermaid block per enabled view:\n{doc}");
+
+        // Writing to -o creates the file with the report contents.
+        let out = dir.join("report.md");
+        emit_doc(&doc, Some(&out.to_string_lossy())).unwrap();
+        let written = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(written, doc, "the -o file holds the whole report");
     }
 }
