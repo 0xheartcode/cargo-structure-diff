@@ -31,7 +31,3 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
-
-# The bob-pass clean-code gate (CRAP hotspots, interface depth, lying-tests) is an interactive
-# Claude Code review, not a shell tool, so it is not a CI job. Run it locally with `just bob`
-# (deterministic subset) plus the /bob-pass review before merge.

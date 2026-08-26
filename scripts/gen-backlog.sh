@@ -47,7 +47,7 @@ out="BACKLOG.md"
     echo '    harness_metrics --> spike_rustdoc[spike: rustdoc-json vs tree-sitter (M3)]'
     echo '    harness_corpus[harness: corpus + pair walker]:::indep'
     echo '    infra_ci[infra: CI gate]:::indep'
-    echo '    infra_gate[infra: bob-pass gate]:::indep'
+    echo '    infra_gate[infra: quality gate]:::indep'
     echo '    classDef indep stroke-dasharray:4 4;'
     echo '```'
     echo
