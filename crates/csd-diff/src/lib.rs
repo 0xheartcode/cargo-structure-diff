@@ -7,6 +7,10 @@
 //! when `DiffOptions::file_renames` is non-empty. [`detect_renames`] is the fingerprint similarity
 //! matcher for the remaining items and runs only when `DiffOptions::rename_threshold` is `Some`.
 //! With neither signal, the output is the pure set diff.
+//!
+//! [`member_diff`] is the member level of the SPEC 3.2 three-level diff (node add/remove, then
+//! member matching within surviving nodes, then signature comparison). It is an additive helper
+//! for the renderer and CLI; it does not change [`diff`]'s output.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -39,6 +43,57 @@ impl Default for DiffOptions {
             rename_threshold: Some(0.7),
             file_renames: Vec::new(),
         }
+    }
+}
+
+/// Member-level delta between two matched type nodes, the member level of the SPEC 3.2 three-level
+/// diff. All fields are sorted for deterministic output.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemberDelta {
+    /// Member names present only on the head side.
+    pub added: Vec<String>,
+    /// Member names present only on the base side.
+    pub removed: Vec<String>,
+    /// Member names present on both sides whose type appears to have changed. See [`member_diff`]
+    /// for the exact (and limited) meaning given the current [`Fingerprint`] shape.
+    pub changed: Vec<String>,
+}
+
+/// Report member-level changes between two nodes matched at the node level.
+///
+/// Members are matched by NAME using [`Fingerprint::members`]. A name only on the head side is
+/// `added`; a name only on the base side is `removed`.
+///
+/// `changed` is the honest limit of the current [`Fingerprint`] shape. The fingerprint stores
+/// member names as a set and field types as a separate `field_types` multiset (type name to
+/// count); it does NOT map a member to its type, so a per-member retype is not directly
+/// recoverable. The best available signal: when the member-name set is identical on both sides
+/// (no adds or removes) yet the `field_types` multiset differs, at least one surviving member was
+/// retyped. Which one is not recoverable, so every common member is reported as `changed`. When
+/// names were added or removed, the `field_types` delta is attributed to those adds/removes and
+/// `changed` stays empty, avoiding a false retype signal.
+///
+/// A node with no fingerprint on either side yields an empty [`MemberDelta`].
+pub fn member_diff(before: &Node, after: &Node) -> MemberDelta {
+    let (Some(bf), Some(af)) = (&before.fingerprint, &after.fingerprint) else {
+        return MemberDelta::default();
+    };
+
+    let added: Vec<String> = af.members.difference(&bf.members).cloned().collect();
+    let removed: Vec<String> = bf.members.difference(&af.members).cloned().collect();
+
+    let changed = if added.is_empty() && removed.is_empty() && bf.field_types != af.field_types {
+        // Names unchanged but the type multiset moved: a surviving member was retyped.
+        bf.members.intersection(&af.members).cloned().collect()
+    } else {
+        Vec::new()
+    };
+
+    // BTreeSet iteration is already sorted; keep it explicit so the contract does not rely on it.
+    MemberDelta {
+        added,
+        removed,
+        changed,
     }
 }
 
@@ -675,6 +730,66 @@ mod tests {
             DiffOptions::default(),
         );
         assert_eq!(out, vec![Change::Added(after), Change::Removed(before)]);
+    }
+
+    #[test]
+    fn member_added_is_reported_as_added() {
+        let before = fp_node("m::T", NodeKind::Struct, fp(&["a"], &[("u64", 1)]));
+        let after = fp_node("m::T", NodeKind::Struct, fp(&["a", "b"], &[("u64", 2)]));
+        let d = member_diff(&before, &after);
+        assert_eq!(d.added, vec!["b".to_string()]);
+        assert!(d.removed.is_empty());
+        assert!(d.changed.is_empty());
+    }
+
+    #[test]
+    fn member_removed_is_reported_as_removed() {
+        let before = fp_node("m::T", NodeKind::Struct, fp(&["a", "b"], &[("u64", 2)]));
+        let after = fp_node("m::T", NodeKind::Struct, fp(&["a"], &[("u64", 1)]));
+        let d = member_diff(&before, &after);
+        assert_eq!(d.removed, vec!["b".to_string()]);
+        assert!(d.added.is_empty());
+        assert!(d.changed.is_empty());
+    }
+
+    #[test]
+    fn retyped_member_is_reported_as_changed() {
+        // Same name set, field_types multiset differs: a surviving member was retyped.
+        let before = fp_node("m::T", NodeKind::Struct, fp(&["a"], &[("u64", 1)]));
+        let after = fp_node("m::T", NodeKind::Struct, fp(&["a"], &[("String", 1)]));
+        let d = member_diff(&before, &after);
+        assert_eq!(d.changed, vec!["a".to_string()]);
+        assert!(d.added.is_empty());
+        assert!(d.removed.is_empty());
+    }
+
+    #[test]
+    fn identical_members_yield_empty_delta() {
+        let f = fp(&["a", "b"], &[("u64", 2)]);
+        let before = fp_node("m::T", NodeKind::Struct, f.clone());
+        let after = fp_node("m::T", NodeKind::Struct, f);
+        assert_eq!(member_diff(&before, &after), MemberDelta::default());
+    }
+
+    #[test]
+    fn no_fingerprint_yields_empty_delta() {
+        let before = node("a");
+        let after = node("a");
+        assert_eq!(member_diff(&before, &after), MemberDelta::default());
+    }
+
+    #[test]
+    fn member_delta_is_sorted_and_deterministic() {
+        let before = fp_node("m::T", NodeKind::Struct, fp(&["a", "c"], &[("u64", 2)]));
+        let after = fp_node(
+            "m::T",
+            NodeKind::Struct,
+            fp(&["a", "z", "b"], &[("u64", 3)]),
+        );
+        let d = member_diff(&before, &after);
+        assert_eq!(d.added, vec!["b".to_string(), "z".to_string()]);
+        assert_eq!(d.removed, vec!["c".to_string()]);
+        assert!(d.changed.is_empty());
     }
 
     #[test]
