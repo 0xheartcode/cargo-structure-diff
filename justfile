@@ -34,6 +34,10 @@ check:
 gate: fmt-check clippy test
     @echo "gate passed"
 
+# bob-pass quality gate: automatable subset (fmt-check, clippy, test)
+bob: fmt-check clippy test
+    @echo "note: full bob-pass clean-code review (CRAP hotspots, interface depth, lying-tests) is run locally via Claude Code before merge"
+
 # backlog helpers (git-native-issue)
 issues:
     git issue ls

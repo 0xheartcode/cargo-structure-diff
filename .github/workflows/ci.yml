@@ -1,0 +1,37 @@
+name: CI
+
+# Mirrors the local `just gate` recipe exactly: fmt-check, clippy -D warnings, test.
+# Calls cargo directly so the workflow runs without installing `just`.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gate:
+    name: fmt + clippy + test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (warnings denied)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+# The bob-pass clean-code gate (CRAP hotspots, interface depth, lying-tests) is an interactive
+# Claude Code review, not a shell tool, so it is not a CI job. Run it locally with `just bob`
+# (deterministic subset) plus the /bob-pass review before merge.
