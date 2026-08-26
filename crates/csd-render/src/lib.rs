@@ -10,14 +10,71 @@
 //! colour-encoded onto a single drawing rather than diffing two images (green added, red-dashed
 //! removed, amber changed, gray unchanged context) and the graph is pruned to changed nodes, the
 //! endpoints of changed edges, and a two-hop neighbourhood, so a large system never renders in
-//! full. The colouring ([`Class`]/[`CLASS_DEFS`]) and pruning ([`prune`]) are shared.
+//! full. The colouring ([`Class`]/[`CLASS_DEFS`]) and pruning ([`prune_within`]) are shared.
 //!
 //! Output is deterministic: nodes are emitted in id order with stable handles, edges in
 //! `(from, to)` order.
+//!
+//! # Options ([`RenderOpts`], [`render`])
+//!
+//! Each view is also reachable through [`render`] plus a [`View`] selector, honouring
+//! [`RenderOpts`]:
+//!
+//! - `full`: render the whole graph, not just the pruned delta. Every collected node is drawn
+//!   (unchanged ones as `context`) with the delta colour on top; the changed-node pruning is
+//!   skipped. The state view still applies its real-state-machine filter; `full` only disables the
+//!   neighbourhood prune.
+//! - `scope`: a list of path globs (`glob::Pattern`, e.g. `dir/**`) matched against
+//!   [`csd_ir::SourceSpan::file`]. Only in-scope nodes render. An edge that crosses the boundary
+//!   (one endpoint in scope, one out) draws its out-of-scope endpoint as a collapsed external
+//!   **stub**: a `context`-classed node whose label is suffixed ` (external)`, so the crossing arrow
+//!   is visible without expanding the far side. Edges wholly outside scope are dropped. Scope
+//!   composes with `full` and with the delta.
+//! - `entry`: the entry `Fn` for the call view (see [`render_call_view`]).
+//!
+//! The four `render_*_view` fns are thin wrappers over [`render`] with default options, so existing
+//! callers are unchanged.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use csd_ir::{Change, EdgeKind, Fingerprint, Graph, NodeKind, StableId};
+
+/// Which view [`render`] produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    /// Module `flowchart` (see [`render_module_view`]).
+    Modules,
+    /// State-machine `stateDiagram-v2` (see [`render_state_view`]).
+    States,
+    /// Type `classDiagram` (see [`render_type_view`]).
+    Types,
+    /// Call `sequenceDiagram` slice (see [`render_call_view`]).
+    Calls,
+}
+
+/// Render options shared by every view.
+///
+/// See the crate docs for `full`, `scope` and `entry`. [`Default`] reproduces the classic
+/// pruned-delta behaviour (no full, no scope, no entry).
+#[derive(Debug, Clone, Default)]
+pub struct RenderOpts {
+    /// Render the whole graph (unchanged nodes as context), skipping the changed-node prune.
+    pub full: bool,
+    /// Path globs matched against `Node.span.file`; empty means every node is in scope.
+    pub scope: Vec<String>,
+    /// Entry `Fn` id for the call view; ignored by the other views.
+    pub entry: Option<StableId>,
+}
+
+/// Render `view` of `head` with `changes` colour-encoded, honouring `opts`.
+pub fn render(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -> String {
+    match view {
+        View::Modules => module_view(head, changes, opts),
+        View::States => state_view(head, changes, opts),
+        View::Types => type_view(head, changes, opts),
+        View::Calls => call_view(head, changes, opts),
+    }
+}
 
 /// How far from a changed node a context node is still drawn.
 const CONTEXT_HOPS: usize = 2;
@@ -56,37 +113,46 @@ impl Class {
 /// `changes` is the delta from `csd_diff::diff`. Removed nodes and edges are recovered from the
 /// delta, since they are absent from `head`. Only `Module` nodes and `Uses` edges participate.
 pub fn render_module_view(head: &Graph, changes: &[Change]) -> String {
+    module_view(head, changes, &RenderOpts::default())
+}
+
+fn module_view(head: &Graph, changes: &[Change], opts: &RenderOpts) -> String {
     let nodes = collect_nodes(head, changes, NodeKind::Module);
     let node_class = classify_nodes(&nodes, changes);
     let edges = collect_edges(head, changes, &nodes, EdgeKind::Uses);
+    let files = file_index(head, changes);
+    let patterns = compile_scope(&opts.scope);
 
-    let kept = prune(&nodes, &node_class, &edges);
+    let sel = select(
+        &nodes,
+        &node_class,
+        &edges,
+        &files,
+        &patterns,
+        opts.full,
+        CONTEXT_HOPS,
+    );
 
     let mut out = String::from("flowchart LR\n");
     out.push_str(CLASS_DEFS);
     out.push('\n');
 
-    if kept.is_empty() {
+    if sel.render_ids.is_empty() {
         out.push_str("    %% no structural changes in the module view\n");
         return out;
     }
 
     // Stable n<i> handles in id order.
-    let handles: BTreeMap<&StableId, String> = kept
+    let handles: BTreeMap<&StableId, String> = sel
+        .render_ids
         .iter()
         .enumerate()
         .map(|(i, id)| (*id, format!("n{i}")))
         .collect();
 
-    for id in &kept {
-        let class = node_class.get(id).copied().unwrap_or(Class::Context);
-        let _ = writeln!(
-            out,
-            "    {}[\"{}\"]:::{}",
-            handles[id],
-            id.as_str(),
-            class.css()
-        );
+    for id in &sel.render_ids {
+        let (label, class) = sel.label_class(id, &node_class);
+        let _ = writeln!(out, "    {}[\"{}\"]:::{}", handles[id], label, class.css());
     }
 
     for (from, to, class) in &edges {
@@ -118,11 +184,16 @@ pub fn render_module_view(head: &Graph, changes: &[Change]) -> String {
 /// removed a `-` label; `stateDiagram-v2` has no dashed transition arrow, so the removed colouring
 /// shows on the state border (via `:::removed`) rather than the edge.
 pub fn render_state_view(head: &Graph, changes: &[Change]) -> String {
+    state_view(head, changes, &RenderOpts::default())
+}
+
+fn state_view(head: &Graph, changes: &[Change], opts: &RenderOpts) -> String {
     let mut nodes = collect_nodes(head, changes, NodeKind::Variant);
     let edges = collect_edges(head, changes, &nodes, EdgeKind::Transitions);
 
     // Only real state machines: an enum with at least one transition. Data enums (their variants
-    // never appear on a Transitions edge) are dropped so the view is not flooded with noise.
+    // never appear on a Transitions edge) are dropped so the view is not flooded with noise. `full`
+    // disables the changed-node prune but not this machine filter.
     let machines: BTreeSet<String> = edges
         .iter()
         .flat_map(|(from, to, _)| [enum_of(from), enum_of(to)])
@@ -130,31 +201,43 @@ pub fn render_state_view(head: &Graph, changes: &[Change]) -> String {
     nodes.retain(|id, _| machines.contains(&enum_of(id)));
 
     let node_class = classify_nodes(&nodes, changes);
-    let kept = prune(&nodes, &node_class, &edges);
+    let files = file_index(head, changes);
+    let patterns = compile_scope(&opts.scope);
+    let sel = select(
+        &nodes,
+        &node_class,
+        &edges,
+        &files,
+        &patterns,
+        opts.full,
+        CONTEXT_HOPS,
+    );
 
     let mut out = String::from("stateDiagram-v2\n");
     out.push_str(CLASS_DEFS);
     out.push('\n');
 
-    if kept.is_empty() {
+    if sel.render_ids.is_empty() {
         out.push_str("    %% no state machines (no enum has transitions)\n");
         return out;
     }
 
     // Stable s<i> handles in id order.
-    let handles: BTreeMap<&StableId, String> = kept
+    let handles: BTreeMap<&StableId, String> = sel
+        .render_ids
         .iter()
         .enumerate()
         .map(|(i, id)| (*id, format!("s{i}")))
         .collect();
 
-    // Declare each state, labelled with its variant id.
-    for id in &kept {
-        let _ = writeln!(out, "    state \"{}\" as {}", id.as_str(), handles[id]);
+    // Declare each state, labelled with its variant id (stubs suffixed ` (external)`).
+    for id in &sel.render_ids {
+        let (label, _) = sel.label_class(id, &node_class);
+        let _ = writeln!(out, "    state \"{}\" as {}", label, handles[id]);
     }
     // Colour each state via the ::: operator.
-    for id in &kept {
-        let class = node_class.get(id).copied().unwrap_or(Class::Context);
+    for id in &sel.render_ids {
+        let (_, class) = sel.label_class(id, &node_class);
         let _ = writeln!(out, "    {}:::{}", handles[id], class.css());
     }
     // Transitions in (from, to) order; added/removed carry a marker label.
@@ -188,6 +271,10 @@ pub fn render_state_view(head: &Graph, changes: &[Change]) -> String {
 /// Pruning is one-hop (SPEC.md 3.2): changed classes plus the classes one relation away, tighter
 /// than the two-hop module/state views because a type graph fans out fast.
 pub fn render_type_view(head: &Graph, changes: &[Change]) -> String {
+    type_view(head, changes, &RenderOpts::default())
+}
+
+fn type_view(head: &Graph, changes: &[Change], opts: &RenderOpts) -> String {
     // Struct, Enum and Trait nodes all render as classes.
     let mut nodes = collect_nodes(head, changes, NodeKind::Struct);
     nodes.extend(collect_nodes(head, changes, NodeKind::Enum));
@@ -205,22 +292,33 @@ pub fn render_type_view(head: &Graph, changes: &[Change]) -> String {
     }
     relations.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
 
-    // One-hop prune: changed classes plus the classes one relation away.
+    // One-hop prune (`select` skips it under `full`): changed classes plus one relation away.
     let prune_edges: Vec<(&StableId, &StableId, Class)> =
         relations.iter().map(|(f, t, _, c)| (*f, *t, *c)).collect();
-    let kept = prune_within(&nodes, &node_class, &prune_edges, 1);
+    let files = file_index(head, changes);
+    let patterns = compile_scope(&opts.scope);
+    let sel = select(
+        &nodes,
+        &node_class,
+        &prune_edges,
+        &files,
+        &patterns,
+        opts.full,
+        1,
+    );
 
     let mut out = String::from("classDiagram\n");
     out.push_str(CLASS_DEFS);
     out.push('\n');
 
-    if kept.is_empty() {
+    if sel.render_ids.is_empty() {
         out.push_str("    %% no structural changes in the type view\n");
         return out;
     }
 
     // Stable c<i> handles in id order (class ids carry `::`/`<>`, so a raw id is not a valid name).
-    let handles: BTreeMap<&StableId, String> = kept
+    let handles: BTreeMap<&StableId, String> = sel
+        .render_ids
         .iter()
         .enumerate()
         .map(|(i, id)| (*id, format!("c{i}")))
@@ -243,13 +341,20 @@ pub fn render_type_view(head: &Graph, changes: &[Change]) -> String {
         .collect();
 
     // Declare each class, with a `<<trait>>` stereotype and (for Modified classes) member lines.
-    for id in &kept {
+    // A scope stub renders as a bare external class with no body.
+    for id in &sel.render_ids {
         let handle = &handles[id];
-        let is_trait = kind_of.get(id).copied() == Some(NodeKind::Trait);
-        let members = modified.get(id).map(|(b, a)| member_lines(b, a));
+        let is_stub = sel.stubs.contains(id);
+        let is_trait = !is_stub && kind_of.get(id).copied() == Some(NodeKind::Trait);
+        let members = if is_stub {
+            None
+        } else {
+            modified.get(id).map(|(b, a)| member_lines(b, a))
+        };
+        let (label, _) = sel.label_class(id, &node_class);
         let has_body = is_trait || members.as_ref().is_some_and(|m| !m.is_empty());
         if has_body {
-            let _ = writeln!(out, "    class {}[\"{}\"] {{", handle, id.as_str());
+            let _ = writeln!(out, "    class {}[\"{}\"] {{", handle, label);
             if is_trait {
                 out.push_str("        <<trait>>\n");
             }
@@ -260,13 +365,13 @@ pub fn render_type_view(head: &Graph, changes: &[Change]) -> String {
             }
             out.push_str("    }\n");
         } else {
-            let _ = writeln!(out, "    class {}[\"{}\"]", handle, id.as_str());
+            let _ = writeln!(out, "    class {}[\"{}\"]", handle, label);
         }
     }
 
     // Colour each class via the ::: operator.
-    for id in &kept {
-        let class = node_class.get(id).copied().unwrap_or(Class::Context);
+    for id in &sel.render_ids {
+        let (_, class) = sel.label_class(id, &node_class);
         let _ = writeln!(out, "    class {}:::{}", handles[id], class.css());
     }
 
@@ -326,6 +431,34 @@ const RECT_REMOVED: &str = "254,242,242";
 /// If `entry` is not a `Fn` node, or has no outgoing calls, the output is `sequenceDiagram` plus a
 /// `%% no calls from <entry>` comment.
 pub fn render_call_view(head: &Graph, changes: &[Change], entry: &StableId) -> String {
+    call_view(
+        head,
+        changes,
+        &RenderOpts {
+            entry: Some(entry.clone()),
+            ..RenderOpts::default()
+        },
+    )
+}
+
+/// Call-view core (see [`render_call_view`]). `opts.entry` names the entry `Fn`; `opts.scope`
+/// collapses the walk at out-of-scope callees (their subtree is not expanded); `opts.full` is a
+/// no-op here (the slice is already the whole reachable call tree, bounded by depth and cycles).
+fn call_view(head: &Graph, changes: &[Change], opts: &RenderOpts) -> String {
+    let entry = match &opts.entry {
+        Some(e) => e,
+        None => return String::from("sequenceDiagram\n    %% no entry fn specified\n"),
+    };
+    // Scope predicate over fn source paths; empty scope keeps every callee.
+    let files = file_index(head, changes);
+    let patterns = compile_scope(&opts.scope);
+    let in_scope = |id: &str| -> bool {
+        patterns.is_empty()
+            || files
+                .get(&StableId::new(id))
+                .is_some_and(|f| matches_scope(f, &patterns))
+    };
+
     // Edges the delta added / removed, keyed by (from, to, ordinal) for exact-message matching.
     let added: BTreeSet<(&str, &str, Option<u32>)> = changes
         .iter()
@@ -409,6 +542,7 @@ pub fn render_call_view(head: &Graph, changes: &[Change], entry: &StableId) -> S
         &mut stack,
         &outgoing,
         &unresolved,
+        &in_scope,
         &mut parts,
         &mut lines,
     );
@@ -474,6 +608,7 @@ fn walk_calls<'a>(
     stack: &mut Vec<&'a str>,
     outgoing: &BTreeMap<&'a str, Vec<Out<'a>>>,
     unresolved: &BTreeMap<&'a str, u32>,
+    in_scope: &dyn Fn(&str) -> bool,
     parts: &mut Parts<'a>,
     lines: &mut String,
 ) {
@@ -500,12 +635,23 @@ fn walk_calls<'a>(
                     let _ = writeln!(lines, "    {caller} ->> {callee} : {name}");
                 }
             }
-            // Recurse into the callee unless it is an ancestor (cycle) or we hit the depth ceiling.
+            // Recurse into the callee unless it is an ancestor (cycle), out of scope (collapsed as
+            // an external leaf), or we hit the depth ceiling.
             if depth + 1 < MAX_CALL_DEPTH
                 && !stack.contains(&out.to)
                 && outgoing.contains_key(out.to)
+                && in_scope(out.to)
             {
-                walk_calls(out.to, depth + 1, stack, outgoing, unresolved, parts, lines);
+                walk_calls(
+                    out.to,
+                    depth + 1,
+                    stack,
+                    outgoing,
+                    unresolved,
+                    in_scope,
+                    parts,
+                    lines,
+                );
             }
         }
     }
@@ -530,6 +676,106 @@ fn enum_of(variant: &StableId) -> String {
         Some(pos) => s[..pos].to_string(),
         None => s.to_string(),
     }
+}
+
+/// Source path per node id: from `head` plus nodes the delta removed (absent from `head`).
+fn file_index<'a>(head: &'a Graph, changes: &'a [Change]) -> BTreeMap<&'a StableId, &'a str> {
+    let mut files: BTreeMap<&StableId, &str> = BTreeMap::new();
+    for n in &head.nodes {
+        files.insert(&n.id, n.span.file.as_str());
+    }
+    for c in changes {
+        if let Change::Removed(n) = c {
+            files.entry(&n.id).or_insert(n.span.file.as_str());
+        }
+    }
+    files
+}
+
+/// Compile the scope globs, dropping any that fail to parse. An empty result means "no scope".
+fn compile_scope(scope: &[String]) -> Vec<glob::Pattern> {
+    scope
+        .iter()
+        .filter_map(|s| glob::Pattern::new(s).ok())
+        .collect()
+}
+
+/// Whether `file` matches any scope glob.
+fn matches_scope(file: &str, patterns: &[glob::Pattern]) -> bool {
+    patterns.iter().any(|p| p.matches(file))
+}
+
+/// The nodes a view draws plus the out-of-scope stub endpoints, after `full` and `scope`.
+struct Selection<'a> {
+    /// Ids to render, in id order (kept in-scope nodes plus external stubs).
+    render_ids: Vec<&'a StableId>,
+    /// Subset of `render_ids` that are collapsed external stubs (out of scope, edge endpoints).
+    stubs: BTreeSet<&'a StableId>,
+}
+
+impl<'a> Selection<'a> {
+    /// The label and colour for a rendered id. A stub is `context` with an ` (external)` suffix;
+    /// otherwise the delta class (unlisted -> context) and the raw id.
+    fn label_class(
+        &self,
+        id: &StableId,
+        node_class: &BTreeMap<&StableId, Class>,
+    ) -> (String, Class) {
+        if self.stubs.contains(id) {
+            (format!("{} (external)", id.as_str()), Class::Context)
+        } else {
+            let class = node_class.get(id).copied().unwrap_or(Class::Context);
+            (id.as_str().to_string(), class)
+        }
+    }
+}
+
+/// Pick the nodes to render, honouring `full` (no prune) and `scope` (path globs + boundary stubs).
+///
+/// Without scope and without full this is exactly the classic pruned neighbourhood. `full` swaps the
+/// prune for "every collected node". `scope` then keeps only in-scope nodes and, for each edge that
+/// crosses into a kept node, records the out-of-scope endpoint as a stub so the arrow stays visible.
+fn select<'a>(
+    nodes: &BTreeMap<&'a StableId, ()>,
+    node_class: &BTreeMap<&'a StableId, Class>,
+    edges: &[(&'a StableId, &'a StableId, Class)],
+    files: &BTreeMap<&'a StableId, &'a str>,
+    patterns: &[glob::Pattern],
+    full: bool,
+    hops: usize,
+) -> Selection<'a> {
+    let scoped = !patterns.is_empty();
+    let in_scope = |id: &StableId| -> bool {
+        !scoped || files.get(id).is_some_and(|f| matches_scope(f, patterns))
+    };
+
+    // Candidate set before scope: the whole graph under `full`, else the pruned neighbourhood.
+    let candidates: Vec<&StableId> = if full {
+        nodes.keys().copied().collect()
+    } else {
+        prune_within(nodes, node_class, edges, hops)
+    };
+
+    // Keep the in-scope candidates.
+    let kept: BTreeSet<&StableId> = candidates.into_iter().filter(|id| in_scope(id)).collect();
+
+    // Stubs: out-of-scope endpoints of edges that touch a kept node.
+    let mut stubs: BTreeSet<&StableId> = BTreeSet::new();
+    if scoped {
+        for (from, to, _) in edges {
+            if kept.contains(from) && !in_scope(to) {
+                stubs.insert(to);
+            }
+            if kept.contains(to) && !in_scope(from) {
+                stubs.insert(from);
+            }
+        }
+    }
+
+    let mut render_ids: Vec<&StableId> =
+        kept.iter().copied().chain(stubs.iter().copied()).collect();
+    render_ids.sort();
+    Selection { render_ids, stubs }
 }
 
 /// Nodes of `kind` to consider: those in `head` plus any removed by the delta (absent from `head`).
@@ -622,17 +868,8 @@ fn collect_edges<'a>(
     edges
 }
 
-/// Keep changed nodes, the endpoints of changed edges, and everything within [`CONTEXT_HOPS`] of
-/// them.
-fn prune<'a>(
-    nodes: &BTreeMap<&'a StableId, ()>,
-    class: &BTreeMap<&'a StableId, Class>,
-    edges: &[(&'a StableId, &'a StableId, Class)],
-) -> Vec<&'a StableId> {
-    prune_within(nodes, class, edges, CONTEXT_HOPS)
-}
-
-/// Like [`prune`] but with a caller-chosen neighbourhood radius. The type view passes `hops = 1`.
+/// Keep changed nodes, the endpoints of changed edges, and everything within a caller-chosen
+/// neighbourhood radius. The module and state views pass [`CONTEXT_HOPS`]; the type view passes 1.
 fn prune_within<'a>(
     nodes: &BTreeMap<&'a StableId, ()>,
     class: &BTreeMap<&'a StableId, Class>,
@@ -1278,5 +1515,175 @@ mod tests {
             "    p1 ->> p0 : start\n",
         );
         assert_eq!(out, expected);
+    }
+
+    /// A module node whose source path is `file`, for scope tests.
+    fn module_at(id: &str, file: &str) -> Node {
+        let mut n = module(id);
+        n.span.file = file.into();
+        n
+    }
+
+    #[test]
+    fn full_renders_every_node_unchanged_as_context() {
+        // a added; chain a->b->c->d. Default prunes d (3 hops); full draws every node.
+        let head = Graph {
+            nodes: vec![
+                module("crate::a"),
+                module("crate::b"),
+                module("crate::c"),
+                module("crate::d"),
+            ],
+            edges: vec![
+                uses("crate::a", "crate::b"),
+                uses("crate::b", "crate::c"),
+                uses("crate::c", "crate::d"),
+            ],
+        };
+        let changes = vec![Change::Added(module("crate::a"))];
+
+        let full = render(
+            View::Modules,
+            &head,
+            &changes,
+            &RenderOpts {
+                full: true,
+                ..RenderOpts::default()
+            },
+        );
+        assert!(full.contains("[\"crate::a\"]:::added"), "{full}");
+        assert!(full.contains("[\"crate::b\"]:::context"), "{full}");
+        assert!(full.contains("[\"crate::c\"]:::context"), "{full}");
+        // full disables pruning, so the 3-hop node is kept as context.
+        assert!(full.contains("[\"crate::d\"]:::context"), "{full}");
+
+        // Same graph, default opts: the classic 2-hop prune still drops d.
+        let pruned = render(View::Modules, &head, &changes, &RenderOpts::default());
+        assert!(
+            !pruned.contains("crate::d"),
+            "default must prune d:\n{pruned}"
+        );
+    }
+
+    #[test]
+    fn scope_filters_nodes_stubs_crossing_edges_and_drops_outside() {
+        // in1,in2 live in the scoped file; out1,out2 outside. in1->in2 stays, in1->out1 crosses
+        // (out1 -> stub), out1->out2 is wholly outside (dropped).
+        let head = Graph {
+            nodes: vec![
+                module_at("crate::in1", "src/focus.rs"),
+                module_at("crate::in2", "src/focus.rs"),
+                module_at("crate::out1", "src/other.rs"),
+                module_at("crate::out2", "src/other.rs"),
+            ],
+            edges: vec![
+                uses("crate::in1", "crate::in2"),
+                uses("crate::in1", "crate::out1"),
+                uses("crate::out1", "crate::out2"),
+            ],
+        };
+        let out = render(
+            View::Modules,
+            &head,
+            &[],
+            &RenderOpts {
+                full: true,
+                scope: vec!["src/focus.rs".to_string()],
+                ..RenderOpts::default()
+            },
+        );
+        assert!(out.contains("[\"crate::in1\"]"), "{out}");
+        assert!(out.contains("[\"crate::in2\"]"), "{out}");
+        // The crossing endpoint renders as a collapsed external stub.
+        assert!(
+            out.contains("[\"crate::out1 (external)\"]:::context"),
+            "crossing endpoint must be an external stub:\n{out}"
+        );
+        // The wholly-outside node is never drawn.
+        assert!(
+            !out.contains("crate::out2"),
+            "outside node must drop:\n{out}"
+        );
+    }
+
+    #[test]
+    fn full_scope_golden() {
+        // a (scoped, Modified) uses b (out of scope). Full+scope: a coloured changed, b a stub.
+        let head = Graph {
+            nodes: vec![
+                module_at("crate::a", "src/focus.rs"),
+                module_at("crate::b", "src/other.rs"),
+            ],
+            edges: vec![uses("crate::a", "crate::b")],
+        };
+        let changes = vec![Change::Modified {
+            before: module_at("crate::a", "src/focus.rs"),
+            after: module_at("crate::a", "src/focus.rs"),
+        }];
+        let out = render(
+            View::Modules,
+            &head,
+            &changes,
+            &RenderOpts {
+                full: true,
+                scope: vec!["src/focus.rs".to_string()],
+                ..RenderOpts::default()
+            },
+        );
+        let expected = concat!(
+            "flowchart LR\n",
+            "    classDef added fill:#f0fdf4,stroke:#22c55e,stroke-width:2px\n",
+            "    classDef removed fill:#fef2f2,stroke:#ef4444,stroke-width:2px,stroke-dasharray:4 4\n",
+            "    classDef changed fill:#fffbeb,stroke:#f59e0b,stroke-width:2px\n",
+            "    classDef context fill:#ffffff,stroke:#d1d5db,color:#9ca3af\n",
+            "    n0[\"crate::a\"]:::changed\n",
+            "    n1[\"crate::b (external)\"]:::context\n",
+            "    n0 --> n1\n",
+        );
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn scope_composes_with_the_call_view() {
+        // run (scoped) calls helper (out of scope): the out-of-scope callee is not expanded.
+        let head = Graph {
+            nodes: vec![
+                {
+                    let mut n = fn_node("crate::App::run");
+                    n.span.file = "src/focus.rs".into();
+                    n
+                },
+                {
+                    let mut n = fn_node("crate::helper");
+                    n.span.file = "src/other.rs".into();
+                    n
+                },
+                {
+                    let mut n = fn_node("crate::helper_deep");
+                    n.span.file = "src/other.rs".into();
+                    n
+                },
+            ],
+            edges: vec![
+                calls("crate::App::run", "crate::helper", 0),
+                calls("crate::helper", "crate::helper_deep", 0),
+            ],
+        };
+        let out = render(
+            View::Calls,
+            &head,
+            &[],
+            &RenderOpts {
+                scope: vec!["src/focus.rs".to_string()],
+                entry: Some(StableId::new("crate::App::run")),
+                ..RenderOpts::default()
+            },
+        );
+        // run's crossing call is shown, but the out-of-scope callee's own calls are not expanded.
+        assert!(out.contains("p0 ->> p1 : helper"), "{out}");
+        assert!(
+            !out.contains("helper_deep"),
+            "far side must not expand:\n{out}"
+        );
     }
 }
