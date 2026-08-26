@@ -118,10 +118,18 @@ pub fn render_module_view(head: &Graph, changes: &[Change]) -> String {
 /// removed a `-` label; `stateDiagram-v2` has no dashed transition arrow, so the removed colouring
 /// shows on the state border (via `:::removed`) rather than the edge.
 pub fn render_state_view(head: &Graph, changes: &[Change]) -> String {
-    let nodes = collect_nodes(head, changes, NodeKind::Variant);
-    let node_class = classify_nodes(&nodes, changes);
+    let mut nodes = collect_nodes(head, changes, NodeKind::Variant);
     let edges = collect_edges(head, changes, &nodes, EdgeKind::Transitions);
 
+    // Only real state machines: an enum with at least one transition. Data enums (their variants
+    // never appear on a Transitions edge) are dropped so the view is not flooded with noise.
+    let machines: BTreeSet<String> = edges
+        .iter()
+        .flat_map(|(from, to, _)| [enum_of(from), enum_of(to)])
+        .collect();
+    nodes.retain(|id, _| machines.contains(&enum_of(id)));
+
+    let node_class = classify_nodes(&nodes, changes);
     let kept = prune(&nodes, &node_class, &edges);
 
     let mut out = String::from("stateDiagram-v2\n");
@@ -129,7 +137,7 @@ pub fn render_state_view(head: &Graph, changes: &[Change]) -> String {
     out.push('\n');
 
     if kept.is_empty() {
-        out.push_str("    %% no structural changes in the state view\n");
+        out.push_str("    %% no state machines (no enum has transitions)\n");
         return out;
     }
 
@@ -514,6 +522,16 @@ fn walk_calls<'a>(
 
 use std::fmt::Write as _;
 
+/// The enum id owning a variant id: the id with its last `::segment` stripped
+/// (`crate::Status::Active` -> `crate::Status`).
+fn enum_of(variant: &StableId) -> String {
+    let s = variant.as_str();
+    match s.rfind("::") {
+        Some(pos) => s[..pos].to_string(),
+        None => s.to_string(),
+    }
+}
+
 /// Nodes of `kind` to consider: those in `head` plus any removed by the delta (absent from `head`).
 fn collect_nodes<'a>(
     head: &'a Graph,
@@ -887,10 +905,40 @@ mod tests {
         let out = render_state_view(&head, &[]);
         assert!(out.starts_with("stateDiagram-v2\n"));
         assert!(out.contains("classDef added"));
-        assert!(out.contains("%% no structural changes in the state view"));
+        assert!(out.contains("%% no state machines (no enum has transitions)"));
         // Nothing was changed, so no state lines are drawn.
         assert!(!out.contains(":::"));
         assert!(!out.contains("state \""));
+    }
+
+    #[test]
+    fn state_view_excludes_enums_without_transitions() {
+        // A data enum (no transition) alongside a real state machine (one transition).
+        let head = Graph {
+            nodes: vec![
+                variant("m::Data::A"),
+                variant("m::Data::B"),
+                variant("m::Sm::Open"),
+                variant("m::Sm::Closed"),
+            ],
+            edges: vec![transition("m::Sm::Open", "m::Sm::Closed")],
+        };
+        let changes = vec![
+            Change::Added(variant("m::Data::A")),
+            Change::Added(variant("m::Data::B")),
+            Change::Added(variant("m::Sm::Open")),
+            Change::Added(variant("m::Sm::Closed")),
+            Change::EdgeAdded(transition("m::Sm::Open", "m::Sm::Closed")),
+        ];
+        let out = render_state_view(&head, &changes);
+        assert!(
+            out.contains("m::Sm::Open") && out.contains("m::Sm::Closed"),
+            "the real state machine must render:\n{out}"
+        );
+        assert!(
+            !out.contains("m::Data"),
+            "a data enum with no transitions must be excluded:\n{out}"
+        );
     }
 
     #[test]
