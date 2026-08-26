@@ -10,7 +10,7 @@ Dependencies are not a native git-issue field, so each issue body carries a
 ## Open issues
 
 ```
-14c3416 [open] ir: implement StableId, structural fingerprints and similarity scoring
+14c3416 [closed] ir: implement StableId, structural fingerprints and similarity scoring
         labels:area:ir, blocking, type:feat priority:critical milestone:m0
 775ae67 [open] diff: rename/move matcher with fingerprint similarity and threshold
         labels:area:diff, blocking, type:feat priority:critical milestone:m0
@@ -30,15 +30,15 @@ ff3a772 [open] extract-rs: item nodes with member fingerprints
         labels:area:harness, blocking, type:docs priority:medium milestone:m0
 4a971c7 [open] diff: seed module-level Moved from git file-rename signal
         labels:area:diff, independent, type:feat priority:medium milestone:m0
-ad3822a [open] harness: corpus clone and first-parent pair walker
+ad3822a [closed] harness: corpus clone and first-parent pair walker
         labels:area:harness, independent, type:feat priority:medium milestone:m0
 ec31139 [open] test: golden fixtures for IR and Change classification
         labels:area:test, independent, type:test priority:medium milestone:m0
-f7c40ef [open] infra: CI workflow (fmt, clippy -D warnings, test on stable)
+f7c40ef [closed] infra: CI workflow (fmt, clippy -D warnings, test on stable)
         labels:area:infra, independent, type:infra priority:medium milestone:m0
 0e76290 [open] spike: rustdoc-json vs tree-sitter for the types view
         labels:area:extract, independent, type:docs priority:low milestone:m3
-db21bac [open] infra: wire bob-pass quality gate into justfile and CI
+db21bac [closed] infra: wire bob-pass quality gate into justfile and CI
         labels:area:infra, independent, type:infra priority:low milestone:m0
 ```
 
