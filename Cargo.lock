@@ -92,6 +92,13 @@ name = "csd-ir"
 version = "0.0.0"
 
 [[package]]
+name = "csd-render"
+version = "0.0.0"
+dependencies = [
+ "csd-ir",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

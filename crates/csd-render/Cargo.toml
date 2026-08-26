@@ -1,0 +1,12 @@
+[package]
+name = "csd-render"
+description = "Render a cargo-structure-diff graph and its delta as one annotated Mermaid diagram."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+csd-ir = { workspace = true }
