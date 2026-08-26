@@ -20,6 +20,7 @@ path = "src/cargo_shim.rs"
 csd-ir = { workspace = true }
 csd-diff = { workspace = true }
 csd-extract-rs = { workspace = true }
+csd-extract-db = { workspace = true }
 csd-config = { workspace = true }
 csd-render = { workspace = true }
 csd-lint = { workspace = true }
