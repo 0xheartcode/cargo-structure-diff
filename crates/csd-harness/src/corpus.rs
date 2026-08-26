@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use csd_diff::FileRename;
 
 /// A single first-parent step: the pre-change commit and the commit that produced it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +104,32 @@ pub fn first_parent_pairs(repo: &Path, rev: &str, n: usize) -> Result<Vec<Commit
         })
         .collect();
     Ok(pairs)
+}
+
+/// The reliable module-level ground truth: git's file renames between `base` and `head`.
+///
+/// Runs `git diff -M50 --name-status base head` and keeps only rename (`R`) entries. Git reports
+/// FILE renames only, never type-level renames, so this is trustworthy ground truth for the
+/// module-move reconciliation sanity check but not for the type-level split/merge signals.
+pub fn file_renames(repo: &Path, base: &str, head: &str) -> Result<Vec<FileRename>> {
+    let out = git_stdout(repo, &["diff", "-M50", "--name-status", base, head])?;
+    let mut renames = Vec::new();
+    for line in out.lines() {
+        // A rename line is `R<score>\t<old>\t<new>`; other statuses (A/M/D) are ignored.
+        let mut parts = line.split('\t');
+        let status = parts.next().unwrap_or("");
+        if !status.starts_with('R') {
+            continue;
+        }
+        let (Some(old_path), Some(new_path)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        renames.push(FileRename {
+            old_path: old_path.to_string(),
+            new_path: new_path.to_string(),
+        });
+    }
+    Ok(renames)
 }
 
 /// Run git in `repo` and return its stdout, erroring on a non-zero exit.
