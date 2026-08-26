@@ -16,7 +16,11 @@ Dependencies are not a native git-issue field, so each issue body carries a
         labels:area:diff, blocking, type:feat priority:critical milestone:m0
 0a83140 [closed] extract-rs: module tree and use-path collection via tree-sitter
         labels:area:extract, blocking, type:feat priority:high milestone:m0
-87f08db [open] harness: threshold sweep and metrics
+22cc17f [open] harness: select refactor-heavy pairs for the sweep
+        labels:area:harness, independent, type:feat priority:high milestone:m0
+7344e8d [open] extract-rs: namespace node ids per crate for workspaces
+        labels:area:extract, independent, type:feat priority:high milestone:m1
+87f08db [closed] harness: threshold sweep and metrics
         labels:area:harness, blocking, type:feat priority:high milestone:m0
 b951fc4 [closed] harness: git worktree materialization and IR cache by SHA
         labels:area:harness, blocking, type:feat priority:high milestone:m0
@@ -26,13 +30,13 @@ c1b3a2b [closed] diff: flat set diff over nodes and edges
         labels:area:diff, blocking, type:feat priority:high milestone:m0
 ff3a772 [closed] extract-rs: item nodes with member fingerprints
         labels:area:extract, independent, type:feat priority:high milestone:m0
-25768fb [open] harness: generate M0-REPORT.md go/no-go artifact
+25768fb [closed] harness: generate M0-REPORT.md go/no-go artifact
         labels:area:harness, blocking, type:docs priority:medium milestone:m0
 4a971c7 [closed] diff: seed module-level Moved from git file-rename signal
         labels:area:diff, independent, type:feat priority:medium milestone:m0
 ad3822a [closed] harness: corpus clone and first-parent pair walker
         labels:area:harness, independent, type:feat priority:medium milestone:m0
-ec31139 [open] test: golden fixtures for IR and Change classification
+ec31139 [closed] test: golden fixtures for IR and Change classification
         labels:area:test, independent, type:test priority:medium milestone:m0
 f7c40ef [closed] infra: CI workflow (fmt, clippy -D warnings, test on stable)
         labels:area:infra, independent, type:infra priority:medium milestone:m0
