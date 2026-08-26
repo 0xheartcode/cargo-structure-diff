@@ -6,6 +6,7 @@
 //! pipeline is not.
 
 mod corpus;
+mod materialize;
 
 use std::path::Path;
 
@@ -16,6 +17,7 @@ fn main() -> Result<()> {
     match args.get(1).map(String::as_str) {
         Some("pairs") => run_pairs(&args[2..]),
         Some("corpus") => run_corpus(),
+        Some("ir") => run_ir(&args[2..]),
         _ => {
             eprintln!(
                 "csd-harness v0.0.0: not yet implemented. See BACKLOG.md (area `harness`) and SPEC.md section 6."
@@ -38,6 +40,20 @@ fn run_pairs(rest: &[String]) -> Result<()> {
     for pair in &pairs {
         println!("{} {}", pair.parent, pair.commit);
     }
+    Ok(())
+}
+
+/// `csd-harness ir <repo-path> <sha>`: materialize a commit and print its IR node count.
+fn run_ir(rest: &[String]) -> Result<()> {
+    let repo = rest
+        .first()
+        .context("usage: csd-harness ir <repo-path> <sha>")?;
+    let sha = rest
+        .get(1)
+        .context("usage: csd-harness ir <repo-path> <sha>")?;
+    let mut cache = materialize::Cache::new();
+    let graph = materialize::ir_for_sha(Path::new(repo), sha, &mut cache)?;
+    println!("{} nodes", graph.nodes.len());
     Ok(())
 }
 
