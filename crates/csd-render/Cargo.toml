@@ -10,3 +10,4 @@ authors.workspace = true
 
 [dependencies]
 csd-ir = { workspace = true }
+glob = "0.3"
