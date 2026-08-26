@@ -41,7 +41,7 @@ fn main() -> Result<()> {
         Some("sweep") => run_sweep(&args[2..]),
         _ => {
             eprintln!(
-                "csd-harness: usage: pairs <repo> [n] | corpus | ir <repo> <sha> | sweep [repo-name] [n]. See SPEC.md section 6."
+                "csd-harness: usage: pairs <repo> [n] | corpus | ir <repo> <sha> | sweep [--refactor] [repo-name] [n] [candidates]. See SPEC.md section 6."
             );
             Ok(())
         }
@@ -88,14 +88,20 @@ fn run_corpus() -> Result<()> {
     Ok(())
 }
 
-/// `csd-harness sweep [repo-name] [num-pairs]`: replay N pairs of a corpus repo across the rename
-/// threshold sweep and print a markdown report. Clones and extracts, so it is manual-only.
+/// `csd-harness sweep [--refactor] [repo-name] [num-pairs] [candidates]`: replay N pairs of a corpus
+/// repo across the rename threshold sweep and print a markdown report. Clones and extracts, so it is
+/// manual-only. With `--refactor`, N pairs are drawn from refactor-heavy commits (subject matches
+/// rename/move/refactor or a `.rs` file rename) found by scanning `candidates` of the first-parent
+/// chain; this concentrates the rename/move events M0 measures.
 fn run_sweep(rest: &[String]) -> Result<()> {
-    let repo_name = rest
+    let refactor = rest.iter().any(|a| a == "--refactor");
+    let positional: Vec<&String> = rest.iter().filter(|a| !a.starts_with("--")).collect();
+
+    let repo_name = positional
         .first()
-        .map(String::as_str)
+        .map(|s| s.as_str())
         .unwrap_or(corpus::CORPUS[0].name);
-    let num_pairs = match rest.get(1) {
+    let num_pairs = match positional.get(1) {
         Some(s) => s
             .parse()
             .context("num-pairs must be a non-negative integer")?,
@@ -111,9 +117,20 @@ fn run_sweep(rest: &[String]) -> Result<()> {
 
     let cache_dir = corpus::cache_dir();
     let path = corpus::ensure_cloned(repo, &cache_dir)?;
-    let pairs = corpus::first_parent_pairs(&path, "HEAD", num_pairs)?;
+    let pairs = if refactor {
+        // Scan far more of the chain than we keep, since refactor commits are sparse.
+        let candidates = match positional.get(2) {
+            Some(s) => s
+                .parse()
+                .context("candidates must be a non-negative integer")?,
+            None => num_pairs.saturating_mul(corpus::REFACTOR_SCAN_FACTOR),
+        };
+        corpus::refactor_pairs(&path, "HEAD", num_pairs, candidates)?
+    } else {
+        corpus::first_parent_pairs(&path, "HEAD", num_pairs)?
+    };
 
-    let report = sweep_report(&path, repo.name, &pairs)?;
+    let report = sweep_report(&path, repo.name, &pairs, refactor)?;
     print!("{report}");
     Ok(())
 }
@@ -125,8 +142,14 @@ struct ThresholdTotals {
     spurious: usize,
 }
 
-/// Run the sweep over `pairs` and render the markdown report.
-fn sweep_report(repo: &Path, repo_name: &str, pairs: &[corpus::CommitPair]) -> Result<String> {
+/// Run the sweep over `pairs` and render the markdown report. `refactor` records whether the pairs
+/// were drawn from a refactor-heavy sample, for the report note.
+fn sweep_report(
+    repo: &Path,
+    repo_name: &str,
+    pairs: &[corpus::CommitPair],
+    refactor: bool,
+) -> Result<String> {
     let mut cache = materialize::Cache::new();
 
     let mut baseline = Counts::default();
@@ -172,6 +195,7 @@ fn sweep_report(repo: &Path, repo_name: &str, pairs: &[corpus::CommitPair]) -> R
 
     Ok(render_markdown(RenderInput {
         repo_name,
+        refactor,
         analyzed,
         baseline,
         totals: &totals,
@@ -249,6 +273,7 @@ fn add_counts(a: Counts, b: Counts) -> Counts {
 /// Everything the renderer needs; grouped to keep the signature narrow.
 struct RenderInput<'a> {
     repo_name: &'a str,
+    refactor: bool,
     analyzed: usize,
     baseline: Counts,
     totals: &'a [ThresholdTotals],
@@ -264,6 +289,12 @@ fn render_markdown(input: RenderInput) -> String {
     let _ = writeln!(out, "# csd-harness sweep report: {}", input.repo_name);
     let _ = writeln!(out);
     let _ = writeln!(out, "Pairs analyzed: {}", input.analyzed);
+    if input.refactor {
+        let _ = writeln!(
+            out,
+            "Sampling: refactor-heavy pairs only (subject matches rename/move/refactor or a `.rs` file rename)."
+        );
+    }
     let _ = writeln!(out);
 
     // Honesty notes up front so no reader mistakes these for gold-standard precision/recall.
@@ -478,6 +509,7 @@ mod tests {
         ];
         let out = render_markdown(RenderInput {
             repo_name: "demo",
+            refactor: false,
             analyzed: 5,
             baseline: counts(9, 1, 0, 2),
             totals: &totals,
@@ -513,5 +545,27 @@ mod tests {
         // Audit and split samples render with 3-decimal scores.
         assert!(out.contains("0.420") && out.contains("m::Old"));
         assert!(out.contains("0.550") && out.contains("m::A"));
+        // Blind sampling adds no refactor note.
+        assert!(!out.contains("refactor-heavy pairs only"));
+    }
+
+    #[test]
+    fn render_markdown_notes_refactor_sampling() {
+        let totals = vec![ThresholdTotals::default(); THRESHOLD_SWEEP.len()];
+        let out = render_markdown(RenderInput {
+            repo_name: "demo",
+            refactor: true,
+            analyzed: 3,
+            baseline: counts(0, 0, 0, 0),
+            totals: &totals,
+            rs_renames: 0,
+            module_reconciled: 0,
+            audit_matches: vec![],
+            audit_splits: vec![],
+        });
+        assert!(
+            out.contains("refactor-heavy pairs only"),
+            "note missing:\n{out}"
+        );
     }
 }

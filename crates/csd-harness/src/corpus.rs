@@ -132,6 +132,59 @@ pub fn file_renames(repo: &Path, base: &str, head: &str) -> Result<Vec<FileRenam
     Ok(renames)
 }
 
+/// Subject keywords that mark a commit as refactor-heavy (case-insensitive substring match).
+const REFACTOR_KEYWORDS: [&str; 3] = ["rename", "move", "refactor"];
+
+/// True if a commit subject reads like a refactor. Lowercase substring check, no regex crate.
+pub fn refactor_subject(subject: &str) -> bool {
+    let lower = subject.to_lowercase();
+    REFACTOR_KEYWORDS.iter().any(|kw| lower.contains(kw))
+}
+
+/// The commit subject line (`git log -1 --format=%s`), trimmed.
+pub fn commit_subject(repo: &Path, sha: &str) -> Result<String> {
+    let out = git_stdout(repo, &["log", "-1", "--format=%s", sha])?;
+    Ok(out.trim().to_string())
+}
+
+/// True if `pair` is refactor-heavy: its subject matches [`refactor_subject`] OR it has at least
+/// one `.rs` file rename per [`file_renames`].
+pub fn is_refactor_pair(repo: &Path, pair: &CommitPair) -> Result<bool> {
+    if refactor_subject(&commit_subject(repo, &pair.commit)?) {
+        return Ok(true);
+    }
+    let renames = file_renames(repo, &pair.parent, &pair.commit)?;
+    Ok(renames.iter().any(|r| r.new_path.ends_with(".rs")))
+}
+
+/// Retain only refactor-heavy pairs from `candidates`, preserving order. See [`is_refactor_pair`].
+pub fn retain_refactor_pairs(repo: &Path, candidates: &[CommitPair]) -> Result<Vec<CommitPair>> {
+    let mut kept = Vec::new();
+    for pair in candidates {
+        if is_refactor_pair(repo, pair)? {
+            kept.push(pair.clone());
+        }
+    }
+    Ok(kept)
+}
+
+/// Scan `candidates` first-parent pairs from `rev`, keep the refactor-heavy ones, and return at most
+/// `want` of them (newest first). Refactor commits are sparse, so `candidates` should exceed `want`.
+pub fn refactor_pairs(
+    repo: &Path,
+    rev: &str,
+    want: usize,
+    candidates: usize,
+) -> Result<Vec<CommitPair>> {
+    let pool = first_parent_pairs(repo, rev, candidates)?;
+    let mut kept = retain_refactor_pairs(repo, &pool)?;
+    kept.truncate(want);
+    Ok(kept)
+}
+
+/// How many candidate pairs to scan per wanted refactor pair, since refactor commits are sparse.
+pub const REFACTOR_SCAN_FACTOR: usize = 12;
+
 /// Run git in `repo` and return its stdout, erroring on a non-zero exit.
 fn git_stdout(repo: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
@@ -230,6 +283,65 @@ mod tests {
         assert_eq!(one[0].commit, head);
 
         assert!(first_parent_pairs(&dir, "HEAD", 0).unwrap().is_empty());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refactor_subject_matches_keywords_case_insensitively() {
+        assert!(refactor_subject("refactor: split the parser"));
+        assert!(refactor_subject("Rename X to Y"));
+        assert!(refactor_subject("MOVE module into core"));
+        assert!(!refactor_subject("add a feature"));
+        assert!(!refactor_subject("fix a bug"));
+    }
+
+    /// Write, stage, and commit a file so a pair carries a real tree change.
+    fn commit_file(repo: &Path, path: &str, contents: &str, msg: &str) {
+        fs::write(repo.join(path), contents).unwrap();
+        git(repo, &["add", path]);
+        commit(repo, msg);
+    }
+
+    #[test]
+    fn retain_refactor_pairs_keeps_only_refactor_heavy() {
+        let dir = env::temp_dir().join(format!("csd-harness-refactor-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        git(&dir, &["init", "-q"]);
+        // c1: seed a .rs file (plain).
+        commit_file(&dir, "old.rs", "fn a() {}\n", "add feature a");
+        // c2: plain add, no refactor keyword, no rename.
+        commit_file(&dir, "other.txt", "hello\n", "add docs");
+        // c3: refactor by subject only (no rename).
+        commit_file(&dir, "extra.rs", "fn b() {}\n", "refactor: tidy modules");
+        // c4: actual git mv of a .rs file with a non-refactor subject.
+        git(&dir, &["mv", "old.rs", "new.rs"]);
+        commit(&dir, "adjust things");
+
+        // Newest first: [c4/c3, c3/c2, c2/c1].
+        let all = first_parent_pairs(&dir, "HEAD", DEFAULT_PAIR_COUNT).unwrap();
+        assert_eq!(all.len(), 3);
+
+        let kept = retain_refactor_pairs(&dir, &all).unwrap();
+        // c4 (file rename) and c3 (subject) qualify; the c2/c1 "add docs" pair does not.
+        assert_eq!(kept.len(), 2, "kept: {kept:?}");
+
+        let c4 = git_out(&dir, &["rev-parse", "HEAD"]);
+        let c3 = git_out(&dir, &["rev-parse", "HEAD~1"]);
+        assert_eq!(kept[0].commit, c4, "file-rename pair must be kept");
+        assert_eq!(kept[1].commit, c3, "subject pair must be kept");
+
+        // The subject pair qualifies by subject, the rename pair by file rename.
+        assert!(refactor_subject(&commit_subject(&dir, &c3).unwrap()));
+        assert!(!refactor_subject(&commit_subject(&dir, &c4).unwrap()));
+        assert!(is_refactor_pair(&dir, &kept[0]).unwrap());
+
+        // want caps the result even when more candidates qualify.
+        let one = refactor_pairs(&dir, "HEAD", 1, DEFAULT_PAIR_COUNT).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].commit, c4);
 
         fs::remove_dir_all(&dir).unwrap();
     }
