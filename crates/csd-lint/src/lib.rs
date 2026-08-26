@@ -4,7 +4,12 @@
 //! - `layering`: a `Uses` edge whose source and target layers form a forbidden pair.
 //! - `cycles`: a strongly-connected component of the module `Uses` graph (a module cycle).
 //!
-//! Both are ratchet-aware. Under [`RatchetMode::NewOnly`] only violations introduced by a newly
+//! Three rules for M2 over the transition graph (Variant nodes + Transitions edges, SPEC.md 3.4):
+//! - `unreachable_state`: a Variant with no incoming and no outgoing transition (isolated).
+//! - `terminal_state_without_exit`: a Variant with an incoming but no outgoing transition.
+//! - `new_state_cycle`: a cycle among states (a Transitions SCC, or a self-transition).
+//!
+//! All are ratchet-aware. Under [`RatchetMode::NewOnly`] only violations introduced by a newly
 //! added edge fail, which is what lets a brownfield repo adopt the gate without a red day one.
 //! A lint runs only when it appears in the config `deny` or `warn` list, and its findings are
 //! tagged with the matching [`Severity`].
@@ -26,7 +31,7 @@ pub enum Severity {
 /// One lint violation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finding {
-    /// The rule that fired (`layering` or `cycles`).
+    /// The rule that fired (for example `layering`, `cycles`, `unreachable_state`).
     pub rule: String,
     /// Whether it denies or only warns.
     pub severity: Severity,
@@ -51,6 +56,8 @@ pub fn lint(head: &Graph, changes: &[Change], config: &Config) -> Vec<Finding> {
     };
 
     let added = added_edges(changes);
+    let added_transitions = added_transition_edges(changes);
+    let touched_states = states_touched_by_change(changes);
     let paths = module_paths(head);
     let mut findings = Vec::new();
 
@@ -59,6 +66,20 @@ pub fn lint(head: &Graph, changes: &[Change], config: &Config) -> Vec<Finding> {
     }
     if let Some(sev) = severity_of("cycles") {
         findings.extend(cycles(head, config, &added, sev));
+    }
+    if let Some(sev) = severity_of("unreachable_state") {
+        findings.extend(unreachable_state(head, config, &touched_states, sev));
+    }
+    if let Some(sev) = severity_of("terminal_state_without_exit") {
+        findings.extend(terminal_state_without_exit(
+            head,
+            config,
+            &touched_states,
+            sev,
+        ));
+    }
+    if let Some(sev) = severity_of("new_state_cycle") {
+        findings.extend(new_state_cycle(head, config, &added_transitions, sev));
     }
 
     findings.sort_by(|a, b| (&a.rule, &a.message).cmp(&(&b.rule, &b.message)));
@@ -195,6 +216,174 @@ fn cycles(
     findings
 }
 
+/// The `(from, to)` ids of `Transitions` edges added between base and head.
+fn added_transition_edges(changes: &[Change]) -> BTreeSet<(&StableId, &StableId)> {
+    changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::EdgeAdded(e) if e.kind == EdgeKind::Transitions => Some((&e.from, &e.to)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// State ids touched by a `Transitions` edge added or removed between base and head. Used to
+/// ratchet the structural state rules: under new-only, a state is only flagged when the change
+/// added or removed a transition on it, so a pre-existing dead-end does not fail a brownfield repo.
+fn states_touched_by_change(changes: &[Change]) -> BTreeSet<&StableId> {
+    let mut touched = BTreeSet::new();
+    for c in changes {
+        let e = match c {
+            Change::EdgeAdded(e) | Change::EdgeRemoved(e) if e.kind == EdgeKind::Transitions => e,
+            _ => continue,
+        };
+        touched.insert(&e.from);
+        touched.insert(&e.to);
+    }
+    touched
+}
+
+/// The Variant node ids of `head`.
+fn variant_ids(head: &Graph) -> BTreeSet<&StableId> {
+    head.nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Variant)
+        .map(|n| &n.id)
+        .collect()
+}
+
+/// For the Variant subgraph, the sets of states with at least one incoming and at least one
+/// outgoing `Transitions` edge (endpoints restricted to Variant nodes). A self-transition counts
+/// as both an incoming and an outgoing edge on its state.
+fn transition_endpoints<'a>(
+    head: &'a Graph,
+    variants: &BTreeSet<&'a StableId>,
+) -> (BTreeSet<&'a StableId>, BTreeSet<&'a StableId>) {
+    let mut has_incoming = BTreeSet::new();
+    let mut has_outgoing = BTreeSet::new();
+    for e in &head.edges {
+        if e.kind != EdgeKind::Transitions {
+            continue;
+        }
+        if !variants.contains(&e.from) || !variants.contains(&e.to) {
+            continue;
+        }
+        has_outgoing.insert(&e.from);
+        has_incoming.insert(&e.to);
+    }
+    (has_incoming, has_outgoing)
+}
+
+/// Unreachable state: a Variant with no incoming and no outgoing `Transitions` edge (an isolated
+/// state). Entry is defined pragmatically to keep the rule precision-first: a state with outgoing
+/// but no incoming transitions is a plausible entry and is NOT flagged; only a state with neither
+/// incoming nor outgoing is unreachable. Under new-only, report one only when the change added or
+/// removed a transition touching that state; under all, report every isolated state.
+fn unreachable_state(
+    head: &Graph,
+    config: &Config,
+    touched: &BTreeSet<&StableId>,
+    severity: Severity,
+) -> Vec<Finding> {
+    let restrict = new_only(config);
+    let variants = variant_ids(head);
+    let (has_incoming, has_outgoing) = transition_endpoints(head, &variants);
+    let mut findings = Vec::new();
+    for id in &variants {
+        if has_incoming.contains(id) || has_outgoing.contains(id) {
+            continue;
+        }
+        if restrict && !touched.contains(id) {
+            continue;
+        }
+        findings.push(Finding {
+            rule: "unreachable_state".to_string(),
+            severity,
+            message: format!("unreachable state: {}", id.as_str()),
+        });
+    }
+    findings
+}
+
+/// Terminal state without exit: a Variant with at least one incoming `Transitions` edge but no
+/// outgoing edge (a dead-end). Under new-only, report one only when the change added or removed a
+/// transition touching that state; under all, report every dead-end.
+fn terminal_state_without_exit(
+    head: &Graph,
+    config: &Config,
+    touched: &BTreeSet<&StableId>,
+    severity: Severity,
+) -> Vec<Finding> {
+    let restrict = new_only(config);
+    let variants = variant_ids(head);
+    let (has_incoming, has_outgoing) = transition_endpoints(head, &variants);
+    let mut findings = Vec::new();
+    for id in &variants {
+        if !has_incoming.contains(id) || has_outgoing.contains(id) {
+            continue;
+        }
+        if restrict && !touched.contains(id) {
+            continue;
+        }
+        findings.push(Finding {
+            rule: "terminal_state_without_exit".to_string(),
+            severity,
+            message: format!("terminal state without exit: {}", id.as_str()),
+        });
+    }
+    findings
+}
+
+/// State cycles: report each non-trivial strongly-connected component of the `Transitions` graph,
+/// or a single state with a self-transition. Under new-only, a component is reported only when a
+/// newly added `Transitions` edge lies inside it (mirrors the module `cycles` rule).
+fn new_state_cycle(
+    head: &Graph,
+    config: &Config,
+    added: &BTreeSet<(&StableId, &StableId)>,
+    severity: Severity,
+) -> Vec<Finding> {
+    let restrict = new_only(config);
+    let variants = variant_ids(head);
+
+    let mut adj: BTreeMap<&StableId, Vec<&StableId>> = BTreeMap::new();
+    for e in &head.edges {
+        if e.kind == EdgeKind::Transitions && variants.contains(&e.from) && variants.contains(&e.to)
+        {
+            adj.entry(&e.from).or_default().push(&e.to);
+        }
+    }
+
+    let mut findings = Vec::new();
+    for scc in strongly_connected(&variants, &adj) {
+        // A cycle is an SCC of two or more nodes, or a single node with a self-loop.
+        let is_cycle = scc.len() > 1
+            || scc
+                .first()
+                .is_some_and(|only| adj.get(only).is_some_and(|ns| ns.contains(only)));
+        if !is_cycle {
+            continue;
+        }
+        let members: BTreeSet<&StableId> = scc.iter().copied().collect();
+        if restrict {
+            let has_new = added
+                .iter()
+                .any(|(f, t)| members.contains(f) && members.contains(t));
+            if !has_new {
+                continue;
+            }
+        }
+        let mut names: Vec<&str> = members.iter().map(|id| id.as_str()).collect();
+        names.sort_unstable();
+        findings.push(Finding {
+            rule: "new_state_cycle".to_string(),
+            severity,
+            message: format!("state cycle: {}", names.join(" -> ")),
+        });
+    }
+    findings
+}
+
 /// Tarjan strongly-connected components over the module subgraph. Returns one Vec per component.
 fn strongly_connected<'a>(
     nodes: &BTreeSet<&'a StableId>,
@@ -300,6 +489,47 @@ mod tests {
             ordinal: None,
         }
     }
+
+    fn variant(id: &str) -> csd_ir::Node {
+        csd_ir::Node {
+            id: StableId::new(id),
+            kind: NodeKind::Variant,
+            span: SourceSpan {
+                file: "src/state.rs".into(),
+                start: 0,
+                end: 1,
+            },
+            attrs: BTreeMap::new(),
+            fingerprint: None,
+        }
+    }
+
+    fn transition(from: &str, to: &str) -> Edge {
+        Edge {
+            from: StableId::new(from),
+            to: StableId::new(to),
+            kind: EdgeKind::Transitions,
+            span: SourceSpan {
+                file: "src/state.rs".into(),
+                start: 0,
+                end: 1,
+            },
+            ordinal: None,
+        }
+    }
+
+    const STATES: &str = r#"
+[lint]
+deny = ["unreachable_state", "terminal_state_without_exit", "new_state_cycle"]
+"#;
+
+    const STATES_ALL: &str = r#"
+[lint]
+deny = ["unreachable_state", "terminal_state_without_exit", "new_state_cycle"]
+
+[ratchet]
+mode = "all"
+"#;
 
     const LAYERS: &str = r#"
 [layers]
@@ -422,6 +652,192 @@ deny = ["layering", "cycles"]
         assert!(lint(&head, &changes, &cfg(LAYERS))
             .iter()
             .all(|f| f.rule != "cycles"));
+    }
+
+    #[test]
+    fn isolated_state_trips_unreachable_under_all() {
+        // Open and Done are connected; Orphan has no transitions at all.
+        let head = Graph {
+            nodes: vec![variant("S::Open"), variant("S::Done"), variant("S::Orphan")],
+            edges: vec![transition("S::Open", "S::Done")],
+        };
+        let f = lint(&head, &[], &cfg(STATES_ALL));
+        let u: Vec<_> = f.iter().filter(|f| f.rule == "unreachable_state").collect();
+        assert_eq!(u.len(), 1, "expected one unreachable finding: {f:?}");
+        assert!(u[0].message.contains("S::Orphan"));
+    }
+
+    #[test]
+    fn entry_state_is_not_unreachable() {
+        // Open has outgoing but no incoming: a plausible entry, must not be flagged.
+        let head = Graph {
+            nodes: vec![variant("S::Open"), variant("S::Done")],
+            edges: vec![transition("S::Open", "S::Done")],
+        };
+        let f = lint(&head, &[], &cfg(STATES_ALL));
+        assert!(
+            f.iter().all(|f| f.rule != "unreachable_state"),
+            "entry state must not be unreachable: {f:?}"
+        );
+    }
+
+    #[test]
+    fn preexisting_isolated_state_passes_under_ratchet() {
+        let head = Graph {
+            nodes: vec![variant("S::Open"), variant("S::Done"), variant("S::Orphan")],
+            edges: vec![transition("S::Open", "S::Done")],
+        };
+        // No change touches Orphan, so new-only stays silent on it.
+        let f = lint(&head, &[], &cfg(STATES));
+        assert!(f.iter().all(|f| f.rule != "unreachable_state"), "{f:?}");
+    }
+
+    #[test]
+    fn isolated_state_trips_unreachable_when_change_touches_it() {
+        // A transition on Orphan was removed, leaving it isolated: new-only flags it.
+        let head = Graph {
+            nodes: vec![variant("S::Open"), variant("S::Done"), variant("S::Orphan")],
+            edges: vec![transition("S::Open", "S::Done")],
+        };
+        let changes = vec![Change::EdgeRemoved(transition("S::Open", "S::Orphan"))];
+        let f = lint(&head, &changes, &cfg(STATES));
+        let u: Vec<_> = f.iter().filter(|f| f.rule == "unreachable_state").collect();
+        assert_eq!(u.len(), 1, "expected one unreachable finding: {f:?}");
+        assert!(u[0].message.contains("S::Orphan"));
+    }
+
+    #[test]
+    fn dead_end_trips_terminal_under_all() {
+        // Done has an incoming transition but no outgoing: a dead-end.
+        let head = Graph {
+            nodes: vec![variant("S::Open"), variant("S::Done")],
+            edges: vec![transition("S::Open", "S::Done")],
+        };
+        let f = lint(&head, &[], &cfg(STATES_ALL));
+        let t: Vec<_> = f
+            .iter()
+            .filter(|f| f.rule == "terminal_state_without_exit")
+            .collect();
+        assert_eq!(t.len(), 1, "expected one terminal finding: {f:?}");
+        assert!(t[0].message.contains("S::Done"));
+    }
+
+    #[test]
+    fn preexisting_dead_end_passes_under_ratchet() {
+        let head = Graph {
+            nodes: vec![variant("S::Open"), variant("S::Done")],
+            edges: vec![transition("S::Open", "S::Done")],
+        };
+        // No change touches Done, so new-only does not fail the pre-existing dead-end.
+        let f = lint(&head, &[], &cfg(STATES));
+        assert!(
+            f.iter().all(|f| f.rule != "terminal_state_without_exit"),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn dead_end_trips_terminal_when_new_transition_reaches_it() {
+        // The transition into Done is new, so new-only flags Done as a dead-end.
+        let head = Graph {
+            nodes: vec![variant("S::Open"), variant("S::Done")],
+            edges: vec![transition("S::Open", "S::Done")],
+        };
+        let changes = vec![Change::EdgeAdded(transition("S::Open", "S::Done"))];
+        let f = lint(&head, &changes, &cfg(STATES));
+        let t: Vec<_> = f
+            .iter()
+            .filter(|f| f.rule == "terminal_state_without_exit")
+            .collect();
+        assert_eq!(t.len(), 1, "expected one terminal finding: {f:?}");
+        assert!(t[0].message.contains("S::Done"));
+    }
+
+    #[test]
+    fn state_with_exit_is_not_terminal() {
+        // Open has an outgoing transition, so it is never terminal.
+        let head = Graph {
+            nodes: vec![variant("S::Open"), variant("S::Done")],
+            edges: vec![transition("S::Open", "S::Done")],
+        };
+        let changes = vec![Change::EdgeAdded(transition("S::Open", "S::Done"))];
+        let f = lint(&head, &changes, &cfg(STATES));
+        assert!(f
+            .iter()
+            .all(|f| !(f.rule == "terminal_state_without_exit" && f.message.contains("S::Open"))));
+    }
+
+    #[test]
+    fn new_transition_closes_state_cycle() {
+        let head = Graph {
+            nodes: vec![variant("S::A"), variant("S::B")],
+            edges: vec![transition("S::A", "S::B"), transition("S::B", "S::A")],
+        };
+        let changes = vec![Change::EdgeAdded(transition("S::B", "S::A"))];
+        let f = lint(&head, &changes, &cfg(STATES));
+        let c: Vec<_> = f.iter().filter(|f| f.rule == "new_state_cycle").collect();
+        assert_eq!(c.len(), 1, "expected one state cycle finding: {f:?}");
+        assert!(c[0].message.contains("S::A"));
+        assert!(c[0].message.contains("S::B"));
+    }
+
+    #[test]
+    fn self_transition_is_a_state_cycle() {
+        let head = Graph {
+            nodes: vec![variant("S::Loop")],
+            edges: vec![transition("S::Loop", "S::Loop")],
+        };
+        let changes = vec![Change::EdgeAdded(transition("S::Loop", "S::Loop"))];
+        let f = lint(&head, &changes, &cfg(STATES));
+        let c: Vec<_> = f.iter().filter(|f| f.rule == "new_state_cycle").collect();
+        assert_eq!(c.len(), 1, "expected one state cycle finding: {f:?}");
+        assert!(c[0].message.contains("S::Loop"));
+    }
+
+    #[test]
+    fn preexisting_state_cycle_passes_under_ratchet() {
+        let head = Graph {
+            nodes: vec![variant("S::A"), variant("S::B")],
+            edges: vec![transition("S::A", "S::B"), transition("S::B", "S::A")],
+        };
+        // No added transition: the cycle predates the change, so new-only stays silent.
+        let f = lint(&head, &[], &cfg(STATES));
+        assert!(f.iter().all(|f| f.rule != "new_state_cycle"), "{f:?}");
+    }
+
+    #[test]
+    fn preexisting_state_cycle_fails_under_all_mode() {
+        let head = Graph {
+            nodes: vec![variant("S::A"), variant("S::B")],
+            edges: vec![transition("S::A", "S::B"), transition("S::B", "S::A")],
+        };
+        let f = lint(&head, &[], &cfg(STATES_ALL));
+        let c: Vec<_> = f.iter().filter(|f| f.rule == "new_state_cycle").collect();
+        assert_eq!(
+            c.len(),
+            1,
+            "all mode flags pre-existing state cycles: {f:?}"
+        );
+    }
+
+    #[test]
+    fn acyclic_states_have_no_cycle_finding() {
+        let head = Graph {
+            nodes: vec![variant("S::A"), variant("S::B")],
+            edges: vec![transition("S::A", "S::B")],
+        };
+        let f = lint(&head, &[], &cfg(STATES_ALL));
+        assert!(f.iter().all(|f| f.rule != "new_state_cycle"), "{f:?}");
+    }
+
+    #[test]
+    fn disabled_state_lints_do_not_run() {
+        // States present but no state lint enabled: nothing fires.
+        let head = Graph {
+            nodes: vec![variant("S::Open"), variant("S::Done"), variant("S::Orphan")],
+            edges: vec![transition("S::Open", "S::Done")],
+        };
+        assert!(lint(&head, &[], &cfg("")).is_empty());
     }
 
     #[test]
