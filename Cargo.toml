@@ -15,6 +15,9 @@ authors = ["0xheartcode <0xheartcode@gmail.com>"]
 csd-ir = { path = "crates/csd-ir", version = "0.0.0" }
 csd-diff = { path = "crates/csd-diff", version = "0.0.0" }
 csd-extract-rs = { path = "crates/csd-extract-rs", version = "0.0.0" }
+csd-config = { path = "crates/csd-config", version = "0.0.0" }
+csd-render = { path = "crates/csd-render", version = "0.0.0" }
+csd-lint = { path = "crates/csd-lint", version = "0.0.0" }
 
 # third-party, pinned at the workspace so every crate agrees
 anyhow = "1"

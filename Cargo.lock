@@ -92,6 +92,14 @@ name = "csd-ir"
 version = "0.0.0"
 
 [[package]]
+name = "csd-lint"
+version = "0.0.0"
+dependencies = [
+ "csd-config",
+ "csd-ir",
+]
+
+[[package]]
 name = "csd-render"
 version = "0.0.0"
 dependencies = [
