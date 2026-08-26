@@ -59,10 +59,26 @@ pub enum View {
     Schema,
 }
 
+/// Which output syntax [`render`] emits.
+///
+/// [`Default`] is [`Format::Mermaid`], the classic behaviour. [`Format::Dot`] and
+/// [`Format::Ascii`] are JS-free alternatives for the DAG-shaped views (see [`render`]); they reuse
+/// the same delta selection and differ only in emission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Format {
+    /// Mermaid diagram source (the default, one syntax per view).
+    #[default]
+    Mermaid,
+    /// Graphviz DOT `digraph` for the graph views (modules, types, states, call-graph, schema).
+    Dot,
+    /// cargo-tree-style ASCII text for the DAG views (modules, types, call-graph).
+    Ascii,
+}
+
 /// Render options shared by every view.
 ///
 /// See the crate docs for `full`, `scope` and `entry`. [`Default`] reproduces the classic
-/// pruned-delta behaviour (no full, no scope, no entry).
+/// pruned-delta Mermaid behaviour (no full, no scope, no entry, `Format::Mermaid`).
 #[derive(Debug, Clone, Default)]
 pub struct RenderOpts {
     /// Render the whole graph (unchanged nodes as context), skipping the changed-node prune.
@@ -71,17 +87,28 @@ pub struct RenderOpts {
     pub scope: Vec<String>,
     /// Entry `Fn` id for the call view; ignored by the other views.
     pub entry: Option<StableId>,
+    /// Output syntax; [`Format::Mermaid`] by default. `full`/`scope` compose with every format.
+    pub format: Format,
 }
 
 /// Render `view` of `head` with `changes` colour-encoded, honouring `opts`.
+///
+/// The per-view node/edge/`Class` selection is shared across formats (see [`select`] and
+/// [`select_graph`]); only the final emission differs. The Mermaid path keeps one bespoke syntax per
+/// view. The Dot and Ascii paths cover the graph/DAG views and degrade unsupported views to a
+/// one-line comment rather than crashing.
 pub fn render(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -> String {
-    match view {
-        View::Modules => module_view(head, changes, opts),
-        View::States => state_view(head, changes, opts),
-        View::Types => type_view(head, changes, opts),
-        View::Calls => call_view(head, changes, opts),
-        View::CallGraph => call_graph_view(head, changes, opts),
-        View::Schema => schema_view(head, changes, opts),
+    match opts.format {
+        Format::Mermaid => match view {
+            View::Modules => module_view(head, changes, opts),
+            View::States => state_view(head, changes, opts),
+            View::Types => type_view(head, changes, opts),
+            View::Calls => call_view(head, changes, opts),
+            View::CallGraph => call_graph_view(head, changes, opts),
+            View::Schema => schema_view(head, changes, opts),
+        },
+        Format::Dot => dot_view(view, head, changes, opts),
+        Format::Ascii => ascii_view(view, head, changes, opts),
     }
 }
 
@@ -1301,6 +1328,306 @@ fn schema_view(head: &Graph, changes: &[Change], opts: &RenderOpts) -> String {
     out
 }
 
+/// A view's selected graph, shared across the alternative output formats.
+///
+/// Bundles what an emitter needs after [`select`] has run: the per-node delta [`Class`], the drawn
+/// edges tagged with their class, and the [`Selection`] (render ids in id order plus external
+/// stubs). The Dot and Ascii emitters consume exactly this; only the syntax they write differs.
+struct GraphView<'a> {
+    node_class: BTreeMap<&'a StableId, Class>,
+    edges: Vec<(&'a StableId, &'a StableId, Class)>,
+    sel: Selection<'a>,
+}
+
+/// Build the shared selected graph for a graph-shaped `view`, reusing the same collection, pruning
+/// and scoping machinery the Mermaid path uses. Returns `None` for [`View::Calls`], the one view
+/// with no graph form (it is a per-entry sequence slice).
+fn select_graph<'a>(
+    head: &'a Graph,
+    changes: &'a [Change],
+    opts: &RenderOpts,
+    view: View,
+) -> Option<GraphView<'a>> {
+    let files = file_index(head, changes);
+    let patterns = compile_scope(&opts.scope);
+
+    let (node_class, edges, sel) = match view {
+        View::Modules => {
+            let nodes = collect_nodes(head, changes, NodeKind::Module);
+            let node_class = classify_nodes(&nodes, changes);
+            let edges = collect_edges(head, changes, &nodes, EdgeKind::Uses);
+            let sel = select(
+                &nodes,
+                &node_class,
+                &edges,
+                &files,
+                &patterns,
+                opts.full,
+                CONTEXT_HOPS,
+            );
+            (node_class, edges, sel)
+        }
+        View::CallGraph => {
+            let nodes = collect_nodes(head, changes, NodeKind::Fn);
+            let node_class = classify_nodes(&nodes, changes);
+            let edges = collect_edges(head, changes, &nodes, EdgeKind::Calls);
+            let sel = select(
+                &nodes,
+                &node_class,
+                &edges,
+                &files,
+                &patterns,
+                opts.full,
+                CONTEXT_HOPS,
+            );
+            (node_class, edges, sel)
+        }
+        View::States => {
+            let mut nodes = collect_nodes(head, changes, NodeKind::Variant);
+            let edges = collect_edges(head, changes, &nodes, EdgeKind::Transitions);
+            // Same real-state-machine filter as the Mermaid state view: keep only variants of an
+            // enum that has at least one transition.
+            let machines: BTreeSet<String> = edges
+                .iter()
+                .flat_map(|(from, to, _)| [enum_of(from), enum_of(to)])
+                .collect();
+            nodes.retain(|id, _| machines.contains(&enum_of(id)));
+            let node_class = classify_nodes(&nodes, changes);
+            let sel = select(
+                &nodes,
+                &node_class,
+                &edges,
+                &files,
+                &patterns,
+                opts.full,
+                CONTEXT_HOPS,
+            );
+            (node_class, edges, sel)
+        }
+        View::Types => {
+            let mut nodes = collect_nodes(head, changes, NodeKind::Struct);
+            nodes.extend(collect_nodes(head, changes, NodeKind::Enum));
+            nodes.extend(collect_nodes(head, changes, NodeKind::Trait));
+            let node_class = classify_nodes(&nodes, changes);
+            let mut edges = collect_edges(head, changes, &nodes, EdgeKind::Implements);
+            edges.extend(collect_edges(head, changes, &nodes, EdgeKind::Associates));
+            edges.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            // One-hop prune, as in the Mermaid type view (a type graph fans out fast).
+            let sel = select(&nodes, &node_class, &edges, &files, &patterns, opts.full, 1);
+            (node_class, edges, sel)
+        }
+        View::Schema => {
+            let nodes = collect_nodes(head, changes, NodeKind::Table);
+            let node_class = classify_nodes(&nodes, changes);
+            let edges = collect_edges(head, changes, &nodes, EdgeKind::ForeignKey);
+            let sel = select(
+                &nodes,
+                &node_class,
+                &edges,
+                &files,
+                &patterns,
+                opts.full,
+                CONTEXT_HOPS,
+            );
+            (node_class, edges, sel)
+        }
+        View::Calls => return None,
+    };
+
+    Some(GraphView {
+        node_class,
+        edges,
+        sel,
+    })
+}
+
+/// DOT node attributes for a delta class (SPEC.md section 4 colours as Graphviz attributes).
+fn dot_node_attrs(class: Class) -> &'static str {
+    match class {
+        Class::Added => "color=\"#22c55e\",style=filled,fillcolor=\"#f0fdf4\"",
+        Class::Removed => "color=\"#ef4444\",style=\"filled,dashed\",fillcolor=\"#fef2f2\"",
+        Class::Changed => "color=\"#f59e0b\",style=filled,fillcolor=\"#fffbeb\"",
+        Class::Context => "color=\"#d1d5db\"",
+    }
+}
+
+/// Escape a DOT double-quoted string: backslash and quote only (labels never carry newlines here).
+fn dot_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Emit a graph view as Graphviz DOT (`digraph { ... }`), JS-free and offline.
+///
+/// Nodes carry a `label` and the delta style ([`dot_node_attrs`]); edges added/removed/plain, with a
+/// removed edge dashed. Node ids are deterministic (`n0`..) in id order. [`View::Calls`] is a
+/// sequence slice with no DOT form, so it degrades to a one-line comment rather than crashing.
+fn dot_view(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -> String {
+    let Some(gv) = select_graph(head, changes, opts, view) else {
+        return String::from(
+            "// dot format not supported for the sequence view; use --format mermaid\n",
+        );
+    };
+
+    let handles: BTreeMap<&StableId, String> = gv
+        .sel
+        .render_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, format!("n{i}")))
+        .collect();
+
+    let mut out = String::from("digraph {\n");
+    for id in &gv.sel.render_ids {
+        let (label, class) = gv.sel.label_class(id, &gv.node_class);
+        let _ = writeln!(
+            out,
+            "    {} [label=\"{}\",{}];",
+            handles[id],
+            dot_escape(&label),
+            dot_node_attrs(class)
+        );
+    }
+    for (from, to, class) in &gv.edges {
+        if !handles.contains_key(from) || !handles.contains_key(to) {
+            continue;
+        }
+        let attr = match class {
+            Class::Added => " [color=\"#22c55e\"]",
+            Class::Removed => " [style=dashed,color=\"#ef4444\"]",
+            _ => "",
+        };
+        let _ = writeln!(out, "    {} -> {}{};", handles[from], handles[to], attr);
+    }
+    out.push('}');
+    out.push('\n');
+    out
+}
+
+/// The ASCII delta marker for a class: `+` added, `-` removed, `~` changed, space context.
+fn ascii_marker(class: Class) -> char {
+    match class {
+        Class::Added => '+',
+        Class::Removed => '-',
+        Class::Changed => '~',
+        Class::Context => ' ',
+    }
+}
+
+/// Emit a DAG view as cargo-tree-style ASCII text, JS-free and offline.
+///
+/// Roots are nodes with no in-edge (else all nodes, sorted); each subtree is printed with
+/// indentation and `->` branches, every node prefixed by its delta marker. A node already on the
+/// current path is marked `(cycle)` and not re-expanded, so cycles terminate; a node expanded under
+/// another root is not re-expanded either. A flat sorted `from -> to` edge list follows. States,
+/// Calls (sequence) and Schema are not DAG-shaped, so they degrade to a one-line note.
+fn ascii_view(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -> String {
+    match view {
+        View::States | View::Calls | View::Schema => {
+            return String::from(
+                "%% ascii format not supported for this view; use --format mermaid\n",
+            );
+        }
+        View::Modules | View::Types | View::CallGraph => {}
+    }
+    // Modules/Types/CallGraph are graph-shaped, so select_graph never returns None here.
+    let gv = select_graph(head, changes, opts, view).expect("DAG views are graph-shaped");
+
+    if gv.sel.render_ids.is_empty() {
+        return String::from("%% no structural changes in this view\n");
+    }
+
+    let render: BTreeSet<&StableId> = gv.sel.render_ids.iter().copied().collect();
+
+    // Directed successors and in-degree over the kept edges (deduplicated, sorted for determinism).
+    let mut succ: BTreeMap<&StableId, Vec<&StableId>> = BTreeMap::new();
+    let mut indeg: BTreeMap<&StableId, usize> =
+        gv.sel.render_ids.iter().map(|id| (*id, 0usize)).collect();
+    for (from, to, _) in &gv.edges {
+        if render.contains(from) && render.contains(to) {
+            succ.entry(from).or_default().push(to);
+            if let Some(d) = indeg.get_mut(to) {
+                *d += 1;
+            }
+        }
+    }
+    for children in succ.values_mut() {
+        children.sort();
+        children.dedup();
+    }
+
+    // Roots: in-degree-zero nodes in id order, else every node (a fully cyclic graph).
+    let mut roots: Vec<&StableId> = gv
+        .sel
+        .render_ids
+        .iter()
+        .copied()
+        .filter(|id| indeg.get(id).copied() == Some(0))
+        .collect();
+    if roots.is_empty() {
+        roots = gv.sel.render_ids.clone();
+    }
+
+    let mut out = String::new();
+    let mut visited: BTreeSet<&StableId> = BTreeSet::new();
+    let mut path: Vec<&StableId> = Vec::new();
+    for root in roots {
+        if visited.contains(root) {
+            continue;
+        }
+        ascii_walk(root, 0, &succ, &gv, &mut visited, &mut path, &mut out);
+    }
+
+    // Flat sorted edge list (edges already in (from, to) order).
+    for (from, to, _) in &gv.edges {
+        if render.contains(from) && render.contains(to) {
+            let _ = writeln!(out, "{} -> {}", from.as_str(), to.as_str());
+        }
+    }
+    out
+}
+
+/// Print one node and its subtree (see [`ascii_view`]). A node on the current `path` is a cycle:
+/// marked and not recursed. A node already `visited` under another root is printed but not
+/// re-expanded, so the walk always terminates.
+fn ascii_walk<'a>(
+    id: &'a StableId,
+    depth: usize,
+    succ: &BTreeMap<&'a StableId, Vec<&'a StableId>>,
+    gv: &GraphView<'a>,
+    visited: &mut BTreeSet<&'a StableId>,
+    path: &mut Vec<&'a StableId>,
+    out: &mut String,
+) {
+    let (label, class) = gv.sel.label_class(id, &gv.node_class);
+    let mut line = String::new();
+    line.push(ascii_marker(class));
+    line.push(' ');
+    for _ in 0..depth {
+        line.push_str("    ");
+    }
+    if depth > 0 {
+        line.push_str("-> ");
+    }
+    line.push_str(&label);
+
+    let is_cycle = path.contains(&id);
+    if is_cycle {
+        line.push_str(" (cycle)");
+    }
+    let _ = writeln!(out, "{line}");
+    if is_cycle || !visited.insert(id) {
+        return;
+    }
+
+    path.push(id);
+    if let Some(children) = succ.get(id) {
+        for child in children {
+            ascii_walk(child, depth + 1, succ, gv, visited, path, out);
+        }
+    }
+    path.pop();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2255,6 +2582,113 @@ mod tests {
         assert!(
             out.contains("posts }o--|| users : \"references (added)\"\n"),
             "fk marker missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn dot_module_delta_golden() {
+        // a added, an added a->b edge (green), and a removed c recovered from the delta (dashed).
+        let head = Graph {
+            nodes: vec![module("crate::a"), module("crate::b")],
+            edges: vec![uses("crate::a", "crate::b")],
+        };
+        let changes = vec![
+            Change::Added(module("crate::a")),
+            Change::EdgeAdded(uses("crate::a", "crate::b")),
+            Change::Removed(module("crate::c")),
+        ];
+        let out = render(
+            View::Modules,
+            &head,
+            &changes,
+            &RenderOpts {
+                format: Format::Dot,
+                ..RenderOpts::default()
+            },
+        );
+        let expected = concat!(
+            "digraph {\n",
+            "    n0 [label=\"crate::a\",color=\"#22c55e\",style=filled,fillcolor=\"#f0fdf4\"];\n",
+            "    n1 [label=\"crate::b\",color=\"#d1d5db\"];\n",
+            "    n2 [label=\"crate::c\",color=\"#ef4444\",style=\"filled,dashed\",fillcolor=\"#fef2f2\"];\n",
+            "    n0 -> n1 [color=\"#22c55e\"];\n",
+            "}\n",
+        );
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn dot_sequence_view_not_supported() {
+        let head = Graph {
+            nodes: vec![fn_node("crate::A::f")],
+            edges: vec![],
+        };
+        let out = render(
+            View::Calls,
+            &head,
+            &[],
+            &RenderOpts {
+                format: Format::Dot,
+                entry: Some(StableId::new("crate::A::f")),
+                ..RenderOpts::default()
+            },
+        );
+        assert_eq!(
+            out,
+            "// dot format not supported for the sequence view; use --format mermaid\n"
+        );
+    }
+
+    #[test]
+    fn ascii_module_tree_with_cycle() {
+        // a -> b -> a: a added, b removed. The back edge to the ancestor a is marked (cycle), so the
+        // walk terminates; a flat sorted edge list follows.
+        let head = Graph {
+            nodes: vec![module("crate::a"), module("crate::b")],
+            edges: vec![uses("crate::a", "crate::b"), uses("crate::b", "crate::a")],
+        };
+        let changes = vec![
+            Change::Added(module("crate::a")),
+            Change::Removed(module("crate::b")),
+        ];
+        let out = render(
+            View::Modules,
+            &head,
+            &changes,
+            &RenderOpts {
+                full: true,
+                format: Format::Ascii,
+                ..RenderOpts::default()
+            },
+        );
+        let expected = concat!(
+            "+ crate::a\n",
+            "-     -> crate::b\n",
+            "+         -> crate::a (cycle)\n",
+            "crate::a -> crate::b\n",
+            "crate::b -> crate::a\n",
+        );
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn ascii_state_view_not_supported() {
+        let head = Graph {
+            nodes: vec![variant("crate::S::a")],
+            edges: vec![],
+        };
+        let out = render(
+            View::States,
+            &head,
+            &[],
+            &RenderOpts {
+                format: Format::Ascii,
+                ..RenderOpts::default()
+            },
+        );
+        assert_eq!(
+            out,
+            "%% ascii format not supported for this view; use --format mermaid\n"
         );
     }
 }
