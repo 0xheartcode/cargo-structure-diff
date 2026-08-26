@@ -70,6 +70,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "csd-extract-db"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "csd-ir",
+ "tempfile",
+ "tree-sitter",
+ "tree-sitter-rust",
+]
+
+[[package]]
 name = "csd-extract-rs"
 version = "0.0.0"
 dependencies = [
@@ -117,6 +128,7 @@ name = "csd-render"
 version = "0.0.0"
 dependencies = [
  "csd-ir",
+ "glob",
 ]
 
 [[package]]

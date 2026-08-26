@@ -1,0 +1,21 @@
+[package]
+name = "csd-extract-db"
+description = "Diesel schema.rs to schema-view IR (Table nodes, ForeignKey edges) for cargo-structure-diff."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+csd-ir = { workspace = true }
+anyhow = { workspace = true }
+# Same grammar versions as csd-extract-rs. tree-sitter-rust 0.24 targets the tree-sitter 0.25/0.26
+# ABI and exposes the grammar via `LANGUAGE`.
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+
+[dev-dependencies]
+tempfile = "3"
