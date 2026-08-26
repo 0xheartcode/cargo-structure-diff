@@ -1,9 +1,10 @@
 //! The M1 capstone: wire extraction, diff, render, and lint into one gate.
 //!
 //! `csd diff --base <ref>` materializes the base ref in a throwaway git worktree, extracts it,
-//! extracts the current working tree as head, diffs the two module graphs, renders the delta as a
-//! Mermaid `flowchart`, and runs the architectural lints. A denied finding prints the findings and
-//! the diagram (the diagram is the error message) and exits non-zero; otherwise it exits zero.
+//! extracts the current working tree as head, diffs the graphs, renders each enabled view (the
+//! module `flowchart` and, when `views.enabled` includes `states`, the `stateDiagram-v2`), and runs
+//! the architectural lints. A denied finding prints the findings and the diagrams (the diagram is
+//! the error message) and exits non-zero; otherwise it exits zero.
 //!
 //! The real work lives in [`analyze`] so both binaries stay thin and the pipeline is testable
 //! without touching the process working directory.
@@ -17,7 +18,7 @@ use csd_config::Config;
 use csd_diff::{diff, DiffOptions, FileRename};
 use csd_ir::{Change, Graph};
 use csd_lint::{has_denials, lint, Finding, Severity};
-use csd_render::render_module_view;
+use csd_render::{render_module_view, render_state_view};
 
 /// Default base ref when `--base` is omitted.
 const DEFAULT_BASE: &str = "main";
@@ -47,14 +48,22 @@ pub enum Cmd {
     },
 }
 
+/// One rendered view: its name and the Mermaid source.
+pub struct ViewDiagram {
+    /// The view name (`modules`, `states`).
+    pub view: String,
+    /// The rendered Mermaid diagram.
+    pub mermaid: String,
+}
+
 /// The result of a run, kept separate from printing so tests can assert on it.
 pub struct Report {
     /// The base-to-head delta.
     pub changes: Vec<Change>,
     /// The lint findings (sorted, deny and warn).
     pub findings: Vec<Finding>,
-    /// The rendered Mermaid module view.
-    pub diagram: String,
+    /// The rendered diagrams, one per enabled view.
+    pub diagrams: Vec<ViewDiagram>,
 }
 
 impl Report {
@@ -89,7 +98,9 @@ impl Report {
                 };
                 eprintln!("  [{tag}] {}: {}", f.rule, f.message);
             }
-            eprintln!("\nmodule view:\n{}", self.diagram);
+            for d in &self.diagrams {
+                eprintln!("\n{} view:\n{}", d.view, d.mermaid);
+            }
         }
     }
 }
@@ -193,13 +204,33 @@ pub fn analyze(repo: &Path, base: &str, config: &Config) -> Result<Report> {
             file_renames,
         },
     );
-    let diagram = render_module_view(&head_graph, &changes);
     let findings = lint(&head_graph, &changes, config);
+    let diagrams = render_views(&head_graph, &changes, config);
     Ok(Report {
         changes,
         findings,
-        diagram,
+        diagrams,
     })
+}
+
+/// Render one diagram per enabled view. Defaults to the module view when `views.enabled` is empty;
+/// unknown view names are ignored. The state lints run via [`lint`] independent of this.
+fn render_views(head: &Graph, changes: &[Change], config: &Config) -> Vec<ViewDiagram> {
+    let enabled: Vec<String> = if config.views.enabled.is_empty() {
+        vec!["modules".to_string()]
+    } else {
+        config.views.enabled.clone()
+    };
+    let mut diagrams = Vec::new();
+    for view in enabled {
+        let mermaid = match view.as_str() {
+            "modules" => render_module_view(head, changes),
+            "states" => render_state_view(head, changes),
+            _ => continue,
+        };
+        diagrams.push(ViewDiagram { view, mermaid });
+    }
+    diagrams
 }
 
 /// Extract the base ref by checking it out into a throwaway detached worktree.
@@ -388,10 +419,15 @@ deny = [\"layering\", \"cycles\"]
             "expected a layering finding, got {:?}",
             report.findings
         );
+        let module = report
+            .diagrams
+            .iter()
+            .find(|d| d.view == "modules")
+            .expect("a module view is rendered by default");
         assert!(
-            report.diagram.contains("flowchart"),
+            module.mermaid.contains("flowchart"),
             "diagram must be a Mermaid flowchart:\n{}",
-            report.diagram
+            module.mermaid
         );
 
         // No worktree leaked past analyze.
@@ -422,6 +458,77 @@ deny = [\"layering\", \"cycles\"]
             !report.denied(),
             "no denied findings expected, got {:?}",
             report.findings
+        );
+    }
+
+    /// A single-crate repo whose config enables the states view and denies new state cycles, with a
+    /// base state machine that is acyclic (Red -> Green -> Yellow, Yellow self-loop dropped).
+    fn state_repo(tag: &str) -> TmpRepo {
+        let repo = TmpRepo::new(tag);
+        let dir = &repo.path;
+        git_ok(dir, &["-c", "init.defaultBranch=main", "init", "-q"]);
+        write(
+            dir,
+            ".csd.toml",
+            "[views]\nenabled = [\"modules\", \"states\"]\n\n[lint]\ndeny = [\"new_state_cycle\"]\n",
+        );
+        write(
+            dir,
+            "src/lib.rs",
+            "pub enum Light { Red, Green, Yellow }\n\
+             impl Light {\n\
+             \x20   pub fn step(self) -> Self {\n\
+             \x20       match self {\n\
+             \x20           Light::Red => Light::Green,\n\
+             \x20           Light::Green => Light::Yellow,\n\
+             \x20           Light::Yellow => Light::Yellow,\n\
+             \x20       }\n\
+             \x20   }\n\
+             }\n",
+        );
+        git_ok(dir, &["add", "-A"]);
+        git_ok(dir, &["commit", "-q", "-m", "base"]);
+        repo
+    }
+
+    #[test]
+    fn new_state_cycle_denies_and_renders_state_diagram() {
+        let repo = state_repo("states");
+        let dir = &repo.path;
+        // Head closes the loop: Yellow -> Red creates the cycle Red -> Green -> Yellow -> Red.
+        write(
+            dir,
+            "src/lib.rs",
+            "pub enum Light { Red, Green, Yellow }\n\
+             impl Light {\n\
+             \x20   pub fn step(self) -> Self {\n\
+             \x20       match self {\n\
+             \x20           Light::Red => Light::Green,\n\
+             \x20           Light::Green => Light::Yellow,\n\
+             \x20           Light::Yellow => Light::Red,\n\
+             \x20       }\n\
+             \x20   }\n\
+             }\n",
+        );
+
+        let config = Config::load(&dir.join(".csd.toml")).unwrap();
+        let report = analyze(dir, "main", &config).unwrap();
+
+        assert_eq!(report.exit_code(), 1, "a new state cycle must exit 1");
+        assert!(
+            report.findings.iter().any(|f| f.rule == "new_state_cycle"),
+            "expected a new_state_cycle finding, got {:?}",
+            report.findings
+        );
+        let state = report
+            .diagrams
+            .iter()
+            .find(|d| d.view == "states")
+            .expect("the states view is enabled");
+        assert!(
+            state.mermaid.contains("stateDiagram-v2"),
+            "state diagram expected:\n{}",
+            state.mermaid
         );
     }
 
