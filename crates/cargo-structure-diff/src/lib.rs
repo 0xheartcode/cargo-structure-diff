@@ -407,7 +407,15 @@ fn edge_kind_name(kind: EdgeKind) -> &'static str {
 }
 
 /// Default views for `csd doc` when `views.enabled` is empty: every view csd knows.
-const DOC_DEFAULT_VIEWS: &[&str] = &["modules", "types", "states", "calls", "callgraph", "schema"];
+const DOC_DEFAULT_VIEWS: &[&str] = &[
+    "overview",
+    "modules",
+    "types",
+    "states",
+    "calls",
+    "callgraph",
+    "schema",
+];
 
 /// Emit the whole-codebase structure report (a snapshot of head, not a delta).
 ///
@@ -488,6 +496,7 @@ fn doc_markdown(head: &Graph, config: &Config) -> String {
             "calls" => View::Calls,
             "callgraph" => View::CallGraph,
             "schema" => View::Schema,
+            "overview" => View::Overview,
             _ => continue,
         };
         let _ = writeln!(out, "## {name} view\n");
@@ -696,6 +705,7 @@ fn render_views(
             "calls" => View::Calls,
             "callgraph" => View::CallGraph,
             "schema" => View::Schema,
+            "overview" => View::Overview,
             _ => continue,
         };
         // Thread the CLI opts through; the entry (calls view only) always comes from config.

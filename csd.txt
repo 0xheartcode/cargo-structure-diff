@@ -1,0 +1,292 @@
+cargo-structure-diff: 652 change(s) vs 46140c35929006f009ab5feea4dfe1c0dd17237a, 0 denial(s), 0 warning(s)
+
+modules view:
+flowchart LR
+    classDef added fill:#f0fdf4,stroke:#22c55e,stroke-width:2px
+    classDef removed fill:#fef2f2,stroke:#ef4444,stroke-width:2px,stroke-dasharray:4 4
+    classDef changed fill:#fffbeb,stroke:#f59e0b,stroke-width:2px
+    classDef context fill:#ffffff,stroke:#d1d5db,color:#9ca3af
+    n0["cargo_structure_diff"]:::added
+    n1["csd_config"]:::added
+    n2["csd_diff"]:::changed
+    n3["csd_extract_rs"]:::changed
+    n4["csd_goldens"]:::added
+    n5["csd_harness"]:::changed
+    n6["csd_harness::corpus"]:::added
+    n7["csd_harness::materialize"]:::added
+    n8["csd_harness::metrics"]:::added
+    n9["csd_ir"]:::changed
+    n10["csd_ir::fingerprint"]:::added
+    n11["csd_lint"]:::added
+    n12["csd_render"]:::added
+    n0 -->|+| n1
+    n0 -->|+| n2
+    n0 -->|+| n9
+    n0 -->|+| n11
+    n0 -->|+| n12
+    n2 --> n9
+    n3 --> n9
+    n5 -->|+| n2
+    n5 -->|+| n9
+    n6 -->|+| n2
+    n7 -->|+| n9
+    n8 -->|+| n9
+    n11 -->|+| n1
+    n11 -->|+| n9
+    n12 -->|+| n9
+
+
+states view:
+stateDiagram-v2
+    classDef added fill:#f0fdf4,stroke:#22c55e,stroke-width:2px
+    classDef removed fill:#fef2f2,stroke:#ef4444,stroke-width:2px,stroke-dasharray:4 4
+    classDef changed fill:#fffbeb,stroke:#f59e0b,stroke-width:2px
+    classDef context fill:#ffffff,stroke:#d1d5db,color:#9ca3af
+    %% no state machines (no enum has transitions)
+
+
+types view:
+classDiagram
+    classDef added fill:#f0fdf4,stroke:#22c55e,stroke-width:2px
+    classDef removed fill:#fef2f2,stroke:#ef4444,stroke-width:2px,stroke-dasharray:4 4
+    classDef changed fill:#fffbeb,stroke:#f59e0b,stroke-width:2px
+    classDef context fill:#ffffff,stroke:#d1d5db,color:#9ca3af
+    class c0["cargo_structure_diff::Cmd"]
+    class c1["cargo_structure_diff::Report"]
+    class c2["cargo_structure_diff::ViewDiagram"]
+    class c3["csd_config::Calls"]
+    class c4["csd_config::Config"]
+    class c5["csd_config::ConfigError"]
+    class c6["csd_config::Forbid"]
+    class c7["csd_config::LayerMap"]
+    class c8["csd_config::Layers"]
+    class c9["csd_config::Lint"]
+    class c10["csd_config::Ratchet"]
+    class c11["csd_config::RatchetMode"]
+    class c12["csd_config::Views"]
+    class c13["csd_diff::CallNode"]
+    class c14["csd_diff::DiffOptions"] {
+        +file_renames
+        ~rename_threshold
+    }
+    class c15["csd_diff::EditOp"]
+    class c16["csd_diff::EditScript"]
+    class c17["csd_diff::FileRename"]
+    class c18["csd_diff::MemberDelta"]
+    class c19["csd_extract_rs::AttrKind"]
+    class c20["csd_extract_rs::Extractor"]
+    class c21["csd_extract_rs::FileCtx"]
+    class c22["csd_extract_rs::RawAssociates"]
+    class c23["csd_extract_rs::RawCall"]
+    class c24["csd_extract_rs::RawImplements"]
+    class c25["csd_extract_rs::RawTransition"]
+    class c26["csd_extract_rs::RawUse"]
+    class c27["csd_harness::RenderInput"]
+    class c28["csd_harness::ThresholdTotals"]
+    class c29["csd_harness::corpus::CommitPair"]
+    class c30["csd_harness::corpus::Repo"]
+    class c31["csd_harness::materialize::Cache"]
+    class c32["csd_harness::metrics::AcceptedMatch"]
+    class c33["csd_harness::metrics::Counts"]
+    class c34["csd_harness::metrics::SplitCandidate"]
+    class c35["csd_harness::metrics::SpuriousSplits"]
+    class c36["csd_ir::Change"]
+    class c37["csd_ir::Graph"]
+    class c38["csd_ir::Node"] {
+        ~attrs
+        +fingerprint
+        ~id
+        ~kind
+        ~span
+    }
+    class c39["csd_ir::NodeKind"]
+    class c40["csd_ir::SourceSpan"]
+    class c41["csd_ir::StableId"]
+    class c42["csd_ir::fingerprint::Fingerprint"]
+    class c43["csd_ir::fingerprint::SimilarityWeights"]
+    class c44["csd_lint::Finding"]
+    class c45["csd_lint::Severity"]
+    class c46["csd_render::Class"]
+    class c47["csd_render::Out"]
+    class c48["csd_render::Parts"]
+    class c0:::added
+    class c1:::added
+    class c2:::added
+    class c3:::added
+    class c4:::added
+    class c5:::added
+    class c6:::added
+    class c7:::added
+    class c8:::added
+    class c9:::added
+    class c10:::added
+    class c11:::added
+    class c12:::added
+    class c13:::added
+    class c14:::changed
+    class c15:::added
+    class c16:::added
+    class c17:::added
+    class c18:::added
+    class c19:::added
+    class c20:::added
+    class c21:::added
+    class c22:::added
+    class c23:::added
+    class c24:::added
+    class c25:::added
+    class c26:::added
+    class c27:::added
+    class c28:::added
+    class c29:::added
+    class c30:::added
+    class c31:::added
+    class c32:::added
+    class c33:::added
+    class c34:::added
+    class c35:::added
+    class c36:::context
+    class c37:::context
+    class c38:::changed
+    class c39:::context
+    class c40:::context
+    class c41:::context
+    class c42:::added
+    class c43:::added
+    class c44:::added
+    class c45:::added
+    class c46:::added
+    class c47:::added
+    class c48:::added
+    c1 --> c2
+    c4 --> c3
+    c4 --> c8
+    c4 --> c9
+    c4 --> c10
+    c4 --> c12
+    c8 --> c6
+    c8 --> c7
+    c10 --> c11
+    c13 --> c13
+    c14 --> c17
+    c16 --> c15
+    c20 --> c22
+    c20 --> c23
+    c20 --> c24
+    c20 --> c25
+    c20 --> c26
+    c27 --> c28
+    c35 --> c34
+    c36 --> c38
+    c36 --> c41
+    c37 --> c38
+    c38 --> c39
+    c38 --> c40
+    c38 --> c41
+    c44 --> c45
+    c47 --> c46
+
+
+calls view:
+sequenceDiagram
+    participant p0 as cargo_structure_diff
+    rect rgb(240,253,244)
+        p0 ->> p0 : parse_args
+    end
+    rect rgb(240,253,244)
+        p0 ->> p0 : run_diff
+    end
+    rect rgb(240,253,244)
+        p0 ->> p0 : repo_root
+    end
+    rect rgb(240,253,244)
+        p0 ->> p0 : git
+    end
+    note over p0 : 5 dynamic call(s) not shown
+    rect rgb(240,253,244)
+        p0 ->> p0 : load_config
+    end
+    rect rgb(240,253,244)
+        p0 ->> p0 : analyze
+    end
+    rect rgb(240,253,244)
+        p0 ->> p0 : base_graph
+    end
+    rect rgb(240,253,244)
+        p0 ->> p0 : worktree_path
+    end
+    rect rgb(240,253,244)
+        p0 ->> p0 : git
+    end
+    rect rgb(240,253,244)
+        p0 ->> p0 : cleanup
+    end
+    rect rgb(240,253,244)
+        p0 ->> p0 : git
+    end
+    note over p0 : 2 dynamic call(s) not shown
+    note over p0 : 4 dynamic call(s) not shown
+    rect rgb(240,253,244)
+        p0 ->> p0 : file_renames
+    end
+    rect rgb(240,253,244)
+        p0 ->> p0 : git
+    end
+    note over p0 : 12 dynamic call(s) not shown
+    rect rgb(240,253,244)
+        p0 ->> p0 : render_views
+    end
+    rect rgb(240,253,244)
+        p0 ->> p0 : call_entry
+    end
+    note over p0 : 9 dynamic call(s) not shown
+    note over p0 : 6 dynamic call(s) not shown
+    note over p0 : 3 dynamic call(s) not shown
+    rect rgb(240,253,244)
+        p0 ->> p0 : run_trace
+    end
+    rect rgb(240,253,244)
+        p0 ->> p0 : repo_root
+    end
+    rect rgb(240,253,244)
+        p0 ->> p0 : git
+    end
+    note over p0 : 5 dynamic call(s) not shown
+    rect rgb(240,253,244)
+        p0 ->> p0 : observe_traces
+    end
+    rect rgb(240,253,244)
+        p0 ->> p0 : trace_base
+    end
+    rect rgb(240,253,244)
+        p0 ->> p0 : worktree_path
+    end
+    rect rgb(240,253,244)
+        p0 ->> p0 : git
+    end
+    rect rgb(240,253,244)
+        p0 ->> p0 : run_shell
+    end
+    rect rgb(240,253,244)
+        p0 ->> p0 : cleanup
+    end
+    rect rgb(240,253,244)
+        p0 ->> p0 : git
+    end
+    note over p0 : 2 dynamic call(s) not shown
+    note over p0 : 3 dynamic call(s) not shown
+    rect rgb(240,253,244)
+        p0 ->> p0 : run_shell
+    end
+    rect rgb(240,253,244)
+        p0 ->> p0 : extract_mermaid_sequences
+    end
+    rect rgb(240,253,244)
+        p0 ->> p0 : extract_mermaid_sequences
+    end
+    note over p0 : 2 dynamic call(s) not shown
+    rect rgb(240,253,244)
+        p0 ->> p0 : trace_delta
+    end
+    note over p0 : 1 dynamic call(s) not shown
+
