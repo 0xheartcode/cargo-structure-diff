@@ -44,7 +44,7 @@ OPTIONS:
     --list          diff: print a one-line-per-change textual summary of the delta
     --scope <glob>  diff: only render nodes whose source path matches <glob>
                     (repeatable; crossing edges show an external stub)
-    --format <fmt>  diff: diagram syntax, one of mermaid|dot|ascii|boxes (default: mermaid)
+    --format <fmt>  diff: diagram syntax, one of mermaid|dot|ascii|boxes|svg (default: mermaid)
     --cmd <cmd>     trace: shell command that emits Mermaid (default: cargo test)
     -o, --out <f>   doc: write the report to <file> instead of stdout
     -h, --help      Print this help
@@ -246,7 +246,8 @@ fn parse_format(value: &str) -> Result<Format> {
         "dot" => Ok(Format::Dot),
         "ascii" => Ok(Format::Ascii),
         "boxes" => Ok(Format::Boxes),
-        other => bail!("unknown --format {other:?}; expected mermaid, dot, ascii, or boxes"),
+        "svg" => Ok(Format::Svg),
+        other => bail!("unknown --format {other:?}; expected mermaid, dot, ascii, boxes, or svg"),
     }
 }
 

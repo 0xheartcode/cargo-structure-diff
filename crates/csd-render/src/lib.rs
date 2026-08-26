@@ -44,6 +44,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use csd_ir::{Change, EdgeKind, Fingerprint, Graph, NodeKind, StableId};
 
 mod boxes;
+mod svg;
 
 /// Which view [`render`] produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +85,8 @@ pub enum Format {
     /// Native layered ASCII boxes-and-arrows for the DAG views (modules, types, call-graph, and the
     /// flattened overview). Pure Rust, no external tools; see [`boxes`] and [`boxes_view`].
     Boxes,
+    /// A rendered SVG image via the pure-Rust layout crate (no Node/Chromium). Graph views only.
+    Svg,
 }
 
 /// Render options shared by every view.
@@ -122,6 +125,7 @@ pub fn render(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -
         Format::Dot => dot_view(view, head, changes, opts),
         Format::Ascii => ascii_view(view, head, changes, opts),
         Format::Boxes => boxes_view(view, head, changes, opts),
+        Format::Svg => svg_view(view, head, changes, opts),
     }
 }
 
@@ -1928,6 +1932,80 @@ fn boxes_view(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -
     }
 
     boxes::layout(&nodes, &edges)
+}
+
+/// The (stroke, fill) `#rrggbb` colours for a delta class, matching the CLASS_DEFS convention.
+fn class_svg_colours(class: Class) -> (&'static str, &'static str) {
+    match class {
+        Class::Added => ("#22c55e", "#f0fdf4"),
+        Class::Removed => ("#ef4444", "#fef2f2"),
+        Class::Changed => ("#f59e0b", "#fffbeb"),
+        Class::Context => ("#d1d5db", "#ffffff"),
+    }
+}
+
+/// Render a graph view as an SVG image via the pure-Rust layout crate (no external tools).
+fn svg_view(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -> String {
+    match view {
+        View::States | View::Calls | View::Schema => {
+            return String::from(
+                "<!-- svg not supported for this view; use --format mermaid -->\n",
+            );
+        }
+        View::Modules | View::Types | View::CallGraph | View::Overview => {}
+    }
+    let gv = select_graph(head, changes, opts, view).expect("DAG views are graph-shaped");
+    if gv.sel.render_ids.is_empty() {
+        return String::from("<!-- no structural changes in this view -->\n");
+    }
+
+    let overview = matches!(view, View::Overview);
+    let index: BTreeMap<&StableId, usize> = gv
+        .sel
+        .render_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, i))
+        .collect();
+
+    let mut nodes: Vec<svg::SvgNode> = Vec::with_capacity(gv.sel.render_ids.len());
+    for id in &gv.sel.render_ids {
+        let is_stub = gv.sel.stubs.contains(id);
+        let class = if is_stub {
+            Class::Context
+        } else {
+            gv.node_class.get(id).copied().unwrap_or(Class::Context)
+        };
+        let base = if overview {
+            format!(
+                "{}::{}",
+                call_name(call_owner(id.as_str())),
+                call_name(id.as_str())
+            )
+        } else {
+            call_name(id.as_str()).to_string()
+        };
+        let label = if is_stub {
+            format!("{base} (external)")
+        } else {
+            base
+        };
+        let (stroke, fill) = class_svg_colours(class);
+        nodes.push(svg::SvgNode {
+            label,
+            stroke: stroke.to_string(),
+            fill: fill.to_string(),
+        });
+    }
+
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    for (from, to, _) in &gv.edges {
+        if let (Some(&f), Some(&t)) = (index.get(from), index.get(to)) {
+            edges.push((f, t));
+        }
+    }
+
+    svg::layout_svg(&nodes, &edges)
 }
 
 #[cfg(test)]
