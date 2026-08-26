@@ -12,7 +12,13 @@
 //! One rule for M4 over the call graph (Calls edges, SPEC.md 3.3):
 //! - `io_in_hot_path`: a call from a `calls.hot` function into a `calls.io` module.
 //!
-//! All are ratchet-aware. Under [`RatchetMode::NewOnly`] only violations introduced by a newly
+//! One rule for the schema view (Table nodes + ForeignKey edges, SPEC.md 3.5):
+//! - `destructive_migration`: a dropped table, dropped column, changed column type, or removed
+//!   foreign key. Computed purely over `changes`: a schema diff is inherently delta-based, so this
+//!   rule reads the delta directly and the ratchet mode does not alter it (there is no pre-existing
+//!   destructive change to grandfather in).
+//!
+//! All the graph rules are ratchet-aware. Under [`RatchetMode::NewOnly`] only violations introduced by a newly
 //! added edge fail, which is what lets a brownfield repo adopt the gate without a red day one.
 //! A lint runs only when it appears in the config `deny` or `warn` list, and its findings are
 //! tagged with the matching [`Severity`].
@@ -87,6 +93,9 @@ pub fn lint(head: &Graph, changes: &[Change], config: &Config) -> Vec<Finding> {
     if let Some(sev) = severity_of("io_in_hot_path") {
         let added_calls = added_call_edges(changes);
         findings.extend(io_in_hot_path(head, config, &added_calls, sev));
+    }
+    if let Some(sev) = severity_of("destructive_migration") {
+        findings.extend(destructive_migration(changes, sev));
     }
 
     findings.sort_by(|a, b| (&a.rule, &a.message).cmp(&(&b.rule, &b.message)));
@@ -435,6 +444,79 @@ fn io_in_hot_path(
                 severity,
                 message: format!("{} (hot) calls into {} (io)", e.from.as_str(), callee_owner),
             });
+        }
+    }
+    findings
+}
+
+/// Parse a Table node's `columns` attribute ("id: Int4, name: Varchar", sorted by name, as emitted
+/// by csd-extract-db) into a `name -> type` map. Missing attribute yields an empty map.
+fn parse_columns_attr(node: &csd_ir::Node) -> BTreeMap<&str, &str> {
+    let mut cols = BTreeMap::new();
+    let Some(raw) = node.attrs.get("columns") else {
+        return cols;
+    };
+    for entry in raw.split(", ") {
+        if let Some((name, ty)) = entry.split_once(": ") {
+            cols.insert(name, ty);
+        }
+    }
+    cols
+}
+
+/// destructive_migration: flag schema changes that can lose data, purely over `changes`. Emits a
+/// finding for a dropped table, a dropped column, a changed column type, and a removed foreign key.
+///
+/// A type change is reported as a change, not asserted to be lossy: narrowing (for example
+/// `Varchar` -> `Int4`) cannot be proven from the column name and stored type string alone, so the
+/// rule reports the change honestly rather than claiming data loss it cannot demonstrate.
+fn destructive_migration(changes: &[Change], severity: Severity) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for c in changes {
+        match c {
+            Change::Removed(n) if n.kind == NodeKind::Table => {
+                findings.push(Finding {
+                    rule: "destructive_migration".to_string(),
+                    severity,
+                    message: format!("table `{}` dropped", n.id.as_str()),
+                });
+            }
+            Change::Modified { before, after }
+                if before.kind == NodeKind::Table && after.kind == NodeKind::Table =>
+            {
+                let table = before.id.as_str();
+                let before_cols = parse_columns_attr(before);
+                let after_cols = parse_columns_attr(after);
+                for (col, ty) in &before_cols {
+                    match after_cols.get(col) {
+                        None => findings.push(Finding {
+                            rule: "destructive_migration".to_string(),
+                            severity,
+                            message: format!("column `{table}.{col}` dropped"),
+                        }),
+                        Some(new_ty) if new_ty != ty => findings.push(Finding {
+                            rule: "destructive_migration".to_string(),
+                            severity,
+                            message: format!(
+                                "column `{table}.{col}` type changed `{ty}` -> `{new_ty}`"
+                            ),
+                        }),
+                        Some(_) => {}
+                    }
+                }
+            }
+            Change::EdgeRemoved(e) if e.kind == EdgeKind::ForeignKey => {
+                findings.push(Finding {
+                    rule: "destructive_migration".to_string(),
+                    severity,
+                    message: format!(
+                        "foreign key `{} -> {}` removed",
+                        e.from.as_str(),
+                        e.to.as_str()
+                    ),
+                });
+            }
+            _ => {}
         }
     }
     findings
@@ -1060,5 +1142,98 @@ mode = "all"
             "[layers]\norder = [\"app\",\"infra\"]\nforbid = [{from=\"app\",to=\"infra\"}]\n";
         let changes = vec![Change::EdgeAdded(uses("crate::app", "crate::infra"))];
         assert!(lint(&head, &changes, &cfg(toml)).is_empty());
+    }
+
+    fn table(id: &str, columns: &str) -> csd_ir::Node {
+        let mut attrs = BTreeMap::new();
+        if !columns.is_empty() {
+            attrs.insert("columns".to_string(), columns.to_string());
+        }
+        csd_ir::Node {
+            id: StableId::new(id),
+            kind: NodeKind::Table,
+            span: SourceSpan {
+                file: "src/schema.rs".into(),
+                start: 0,
+                end: 1,
+            },
+            attrs,
+            fingerprint: None,
+        }
+    }
+
+    fn foreign_key(from: &str, to: &str) -> Edge {
+        Edge {
+            from: StableId::new(from),
+            to: StableId::new(to),
+            kind: EdgeKind::ForeignKey,
+            span: SourceSpan {
+                file: "src/schema.rs".into(),
+                start: 0,
+                end: 1,
+            },
+            ordinal: None,
+        }
+    }
+
+    const SCHEMA: &str = r#"
+[lint]
+deny = ["destructive_migration"]
+"#;
+
+    #[test]
+    fn destructive_migration_flags_drops_retypes_and_removed_fk() {
+        let head = Graph::new();
+        let changes = vec![
+            // A whole table dropped.
+            Change::Removed(table("sessions", "id: Int4, token: Varchar")),
+            // A table that drops `email` and retypes `age`.
+            Change::Modified {
+                before: table("users", "age: Int4, email: Varchar, id: Int4"),
+                after: table("users", "age: Int8, id: Int4"),
+            },
+            // A foreign key removed.
+            Change::EdgeRemoved(foreign_key("posts", "users")),
+        ];
+        let f = lint(&head, &changes, &cfg(SCHEMA));
+        let msgs: Vec<&str> = f.iter().map(|f| f.message.as_str()).collect();
+        // Deterministic, sorted output.
+        assert_eq!(
+            msgs,
+            [
+                "column `users.age` type changed `Int4` -> `Int8`",
+                "column `users.email` dropped",
+                "foreign key `posts -> users` removed",
+                "table `sessions` dropped",
+            ]
+        );
+        assert!(f.iter().all(|f| f.rule == "destructive_migration"));
+        assert!(f.iter().all(|f| f.severity == Severity::Deny));
+    }
+
+    #[test]
+    fn destructive_migration_silent_when_not_selected() {
+        let head = Graph::new();
+        let changes = vec![
+            Change::Removed(table("sessions", "id: Int4")),
+            Change::EdgeRemoved(foreign_key("posts", "users")),
+        ];
+        // Rule not in deny/warn: nothing fires.
+        assert!(lint(&head, &changes, &cfg("")).is_empty());
+    }
+
+    #[test]
+    fn added_table_and_column_are_not_destructive() {
+        let head = Graph::new();
+        let changes = vec![
+            // A new table is additive.
+            Change::Added(table("audit", "id: Int4")),
+            // A table that only gains a column is additive.
+            Change::Modified {
+                before: table("users", "id: Int4"),
+                after: table("users", "id: Int4, nickname: Varchar"),
+            },
+        ];
+        assert!(lint(&head, &changes, &cfg(SCHEMA)).is_empty());
     }
 }
