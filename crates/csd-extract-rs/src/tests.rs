@@ -239,6 +239,53 @@ fn enum_and_trait_and_fn_fingerprints() {
 }
 
 #[test]
+fn fn_signature_is_captured_as_sig_attr() {
+    let g = fixture();
+    // Typed params plus a return type: `pub fn make(a: u64, b: &Money) -> Order`.
+    assert_eq!(
+        node(&g, "crate::make").attrs.get("sig").map(String::as_str),
+        Some("(a: u64, b: &Money) -> Order")
+    );
+    // A no-arg free function with no return type: `pub fn foo_fn() {}`.
+    assert_eq!(
+        node(&g, "crate::foo::foo_fn")
+            .attrs
+            .get("sig")
+            .map(String::as_str),
+        Some("()")
+    );
+}
+
+#[test]
+fn method_signature_includes_receiver_and_return() {
+    let g = calls_fixture();
+    // `&self` receiver plus a return type: `pub fn other(&self) -> u64`.
+    assert_eq!(
+        node(&g, "crate::Widget::other")
+            .attrs
+            .get("sig")
+            .map(String::as_str),
+        Some("(&self) -> u64")
+    );
+    // No receiver, no params, return type present: `pub fn assoc() -> u64`.
+    assert_eq!(
+        node(&g, "crate::Widget::assoc")
+            .attrs
+            .get("sig")
+            .map(String::as_str),
+        Some("() -> u64")
+    );
+    // A single typed param and a return type: `pub fn helper(x: u64) -> u64`.
+    assert_eq!(
+        node(&g, "crate::helper")
+            .attrs
+            .get("sig")
+            .map(String::as_str),
+        Some("(x: u64) -> u64")
+    );
+}
+
+#[test]
 fn intra_crate_use_resolves_external_use_stays_unresolved() {
     let g = fixture();
     // `use crate::money::Money` resolves to a Uses edge to the item's owning module.
