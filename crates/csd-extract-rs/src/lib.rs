@@ -55,6 +55,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use csd_ir::{doc_hash, Edge, EdgeKind, Fingerprint, Graph, Node, NodeKind, SourceSpan, StableId};
+use rayon::prelude::*;
 use tree_sitter::{Node as TsNode, Parser};
 
 /// Type constructors unwrapped to reach the associated type (SPEC 3.2). A field `Arc<Money>`
@@ -71,21 +72,73 @@ const WRAPPERS: [&str; 5] = ["Arc", "Box", "Rc", "Vec", "Option"];
 /// under the `crate::` prefix. When more than one crate is discovered, each crate's ids are
 /// namespaced by its crate name (`<crate>::module::Item`) so two crates no longer collide under a
 /// shared `crate::` prefix. Single-crate output is byte-for-byte unchanged.
+///
+/// Parallelism (backlog `perf: parallel extraction with rayon`): the mod tree is discovered by
+/// fanning out one frontier at a time. Each frontier's files are parsed and extracted in parallel
+/// (every [`FileExtractor`] builds its own `tree_sitter::Parser`, which is not `Sync`), and the
+/// file-backed submodules they declare become the next frontier. Output stays byte-identical to a
+/// serial walk: the graph is normalised (sorted) at the end, and every order-sensitive record (the
+/// dense per-caller call ordinals, the first-span-wins dedups in [`finish`]) is scoped to a single
+/// module, hence a single file, so merge order never changes the result.
 pub fn extract(root: &Path) -> Result<Graph> {
-    let mut ex = Extractor::new(root);
     let roots = discover_crate_roots(root);
     // A crate is a directory holding `src/`; `lib.rs` + `main.rs` in one crate share a prefix.
     let crate_dirs: BTreeSet<PathBuf> = roots.iter().filter_map(|r| crate_dir_of(r)).collect();
     let multi = crate_dirs.len() > 1;
+
+    // Seed the walk with one job per crate root. `seen_files` guards a file from being parsed twice
+    // (a module reachable from two roots, or aliased through `#[path]`), matching the serial walk.
+    let mut seen_files: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut frontier: Vec<Job> = Vec::new();
     for crate_root in roots {
-        let prefix = if multi {
+        let mod_path = if multi {
             crate_name_for(&crate_root)
         } else {
             "crate".to_string()
         };
-        ex.process_file(&crate_root, &prefix);
+        if seen_files.insert(crate_root.clone()) {
+            frontier.push(Job {
+                path: crate_root,
+                mod_path,
+            });
+        }
     }
-    ex.finish()
+
+    // Extract each frontier in parallel, then collect the file-backed submodules it declares into
+    // the next frontier. `par_iter().collect()` preserves frontier order, but the merge is
+    // order-independent anyway (see the function doc), so the whole graph is deterministic.
+    let mut all = FilePartial::default();
+    while !frontier.is_empty() {
+        let partials: Vec<FilePartial> = frontier
+            .par_iter()
+            .map(|job| extract_file(root, &job.path, &job.mod_path))
+            .collect();
+        let mut next: Vec<Job> = Vec::new();
+        for mut partial in partials {
+            all.nodes.append(&mut partial.nodes);
+            all.uses.append(&mut partial.uses);
+            all.transitions.append(&mut partial.transitions);
+            all.impls.append(&mut partial.impls);
+            all.associates.append(&mut partial.associates);
+            all.calls.append(&mut partial.calls);
+            for job in partial.child_jobs {
+                if seen_files.insert(job.path.clone()) {
+                    next.push(job);
+                }
+            }
+        }
+        frontier = next;
+    }
+
+    finish(all)
+}
+
+/// Extract one file into a [`FilePartial`], building a fresh parser for it. This is the unit of
+/// parallel work: it owns its `tree_sitter::Parser` and touches no shared state.
+fn extract_file(root: &Path, path: &Path, mod_path: &str) -> FilePartial {
+    let mut ex = FileExtractor::new(root);
+    ex.process_file(path, mod_path);
+    ex.into_partial()
 }
 
 /// The crate directory (the parent of `src/`) for a `.../src/{lib,main}.rs` root.
@@ -193,24 +246,54 @@ struct FileCtx<'a> {
     src: &'a [u8],
 }
 
-/// Carries the graph under construction plus dedup state across the recursive module walk.
-struct Extractor {
+/// One file to extract: its on-disk path and the module path its contents live under.
+#[derive(Clone)]
+struct Job {
+    /// The file to parse.
+    path: PathBuf,
+    /// The crate-relative module path the file's root maps to (e.g. `crate::foo`).
+    mod_path: String,
+}
+
+/// The result of extracting one file: the nodes read from it, the raw candidate records still to be
+/// resolved, and the file-backed submodule jobs it declares. Partials are merged (order-independently,
+/// since the final graph is normalised and every order-sensitive record is per-module) and resolved
+/// to edges in [`finish`].
+#[derive(Default)]
+struct FilePartial {
+    nodes: Vec<Node>,
+    /// Raw `use` targets, resolved to edges in [`finish`].
+    uses: Vec<RawUse>,
+    /// Candidate enum state transitions, resolved to edges in [`finish`].
+    transitions: Vec<RawTransition>,
+    /// Candidate `impl Trait for Type` realizations, resolved in [`finish`].
+    impls: Vec<RawImplements>,
+    /// Candidate type associations from a field type, resolved in [`finish`].
+    associates: Vec<RawAssociates>,
+    /// Call sites collected from Fn bodies, resolved to [`EdgeKind::Calls`] edges in [`finish`].
+    /// Push order within a caller is source order.
+    calls: Vec<RawCall>,
+    /// File-backed submodules declared in this file, handed back to the driver as the next frontier.
+    child_jobs: Vec<Job>,
+}
+
+/// Extracts one source file. Holds its own `tree_sitter::Parser` (which is not `Sync`), so a fresh
+/// extractor is built per file inside the parallel frontier walk. File-backed `mod` declarations are
+/// recorded as `child_jobs` rather than recursed into, so the driver drives the fan-out and no shared
+/// state is touched during extraction.
+struct FileExtractor {
     root: PathBuf,
     parser: Parser,
-    graph: Graph,
+    /// Dedup of module ids emitted from this file (repeated inline `mod foo` blocks collapse to one).
     seen_modules: BTreeSet<String>,
-    seen_files: BTreeSet<PathBuf>,
-    /// Raw `use` targets collected across the walk, resolved to edges in [`Extractor::finish`].
+    /// Nodes and raw candidate records accumulated for this file; moved out by [`Self::into_partial`].
+    nodes: Vec<Node>,
     uses: Vec<RawUse>,
-    /// Candidate enum state transitions, resolved to edges in [`Extractor::finish`].
     transitions: Vec<RawTransition>,
-    /// Candidate `impl Trait for Type` realizations, resolved in [`Extractor::finish`].
     impls: Vec<RawImplements>,
-    /// Candidate type associations from a field type, resolved in [`Extractor::finish`].
     associates: Vec<RawAssociates>,
-    /// Call sites collected from Fn bodies, resolved to [`EdgeKind::Calls`] edges in
-    /// [`Extractor::finish`]. Push order within a caller is source order.
     calls: Vec<RawCall>,
+    child_jobs: Vec<Job>,
 }
 
 /// One call site read from a caller Fn body. `callee` is the resolved candidate id, or `None` when
@@ -283,7 +366,7 @@ struct RawUse {
     span: SourceSpan,
 }
 
-impl Extractor {
+impl FileExtractor {
     fn new(root: &Path) -> Self {
         let mut parser = Parser::new();
         parser
@@ -292,251 +375,261 @@ impl Extractor {
         Self {
             root: root.to_path_buf(),
             parser,
-            graph: Graph::new(),
             seen_modules: BTreeSet::new(),
-            seen_files: BTreeSet::new(),
+            nodes: Vec::new(),
             uses: Vec::new(),
             transitions: Vec::new(),
             impls: Vec::new(),
             associates: Vec::new(),
             calls: Vec::new(),
+            child_jobs: Vec::new(),
         }
     }
 
-    /// Resolve collected `use` targets into edges, park the unresolved ones on their module node,
-    /// normalise, and return the graph.
-    fn finish(mut self) -> Result<Graph> {
-        let module_ids: BTreeSet<String> = self
-            .graph
-            .nodes
-            .iter()
-            .filter(|n| n.kind == NodeKind::Module)
-            .map(|n| n.id.as_str().to_string())
-            .collect();
-        let reexports = self.build_reexports();
-        // Known workspace crate names: the single-segment module ids are the per-crate top-level
-        // module nodes (`csd_ir`, `csd_diff`, ..), i.e. the crate-name prefixes this extraction
-        // emitted. A `use` whose first segment names one is a sibling-crate reference.
-        let crate_names: BTreeSet<String> = module_ids
-            .iter()
-            .filter(|id| !id.contains("::"))
-            .cloned()
-            .collect();
+    /// Move the accumulated per-file records out into a [`FilePartial`] (dropping the parser).
+    fn into_partial(self) -> FilePartial {
+        FilePartial {
+            nodes: self.nodes,
+            uses: self.uses,
+            transitions: self.transitions,
+            impls: self.impls,
+            associates: self.associates,
+            calls: self.calls,
+            child_jobs: self.child_jobs,
+        }
+    }
+}
 
-        // Resolved edges keyed by (from, to) so repeated uses collapse to one edge (first span).
-        let mut edges: BTreeMap<(String, String), SourceSpan> = BTreeMap::new();
-        // Unresolved raw targets parked per module.
-        let mut unresolved: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+/// Resolve the merged per-file records into edges, park the unresolved `use` targets on their module
+/// node, normalise, and return the graph. `all.child_jobs` is spent by the driver and unused here.
+fn finish(all: FilePartial) -> Result<Graph> {
+    let mut graph = Graph::new();
+    graph.nodes = all.nodes;
+    let module_ids: BTreeSet<String> = graph
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Module)
+        .map(|n| n.id.as_str().to_string())
+        .collect();
+    let reexports = build_reexports(&all.uses);
+    // Known workspace crate names: the single-segment module ids are the per-crate top-level
+    // module nodes (`csd_ir`, `csd_diff`, ..), i.e. the crate-name prefixes this extraction
+    // emitted. A `use` whose first segment names one is a sibling-crate reference.
+    let crate_names: BTreeSet<String> = module_ids
+        .iter()
+        .filter(|id| !id.contains("::"))
+        .cloned()
+        .collect();
 
-        for u in &self.uses {
-            match resolve_use(u, &module_ids, &reexports, &crate_names) {
-                Some(target) if target != u.module => {
-                    edges
-                        .entry((u.module.clone(), target))
-                        .or_insert_with(|| u.span.clone());
-                }
-                // Resolved to the declaring module itself: a self-reference, not a cross edge.
-                Some(_) => {}
-                None => {
-                    unresolved
-                        .entry(u.module.clone())
-                        .or_default()
-                        .insert(u.path.clone());
-                }
+    // Resolved edges keyed by (from, to) so repeated uses collapse to one edge (first span).
+    let mut edges: BTreeMap<(String, String), SourceSpan> = BTreeMap::new();
+    // Unresolved raw targets parked per module.
+    let mut unresolved: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+    for u in &all.uses {
+        match resolve_use(u, &module_ids, &reexports, &crate_names) {
+            Some(target) if target != u.module => {
+                edges
+                    .entry((u.module.clone(), target))
+                    .or_insert_with(|| u.span.clone());
+            }
+            // Resolved to the declaring module itself: a self-reference, not a cross edge.
+            Some(_) => {}
+            None => {
+                unresolved
+                    .entry(u.module.clone())
+                    .or_default()
+                    .insert(u.path.clone());
             }
         }
-
-        for ((from, to), span) in edges {
-            self.graph.edges.push(Edge {
-                from: StableId::new(from),
-                to: StableId::new(to),
-                kind: EdgeKind::Uses,
-                span,
-                ordinal: None,
-            });
-        }
-
-        for node in &mut self.graph.nodes {
-            if node.kind == NodeKind::Module {
-                if let Some(targets) = unresolved.get(node.id.as_str()) {
-                    if !targets.is_empty() {
-                        let joined = targets.iter().cloned().collect::<Vec<_>>().join(", ");
-                        node.attrs.insert("uses".to_string(), joined);
-                    }
-                }
-            }
-        }
-
-        // Resolve candidate transitions: emit an edge only when both endpoints name a variant node
-        // actually emitted for that enum, and the arm changes variant. Deduped by (from, to).
-        let variant_ids: BTreeSet<String> = self
-            .graph
-            .nodes
-            .iter()
-            .filter(|n| n.kind == NodeKind::Variant)
-            .map(|n| n.id.as_str().to_string())
-            .collect();
-        let mut transitions: BTreeMap<(String, String), SourceSpan> = BTreeMap::new();
-        for t in &self.transitions {
-            let from = format!("{}::{}", t.enum_id, t.from);
-            let to = format!("{}::{}", t.enum_id, t.to);
-            if from == to || !variant_ids.contains(&from) || !variant_ids.contains(&to) {
-                continue;
-            }
-            transitions
-                .entry((from, to))
-                .or_insert_with(|| t.span.clone());
-        }
-        for ((from, to), span) in transitions {
-            self.graph.edges.push(Edge {
-                from: StableId::new(from),
-                to: StableId::new(to),
-                kind: EdgeKind::Transitions,
-                span,
-                ordinal: None,
-            });
-        }
-
-        // Type view (SPEC 3.2). Both endpoints must resolve to nodes this extractor emitted, so
-        // external traits/types (`Display`, `String`) and generic params emit nothing.
-        let type_ids: BTreeSet<String> = self
-            .graph
-            .nodes
-            .iter()
-            .filter(|n| matches!(n.kind, NodeKind::Struct | NodeKind::Enum))
-            .map(|n| n.id.as_str().to_string())
-            .collect();
-        let trait_ids: BTreeSet<String> = self
-            .graph
-            .nodes
-            .iter()
-            .filter(|n| n.kind == NodeKind::Trait)
-            .map(|n| n.id.as_str().to_string())
-            .collect();
-
-        // Implements: from the local type node to the local trait node. Deduped by (from, to).
-        let mut implements: BTreeMap<(String, String), SourceSpan> = BTreeMap::new();
-        for i in &self.impls {
-            let Some(from) =
-                resolve_local(&i.type_path, &i.module).filter(|id| type_ids.contains(id))
-            else {
-                continue;
-            };
-            let Some(to) =
-                resolve_local(&i.trait_path, &i.module).filter(|id| trait_ids.contains(id))
-            else {
-                continue;
-            };
-            implements
-                .entry((from, to))
-                .or_insert_with(|| i.span.clone());
-        }
-        for ((from, to), span) in implements {
-            self.graph.edges.push(Edge {
-                from: StableId::new(from),
-                to: StableId::new(to),
-                kind: EdgeKind::Implements,
-                span,
-                ordinal: None,
-            });
-        }
-
-        // Associates: from the owning type node to the field's inner local type/trait node.
-        let mut associates: BTreeMap<(String, String), SourceSpan> = BTreeMap::new();
-        for a in &self.associates {
-            let Some(to) = resolve_local(&a.inner_path, &a.module)
-                .filter(|id| type_ids.contains(id) || trait_ids.contains(id))
-            else {
-                continue;
-            };
-            associates
-                .entry((a.owner_id.clone(), to))
-                .or_insert_with(|| a.span.clone());
-        }
-        for ((from, to), span) in associates {
-            self.graph.edges.push(Edge {
-                from: StableId::new(from),
-                to: StableId::new(to),
-                kind: EdgeKind::Associates,
-                span,
-                ordinal: None,
-            });
-        }
-
-        // Call graph (SPEC 3.3). Emit a Calls edge only when the callee names a Fn node this
-        // extractor emitted; the ordinal is dense per caller in source order. Every call that does
-        // not resolve to an emitted Fn bumps the caller's `unresolved_calls` count so the fidelity
-        // ceiling stays visible. Deduped by (from, to, ordinal).
-        let fn_ids: BTreeSet<String> = self
-            .graph
-            .nodes
-            .iter()
-            .filter(|n| n.kind == NodeKind::Fn)
-            .map(|n| n.id.as_str().to_string())
-            .collect();
-        let mut next_ordinal: BTreeMap<String, u32> = BTreeMap::new();
-        let mut unresolved_calls: BTreeMap<String, u32> = BTreeMap::new();
-        let mut seen: BTreeSet<(String, String, u32)> = BTreeSet::new();
-        let mut call_edges: Vec<Edge> = Vec::new();
-        for c in &self.calls {
-            match &c.callee {
-                Some(id) if fn_ids.contains(id) => {
-                    let slot = next_ordinal.entry(c.caller.clone()).or_insert(0);
-                    let ordinal = *slot;
-                    if seen.insert((c.caller.clone(), id.clone(), ordinal)) {
-                        call_edges.push(Edge {
-                            from: StableId::new(c.caller.clone()),
-                            to: StableId::new(id.clone()),
-                            kind: EdgeKind::Calls,
-                            span: c.span.clone(),
-                            ordinal: Some(ordinal),
-                        });
-                        *slot += 1;
-                    }
-                }
-                _ => {
-                    *unresolved_calls.entry(c.caller.clone()).or_insert(0) += 1;
-                }
-            }
-        }
-        self.graph.edges.extend(call_edges);
-        for node in &mut self.graph.nodes {
-            if node.kind == NodeKind::Fn {
-                if let Some(n) = unresolved_calls.get(node.id.as_str()) {
-                    if *n > 0 {
-                        node.attrs
-                            .insert("unresolved_calls".to_string(), n.to_string());
-                    }
-                }
-            }
-        }
-
-        self.graph.normalize();
-        Ok(self.graph)
     }
 
-    /// Build the intra-crate `pub use` re-export bindings: `(module, local_name) -> absolute path`.
-    /// Only non-glob `pub use` whose target normalises to an absolute path is recorded.
-    fn build_reexports(&self) -> BTreeMap<(String, String), String> {
-        let mut map = BTreeMap::new();
-        for u in &self.uses {
-            if !u.is_pub || u.glob {
-                continue;
-            }
-            let Some(abs) = normalize_path(&u.path, &u.module) else {
-                continue;
-            };
-            let name = u
-                .alias
-                .clone()
-                .or_else(|| abs.rsplit("::").next().map(|s| s.to_string()));
-            if let Some(name) = name {
-                map.insert((u.module.clone(), name), abs);
-            }
-        }
-        map
+    for ((from, to), span) in edges {
+        graph.edges.push(Edge {
+            from: StableId::new(from),
+            to: StableId::new(to),
+            kind: EdgeKind::Uses,
+            span,
+            ordinal: None,
+        });
     }
 
+    for node in &mut graph.nodes {
+        if node.kind == NodeKind::Module {
+            if let Some(targets) = unresolved.get(node.id.as_str()) {
+                if !targets.is_empty() {
+                    let joined = targets.iter().cloned().collect::<Vec<_>>().join(", ");
+                    node.attrs.insert("uses".to_string(), joined);
+                }
+            }
+        }
+    }
+
+    // Resolve candidate transitions: emit an edge only when both endpoints name a variant node
+    // actually emitted for that enum, and the arm changes variant. Deduped by (from, to).
+    let variant_ids: BTreeSet<String> = graph
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Variant)
+        .map(|n| n.id.as_str().to_string())
+        .collect();
+    let mut transitions: BTreeMap<(String, String), SourceSpan> = BTreeMap::new();
+    for t in &all.transitions {
+        let from = format!("{}::{}", t.enum_id, t.from);
+        let to = format!("{}::{}", t.enum_id, t.to);
+        if from == to || !variant_ids.contains(&from) || !variant_ids.contains(&to) {
+            continue;
+        }
+        transitions
+            .entry((from, to))
+            .or_insert_with(|| t.span.clone());
+    }
+    for ((from, to), span) in transitions {
+        graph.edges.push(Edge {
+            from: StableId::new(from),
+            to: StableId::new(to),
+            kind: EdgeKind::Transitions,
+            span,
+            ordinal: None,
+        });
+    }
+
+    // Type view (SPEC 3.2). Both endpoints must resolve to nodes this extractor emitted, so
+    // external traits/types (`Display`, `String`) and generic params emit nothing.
+    let type_ids: BTreeSet<String> = graph
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.kind, NodeKind::Struct | NodeKind::Enum))
+        .map(|n| n.id.as_str().to_string())
+        .collect();
+    let trait_ids: BTreeSet<String> = graph
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Trait)
+        .map(|n| n.id.as_str().to_string())
+        .collect();
+
+    // Implements: from the local type node to the local trait node. Deduped by (from, to).
+    let mut implements: BTreeMap<(String, String), SourceSpan> = BTreeMap::new();
+    for i in &all.impls {
+        let Some(from) = resolve_local(&i.type_path, &i.module).filter(|id| type_ids.contains(id))
+        else {
+            continue;
+        };
+        let Some(to) = resolve_local(&i.trait_path, &i.module).filter(|id| trait_ids.contains(id))
+        else {
+            continue;
+        };
+        implements
+            .entry((from, to))
+            .or_insert_with(|| i.span.clone());
+    }
+    for ((from, to), span) in implements {
+        graph.edges.push(Edge {
+            from: StableId::new(from),
+            to: StableId::new(to),
+            kind: EdgeKind::Implements,
+            span,
+            ordinal: None,
+        });
+    }
+
+    // Associates: from the owning type node to the field's inner local type/trait node.
+    let mut associates: BTreeMap<(String, String), SourceSpan> = BTreeMap::new();
+    for a in &all.associates {
+        let Some(to) = resolve_local(&a.inner_path, &a.module)
+            .filter(|id| type_ids.contains(id) || trait_ids.contains(id))
+        else {
+            continue;
+        };
+        associates
+            .entry((a.owner_id.clone(), to))
+            .or_insert_with(|| a.span.clone());
+    }
+    for ((from, to), span) in associates {
+        graph.edges.push(Edge {
+            from: StableId::new(from),
+            to: StableId::new(to),
+            kind: EdgeKind::Associates,
+            span,
+            ordinal: None,
+        });
+    }
+
+    // Call graph (SPEC 3.3). Emit a Calls edge only when the callee names a Fn node this
+    // extractor emitted; the ordinal is dense per caller in source order. Every call that does
+    // not resolve to an emitted Fn bumps the caller's `unresolved_calls` count so the fidelity
+    // ceiling stays visible. Deduped by (from, to, ordinal).
+    let fn_ids: BTreeSet<String> = graph
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Fn)
+        .map(|n| n.id.as_str().to_string())
+        .collect();
+    let mut next_ordinal: BTreeMap<String, u32> = BTreeMap::new();
+    let mut unresolved_calls: BTreeMap<String, u32> = BTreeMap::new();
+    let mut seen: BTreeSet<(String, String, u32)> = BTreeSet::new();
+    let mut call_edges: Vec<Edge> = Vec::new();
+    for c in &all.calls {
+        match &c.callee {
+            Some(id) if fn_ids.contains(id) => {
+                let slot = next_ordinal.entry(c.caller.clone()).or_insert(0);
+                let ordinal = *slot;
+                if seen.insert((c.caller.clone(), id.clone(), ordinal)) {
+                    call_edges.push(Edge {
+                        from: StableId::new(c.caller.clone()),
+                        to: StableId::new(id.clone()),
+                        kind: EdgeKind::Calls,
+                        span: c.span.clone(),
+                        ordinal: Some(ordinal),
+                    });
+                    *slot += 1;
+                }
+            }
+            _ => {
+                *unresolved_calls.entry(c.caller.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    graph.edges.extend(call_edges);
+    for node in &mut graph.nodes {
+        if node.kind == NodeKind::Fn {
+            if let Some(n) = unresolved_calls.get(node.id.as_str()) {
+                if *n > 0 {
+                    node.attrs
+                        .insert("unresolved_calls".to_string(), n.to_string());
+                }
+            }
+        }
+    }
+
+    graph.normalize();
+    Ok(graph)
+}
+
+/// Build the intra-crate `pub use` re-export bindings: `(module, local_name) -> absolute path`.
+/// Only non-glob `pub use` whose target normalises to an absolute path is recorded.
+fn build_reexports(uses: &[RawUse]) -> BTreeMap<(String, String), String> {
+    let mut map = BTreeMap::new();
+    for u in uses {
+        if !u.is_pub || u.glob {
+            continue;
+        }
+        let Some(abs) = normalize_path(&u.path, &u.module) else {
+            continue;
+        };
+        let name = u
+            .alias
+            .clone()
+            .or_else(|| abs.rsplit("::").next().map(|s| s.to_string()));
+        if let Some(name) = name {
+            map.insert((u.module.clone(), name), abs);
+        }
+    }
+    map
+}
+
+impl FileExtractor {
     /// Path relative to `root`, forward-slashed, for a [`SourceSpan`].
     fn rel(&self, path: &Path) -> String {
         path.strip_prefix(&self.root)
@@ -548,9 +641,6 @@ impl Extractor {
     /// Parse one source file and emit its module node plus everything declared in it.
     fn process_file(&mut self, path: &Path, mod_path: &str) {
         let path = path.to_path_buf();
-        if !self.seen_files.insert(path.clone()) {
-            return;
-        }
         let Ok(src) = std::fs::read_to_string(&path) else {
             return;
         };
@@ -833,7 +923,12 @@ impl Extractor {
             self.emit_module(&child_path, span_of(node, file));
             self.process_body(body, ctx, &child_path);
         } else if let Some(target) = resolve_mod_file(ctx.file_path, &name, path_attr) {
-            self.process_file(&target, &child_path);
+            // Discovery is deferred to the driver: record the file-backed submodule as a job and let
+            // the next parallel frontier parse it. The child file emits its own module node.
+            self.child_jobs.push(Job {
+                path: target,
+                mod_path: child_path,
+            });
         } else {
             // Declared but the backing file was not found; record the module anyway.
             self.emit_module(&child_path, span_of(node, file));
@@ -957,7 +1052,7 @@ impl Extractor {
         span: SourceSpan,
         fingerprint: Option<Fingerprint>,
     ) {
-        self.graph.nodes.push(Node {
+        self.nodes.push(Node {
             id: StableId::new(id),
             kind,
             span,

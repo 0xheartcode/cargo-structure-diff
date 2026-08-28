@@ -805,3 +805,19 @@ fn output_is_deterministic() {
     let ids_b: Vec<_> = b.nodes.iter().map(|n| (n.id.as_str(), n.kind)).collect();
     assert_eq!(ids_a, ids_b);
 }
+
+/// The whole [`Graph`] (nodes and edges, attributes, fingerprints, spans, and ordinals) is stable
+/// across runs. Extraction fans the mod tree out across rayon worker threads whose completion order
+/// is nondeterministic, so this pins the guarantee that the parallel merge plus normalisation is
+/// byte-identical run to run, not merely stable in node ids. A multi-file, multi-crate layout is
+/// used so several files land on the parallel frontier at once.
+#[test]
+fn full_graph_is_byte_identical_across_runs() {
+    let a = fixture();
+    let b = fixture();
+    assert_eq!(a, b, "single-crate multi-file graph must be reproducible");
+
+    let c = state_fixture();
+    let d = state_fixture();
+    assert_eq!(c, d, "transition graph must be reproducible");
+}
