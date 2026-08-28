@@ -54,6 +54,13 @@ csd files
 # Init: scaffold a .csd.toml pre-filled with this repo's real crate globs.
 csd init
 
+# Walk: flip through one frame per commit to watch the architecture evolve (great with ascii).
+csd walk --base HEAD~20 --format ascii --view modules
+
+# Drift: a compact count of how far the structure has moved since a ref or a pinned baseline.
+csd drift --base main
+csd drift --baseline structure.json
+
 # Version: prints the build's commit, for example csd 0.0.0 (a678f58 2026-08-28T12:19:01Z).
 csd --version
 ```

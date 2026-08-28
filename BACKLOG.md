@@ -84,7 +84,7 @@ ff3a772 [closed] extract-rs: item nodes with member fingerprints
         labels:area:harness, blocking, type:docs priority:medium milestone:m0
 3407789 [closed] diff-members: member-level matching within surviving types
         labels:area:diff, independent, type:feat priority:medium milestone:m3
-369ee6b [open] cli: csd walk - render each commit's graph frame by frame
+369ee6b [closed] cli: csd walk - render each commit's graph frame by frame
         labels:area:cli, independent, type:feat priority:medium milestone:m6
 3aefc9b [closed] extract-db/render: schema (ER) view for Diesel and SeaORM (SPEC 3.5)
         labels:area:extract, independent, type:feat priority:medium milestone:m6
