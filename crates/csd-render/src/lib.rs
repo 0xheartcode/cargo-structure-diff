@@ -567,18 +567,7 @@ fn call_view(head: &Graph, changes: &[Change], opts: &RenderOpts) -> String {
     }
 
     // `unresolved_calls` counts per fn (the dyn/generics fidelity ceiling).
-    let unresolved: BTreeMap<&str, u32> = head
-        .nodes
-        .iter()
-        .filter(|n| n.kind == NodeKind::Fn)
-        .filter_map(|n| {
-            n.attrs
-                .get("unresolved_calls")
-                .and_then(|v| v.parse::<u32>().ok())
-                .filter(|n| *n > 0)
-                .map(|count| (n.id.as_str(), count))
-        })
-        .collect();
+    let unresolved = unresolved_calls(head);
 
     let is_fn = head
         .nodes
@@ -657,6 +646,25 @@ fn call_name(id: &str) -> &str {
         Some(i) => &id[i + 2..],
         None => id,
     }
+}
+
+/// The dyn/generics fidelity ceiling per fn id: `attrs["unresolved_calls"] = N` (N > 0) means the fn
+/// has N dynamic or generic call sites with no statically known callee. Keyed by fn id string so the
+/// value compares across `head` and the delta. Fns with no unresolved calls are absent, so an empty
+/// map means the whole graph is statically resolved. Shared by every view that draws calls, so the
+/// ceiling is surfaced honestly and identically rather than recomputed per emitter.
+fn unresolved_calls(head: &Graph) -> BTreeMap<&str, u32> {
+    head.nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Fn)
+        .filter_map(|n| {
+            n.attrs
+                .get("unresolved_calls")
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|c| *c > 0)
+                .map(|c| (n.id.as_str(), c))
+        })
+        .collect()
 }
 
 /// Depth-first pre-order emit of one fn's messages, then its dyn note, recursing into callees.
@@ -1135,18 +1143,7 @@ fn call_graph_view(head: &Graph, changes: &[Change], opts: &RenderOpts) -> Strin
         .collect();
 
     // `unresolved_calls` counts per fn (the dyn/generics fidelity ceiling).
-    let unresolved: BTreeMap<&str, u32> = head
-        .nodes
-        .iter()
-        .filter(|n| n.kind == NodeKind::Fn)
-        .filter_map(|n| {
-            n.attrs
-                .get("unresolved_calls")
-                .and_then(|v| v.parse::<u32>().ok())
-                .filter(|c| *c > 0)
-                .map(|c| (n.id.as_str(), c))
-        })
-        .collect();
+    let unresolved = unresolved_calls(head);
 
     // Group the rendered fns by owner (sorted), one subgraph each. render_ids is already sorted, so
     // fns within a subgraph stay in id order.
@@ -1534,6 +1531,21 @@ fn overview_view(head: &Graph, changes: &[Change], opts: &RenderOpts) -> String 
         let _ = writeln!(out, "    {} {}|uses{}| {}", sf, arrow, marker, st);
     }
 
+    // Honest dyn ceiling: a dashed edge to a `dyn` stub for each rendered fn with unresolved calls,
+    // matching the call-graph view so the flattened overview never hides dynamic dispatch either.
+    let unresolved = unresolved_calls(head);
+    let mut dyn_idx = 0;
+    for id in &sel.render_ids {
+        if sel.stubs.contains(id) {
+            continue;
+        }
+        if unresolved.contains_key(id.as_str()) {
+            let _ = writeln!(out, "    dyn{dyn_idx}[\"dyn\"]:::context");
+            let _ = writeln!(out, "    {} -.-> dyn{dyn_idx}", handles[id]);
+            dyn_idx += 1;
+        }
+    }
+
     out
 }
 
@@ -1546,6 +1558,11 @@ struct GraphView<'a> {
     node_class: BTreeMap<&'a StableId, Class>,
     edges: Vec<(&'a StableId, &'a StableId, Class)>,
     sel: Selection<'a>,
+    /// Rendered non-stub fns carrying a dyn/generics fidelity ceiling, as `(fn id, count)` in id
+    /// order (see [`unresolved_calls`]). Each alternative-format emitter attaches an honest "dyn"
+    /// signal from this, so no format silently hides that dynamic calls exist. Empty for views with
+    /// no such fns (every view but the call graph and the overview).
+    unresolved: Vec<(&'a StableId, u32)>,
 }
 
 /// Build the shared selected graph for a graph-shaped `view`, reusing the same collection, pruning
@@ -1666,10 +1683,22 @@ fn select_graph<'a>(
         View::Calls => return None,
     };
 
+    // Shared dyn/generics ceiling: rendered non-stub fns with unresolved calls, in id order (render
+    // ids are already sorted). Every alternative-format emitter draws these so the ceiling is never
+    // silently dropped. Only Fn nodes carry the attr, so this is empty for the non-call views.
+    let umap = unresolved_calls(head);
+    let unresolved: Vec<(&StableId, u32)> = sel
+        .render_ids
+        .iter()
+        .filter(|id| !sel.stubs.contains(*id))
+        .filter_map(|id| umap.get(id.as_str()).map(|c| (*id, *c)))
+        .collect();
+
     Some(GraphView {
         node_class,
         edges,
         sel,
+        unresolved,
     })
 }
 
@@ -1730,6 +1759,22 @@ fn dot_view(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -> 
         };
         let _ = writeln!(out, "    {} -> {}{};", handles[from], handles[to], attr);
     }
+
+    // Honest dyn ceiling: a dashed edge to a `dyn` context node for each rendered fn with unresolved
+    // dynamic/generic callees, so the DOT output shows the ceiling instead of silently omitting it.
+    for (i, (id, _count)) in gv.unresolved.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "    dyn{i} [label=\"dyn\",{}];",
+            dot_node_attrs(Class::Context)
+        );
+        let _ = writeln!(
+            out,
+            "    {} -> dyn{i} [style=dashed,color=\"#d1d5db\"];",
+            handles[id]
+        );
+    }
+
     out.push('}');
     out.push('\n');
     out
@@ -1815,6 +1860,13 @@ fn ascii_view(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -
             let _ = writeln!(out, "{} -> {}", from.as_str(), to.as_str());
         }
     }
+
+    // Honest dyn ceiling: annotate each rendered fn that has dynamic/generic callees with no static
+    // target, in id order, so the ASCII text states the calls exist instead of silently omitting them.
+    for (id, count) in &gv.unresolved {
+        let _ = writeln!(out, "{} : {count} dynamic call(s) not shown", id.as_str());
+    }
+
     out
 }
 
@@ -1931,6 +1983,19 @@ fn boxes_view(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -
         }
     }
 
+    // Honest dyn ceiling: one `dyn` box per rendered fn with unresolved dynamic/generic callees, so
+    // the layered diagram shows the dispatch that has no static target instead of dropping it.
+    for (id, _count) in &gv.unresolved {
+        if let Some(&f) = index.get(id) {
+            let dyn_idx = nodes.len();
+            nodes.push(boxes::BoxNode {
+                marker: ' ',
+                name: "dyn".to_string(),
+            });
+            edges.push((f, dyn_idx));
+        }
+    }
+
     boxes::layout(&nodes, &edges)
 }
 
@@ -2002,6 +2067,21 @@ fn svg_view(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -> 
     for (from, to, _) in &gv.edges {
         if let (Some(&f), Some(&t)) = (index.get(from), index.get(to)) {
             edges.push((f, t));
+        }
+    }
+
+    // Honest dyn ceiling: one `dyn` context box per rendered fn with unresolved dynamic/generic
+    // callees, so the SVG shows the ceiling instead of silently omitting it.
+    for (id, _count) in &gv.unresolved {
+        if let Some(&f) = index.get(id) {
+            let dyn_idx = nodes.len();
+            let (stroke, fill) = class_svg_colours(Class::Context);
+            nodes.push(svg::SvgNode {
+                label: "dyn".to_string(),
+                stroke: stroke.to_string(),
+                fill: fill.to_string(),
+            });
+            edges.push((f, dyn_idx));
         }
     }
 
@@ -2854,6 +2934,115 @@ mod tests {
             out.contains("    f0 -.-> dyn0\n"),
             "dyn edge missing:\n{out}"
         );
+    }
+
+    /// A fn with two dynamic callees, drawn full so it always renders. Reused by the per-format
+    /// dyn-ceiling honesty tests below.
+    fn dyn_graph() -> Graph {
+        Graph {
+            nodes: vec![fn_node_dyn("crate::a::f", 2)],
+            edges: vec![],
+        }
+    }
+
+    fn render_full(view: View, format: Format, head: &Graph) -> String {
+        render(
+            view,
+            head,
+            &[],
+            &RenderOpts {
+                full: true,
+                format,
+                ..RenderOpts::default()
+            },
+        )
+    }
+
+    #[test]
+    fn call_graph_dot_surfaces_dyn_ceiling() {
+        let out = render_full(View::CallGraph, Format::Dot, &dyn_graph());
+        assert!(
+            out.contains("dyn0 [label=\"dyn\""),
+            "dot dyn node missing:\n{out}"
+        );
+        assert!(
+            out.contains("n0 -> dyn0 [style=dashed"),
+            "dot dyn edge missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn call_graph_ascii_surfaces_dyn_ceiling() {
+        let out = render_full(View::CallGraph, Format::Ascii, &dyn_graph());
+        assert!(
+            out.contains("crate::a::f : 2 dynamic call(s) not shown"),
+            "ascii dyn note missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn call_graph_boxes_surfaces_dyn_ceiling() {
+        let out = render_full(View::CallGraph, Format::Boxes, &dyn_graph());
+        assert!(out.contains("dyn"), "boxes dyn box missing:\n{out}");
+    }
+
+    #[test]
+    fn call_graph_svg_surfaces_dyn_ceiling() {
+        let out = render_full(View::CallGraph, Format::Svg, &dyn_graph());
+        assert!(out.contains("dyn"), "svg dyn box missing:\n{out}");
+    }
+
+    #[test]
+    fn overview_mermaid_surfaces_dyn_ceiling() {
+        let out = render_full(View::Overview, Format::Mermaid, &dyn_graph());
+        assert!(
+            out.contains("dyn0[\"dyn\"]:::context"),
+            "overview mermaid dyn stub missing:\n{out}"
+        );
+        assert!(
+            out.contains("-.-> dyn0"),
+            "overview mermaid dyn edge missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn overview_dot_surfaces_dyn_ceiling() {
+        let out = render_full(View::Overview, Format::Dot, &dyn_graph());
+        assert!(
+            out.contains("dyn0 [label=\"dyn\"") && out.contains("-> dyn0 [style=dashed"),
+            "overview dot dyn stub missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn overview_boxes_surfaces_dyn_ceiling() {
+        let out = render_full(View::Overview, Format::Boxes, &dyn_graph());
+        assert!(
+            out.contains("dyn"),
+            "overview boxes dyn box missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn overview_svg_surfaces_dyn_ceiling() {
+        let out = render_full(View::Overview, Format::Svg, &dyn_graph());
+        assert!(out.contains("dyn"), "overview svg dyn box missing:\n{out}");
+    }
+
+    #[test]
+    fn zero_unresolved_draws_no_dyn_signal() {
+        // A fn with a resolved call and no unresolved attr: no format may invent a dyn signal.
+        let head = Graph {
+            nodes: vec![fn_node("crate::a::f"), fn_node("crate::b::g")],
+            edges: vec![calls("crate::a::f", "crate::b::g", 0)],
+        };
+        for format in [Format::Dot, Format::Ascii, Format::Boxes, Format::Svg] {
+            let out = render_full(View::CallGraph, format, &head);
+            assert!(
+                !out.contains("dyn"),
+                "unexpected dyn signal for a resolved graph ({format:?}):\n{out}"
+            );
+        }
     }
 
     #[test]
