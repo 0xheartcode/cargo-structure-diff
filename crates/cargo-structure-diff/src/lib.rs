@@ -1259,6 +1259,38 @@ deny = [\"layering\", \"cycles\"]
     }
 
     #[test]
+    fn preexisting_violation_stays_green_under_new_only_ratchet() {
+        // Base already contains the forbidden app -> infra edge, committed to main.
+        let repo = TmpRepo::new("ratchet");
+        let dir = &repo.path;
+        git_ok(dir, &["-c", "init.defaultBranch=main", "init", "-q"]);
+        write(dir, ".csd.toml", CONFIG);
+        write(dir, "src/lib.rs", "pub mod app;\npub mod infra;\n");
+        write(
+            dir,
+            "src/app/mod.rs",
+            "use crate::infra;\npub fn app_fn() {}\n",
+        );
+        write(dir, "src/infra/mod.rs", "pub fn infra_fn() {}\n");
+        git_ok(dir, &["add", "-A"]);
+        git_ok(
+            dir,
+            &["commit", "-q", "-m", "base with a pre-existing violation"],
+        );
+
+        // Head leaves the forbidden edge untouched: the violation is not new.
+        let config = Config::load(&dir.join(".csd.toml")).unwrap();
+        let report = analyze(dir, "main", &config, &RenderOpts::default()).unwrap();
+
+        assert_eq!(
+            report.exit_code(),
+            0,
+            "a pre-existing violation must not fail the default new-only ratchet, findings: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
     fn parse_baseline_sets_the_snapshot_path() {
         let cmd =
             parse_args(&["diff".into(), "--baseline".into(), "structure.json".into()]).unwrap();
