@@ -546,10 +546,25 @@ pub fn changelog_markdown(base: &str, changes: &[Change]) -> String {
     use std::collections::BTreeMap;
 
     let mut groups: BTreeMap<String, ChangelogGroup> = BTreeMap::new();
+    // A module change is rendered as a status tag on that module's own section heading, never also
+    // as a bullet under its parent, so a changed module is listed exactly once.
+    let mut module_status: BTreeMap<String, &'static str> = BTreeMap::new();
     let mut edges: Vec<String> = Vec::new();
 
     for change in changes {
         match change {
+            Change::Added(n) if n.kind == NodeKind::Module => {
+                module_status.insert(n.id.as_str().to_string(), "added");
+                groups.entry(n.id.as_str().to_string()).or_default();
+            }
+            Change::Removed(n) if n.kind == NodeKind::Module => {
+                module_status.insert(n.id.as_str().to_string(), "removed");
+                groups.entry(n.id.as_str().to_string()).or_default();
+            }
+            Change::Modified { after, .. } if after.kind == NodeKind::Module => {
+                module_status.insert(after.id.as_str().to_string(), "modified");
+                groups.entry(after.id.as_str().to_string()).or_default();
+            }
             Change::Added(n) => {
                 groups
                     .entry(owning_module(&n.id))
@@ -611,7 +626,24 @@ pub fn changelog_markdown(base: &str, changes: &[Change]) -> String {
         return out;
     }
     for (module, g) in &groups {
-        let _ = writeln!(out, "## {module}");
+        let status = module_status.get(module.as_str()).copied();
+        let empty = g.added.is_empty()
+            && g.removed.is_empty()
+            && g.modified.is_empty()
+            && g.moved.is_empty();
+        // A group can be empty when a module changed but none of its contents did; still show its
+        // heading so the module change is visible. Skip a genuinely empty, untagged group.
+        if empty && status.is_none() {
+            continue;
+        }
+        match status {
+            Some(s) => {
+                let _ = writeln!(out, "## {module} ({s})");
+            }
+            None => {
+                let _ = writeln!(out, "## {module}");
+            }
+        }
         let _ = writeln!(out);
         changelog_section(&mut out, "Added", &g.added);
         changelog_section(&mut out, "Removed", &g.removed);
@@ -2075,6 +2107,35 @@ trailing noise
         assert!(md.contains("### Added\n- struct `Invoice`"));
         assert!(md.contains("### Removed\n- fn `legacy_charge`"));
         assert!(md.contains("- + `crate::billing` -> `crate::payments` (uses)"));
+    }
+
+    #[test]
+    fn changelog_tags_a_modified_module_on_its_heading_not_as_a_bullet() {
+        let changes = vec![
+            Change::Modified {
+                before: cl_node("crate::billing", NodeKind::Module),
+                after: cl_node("crate::billing", NodeKind::Module),
+            },
+            Change::Added(cl_node("crate::billing::Invoice", NodeKind::Struct)),
+        ];
+        let md = changelog_markdown("main", &changes);
+
+        // The module is tagged on its own heading, once.
+        assert!(
+            md.contains("## crate::billing (modified)"),
+            "module change should tag the heading:\n{md}"
+        );
+        // It must NOT also appear as a "Modified module" bullet under the crate root.
+        assert!(
+            !md.contains("module `billing`"),
+            "a changed module must not double-list as a bullet:\n{md}"
+        );
+        // No empty crate-root section is emitted.
+        assert!(
+            !md.contains("## (crate root)"),
+            "no empty parent section:\n{md}"
+        );
+        assert!(md.contains("### Added\n- struct `Invoice`"));
     }
 
     #[test]
