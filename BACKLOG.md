@@ -12,7 +12,7 @@ Dependencies are not a native git-issue field, so each issue body carries a
 ```
 14c3416 [closed] ir: implement StableId, structural fingerprints and similarity scoring
         labels:area:ir, blocking, type:feat priority:critical milestone:m0
-422be96 [open] extract: resolve cross-crate use paths to workspace dependency edges
+422be96 [closed] extract: resolve cross-crate use paths to workspace dependency edges
         labels:area:extract, blocking, type:feat priority:critical milestone:m6
 775ae67 [closed] diff: rename/move matcher with fingerprint similarity and threshold
         labels:area:diff, blocking, type:feat priority:critical milestone:m0
@@ -40,6 +40,8 @@ e462549 [closed] extract/render: states view only for real state machines
         labels:area:lint, independent, type:feat priority:high milestone:m2
 4894e6a [closed] lint: layering and cycles over the module graph with ratchet
         labels:area:lint, blocking, type:feat priority:high milestone:m1
+53b3162 [closed] render: combined overview view (the code schema) - modules containing types + fns with all edges
+        labels:area:render, independent, type:feat priority:high milestone:m6
 563525b [closed] cli/render: --scope focus view (files/folders) with boundary stubs
         labels:area:cli, area:render, independent, type:feat priority:high milestone:m6
 5b13237 [closed] diff-calls: tree edit distance over call sequences
@@ -64,6 +66,8 @@ e462549 [closed] extract/render: states view only for real state machines
         labels:area:render, blocking, type:feat priority:high milestone:m4
 a04d762 [closed] cli: wire the types view into csd diff
         labels:area:cli, blocking, type:feat priority:high milestone:m3
+b59eafb [closed] render: native ASCII boxes-and-arrows layout for graph views
+        labels:area:render, independent, type:feat priority:high milestone:m6
 b951fc4 [closed] harness: git worktree materialization and IR cache by SHA
         labels:area:harness, blocking, type:feat priority:high milestone:m0
 bb67bbb [closed] extract-rs: precision-first use-path mini-resolver
@@ -86,7 +90,7 @@ ff3a772 [closed] extract-rs: item nodes with member fingerprints
         labels:area:extract, independent, type:feat priority:medium milestone:m6
 4a971c7 [closed] diff: seed module-level Moved from git file-rename signal
         labels:area:diff, independent, type:feat priority:medium milestone:m0
-71d1b0d [open] perf: persistent SHA-keyed IR cache (with serde on csd-ir)
+71d1b0d [closed] perf: persistent SHA-keyed IR cache (with serde on csd-ir)
         labels:area:ir, independent, type:feat priority:medium milestone:m6
 ad3822a [closed] harness: corpus clone and first-parent pair walker
         labels:area:harness, independent, type:feat priority:medium milestone:m0
@@ -108,9 +112,9 @@ fdaac35 [closed] render: --format dot output (offline, JS-free) for the graph vi
         labels:area:extract, independent, type:docs priority:low milestone:m3
 29f3ab0 [closed] extract-states: broaden idiom test coverage
         labels:area:extract, independent, type:test priority:low milestone:m2
-2a73d33 [open] perf: parallel extraction with rayon
+2a73d33 [closed] perf: parallel extraction with rayon
         labels:area:extract, independent, type:feat priority:low milestone:m6
-60f22da [open] render: --format svg via the pure-Rust layout crate (native image, no Node)
+60f22da [closed] render: --format svg via the pure-Rust layout crate (native image, no Node)
         labels:area:render, independent, type:feat priority:low milestone:m6
 db21bac [closed] infra: wire the quality gate into justfile and CI
         labels:area:infra, independent, type:infra priority:low milestone:m0
