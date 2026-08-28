@@ -35,6 +35,7 @@ dependencies = [
  "csd-ir",
  "csd-lint",
  "csd-render",
+ "serde_json",
 ]
 
 [[package]]
@@ -115,6 +116,10 @@ dependencies = [
 [[package]]
 name = "csd-ir"
 version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "csd-lint"
