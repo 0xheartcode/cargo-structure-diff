@@ -36,6 +36,7 @@ USAGE:
     csd snapshot [-o <file>|--out <file>]
     csd changelog [--base <ref>]
     csd files [-o <file>|--out <file>]
+    csd init [-o <file>|--out <file>]
     csd trace [--base <ref>] [--cmd <shell command>]
     csd doc [-o <file>|--out <file>]
     cargo structure-diff diff [--base <ref>] [--show]
@@ -76,6 +77,11 @@ files mode is observational: it prints a per-file structural index of the workin
 tree, listing for each source file the modules, types (with their members), and
 functions it defines, plus the trait realizations declared in it. No base, no
 delta. It exits 0 on success, 2 on error.
+
+init writes a starter .csd.toml pre-filled with the crate path globs detected in
+this repo, so the layer mapping matches real modules instead of guessed paths.
+With no --out it writes .csd.toml and refuses to overwrite an existing one; pass
+--out - to print to stdout. It exits 0 on success, 2 on error.
 ";
 
 /// A parsed invocation.
@@ -127,6 +133,11 @@ pub enum Cmd {
     /// Emit a per-file structural index of the working tree (no delta, no diagram).
     Files {
         /// Output file; `None` writes to stdout.
+        out: Option<String>,
+    },
+    /// Generate a starter `.csd.toml` pre-filled with the repo's detected crate globs.
+    Init {
+        /// Output file; `None` writes `.csd.toml` (refusing to overwrite), `-` writes stdout.
         out: Option<String>,
     },
 }
@@ -220,7 +231,9 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
             "--show" => show = true,
             "--full" => full = true,
             "--list" => list = true,
-            "diff" | "trace" | "doc" | "changelog" | "snapshot" | "files" if sub.is_none() => {
+            "diff" | "trace" | "doc" | "changelog" | "snapshot" | "files" | "init"
+                if sub.is_none() =>
+            {
                 sub = Some(arg)
             }
             "--baseline" => {
@@ -280,6 +293,7 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
         Some("doc") => Ok(Cmd::Doc { out }),
         Some("snapshot") => Ok(Cmd::Snapshot { out }),
         Some("files") => Ok(Cmd::Files { out }),
+        Some("init") => Ok(Cmd::Init { out }),
         Some("changelog") => Ok(Cmd::Changelog { base }),
         Some(_) => Ok(Cmd::Diff {
             base,
@@ -372,6 +386,13 @@ pub fn run(args: &[String]) -> i32 {
             }
         },
         Cmd::Files { out } => match run_files(out.as_deref()) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                2
+            }
+        },
+        Cmd::Init { out } => match run_init(out.as_deref()) {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("error: {e:#}");
@@ -689,6 +710,79 @@ fn run_files(out: Option<&str>) -> Result<i32> {
     let head = extract_head(&repo)?;
     emit_doc(&files_markdown(&head), out)?;
     Ok(0)
+}
+
+/// Generate a starter `.csd.toml`, or write it. With no `out`, write `.csd.toml` at the repo root
+/// and refuse to overwrite an existing one; `-` prints to stdout; any other path is written.
+fn run_init(out: Option<&str>) -> Result<i32> {
+    let repo = repo_root()?;
+    let head = extract_head(&repo)?;
+    let config = init_config(&head);
+    match out {
+        None => {
+            let target = repo.join(".csd.toml");
+            if target.exists() {
+                bail!(
+                    "{} already exists; pass --out <file> to write elsewhere or --out - for stdout",
+                    target.display()
+                );
+            }
+            std::fs::write(&target, &config)
+                .with_context(|| format!("failed to write {}", target.display()))?;
+            println!("wrote {}", target.display());
+        }
+        Some("-") => print!("{config}"),
+        Some(path) => {
+            std::fs::write(path, &config).with_context(|| format!("failed to write {path}"))?;
+            println!("wrote {path}");
+        }
+    }
+    Ok(0)
+}
+
+/// The `crates/<name>/**` (or `src/**`) globs for every crate a module was extracted from, sorted
+/// and de-duplicated, so a generated config maps real paths rather than guessed ones.
+fn detected_crate_globs(head: &Graph) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut roots: BTreeSet<String> = BTreeSet::new();
+    for n in &head.nodes {
+        if n.kind != NodeKind::Module {
+            continue;
+        }
+        let file = n.span.file.as_str();
+        if let Some(idx) = file.find("/src/") {
+            roots.insert(format!("{}/**", &file[..idx]));
+        } else if file.starts_with("src/") {
+            roots.insert("src/**".to_string());
+        }
+    }
+    roots.into_iter().collect()
+}
+
+/// Render a starter `.csd.toml`: a commented layer-mapping template pre-filled with this repo's
+/// detected crate globs, plus sensible defaults (module view, cycle lint, new-only ratchet). The
+/// layers section is left commented so the config is valid immediately and the user opts in to a
+/// constraint by uncommenting and assigning layers.
+fn init_config(head: &Graph) -> String {
+    let mut s = String::new();
+    s.push_str("# cargo-structure-diff configuration, generated by `csd init`.\n");
+    s.push_str(
+        "# Assign the detected crates to architectural layers, then declare forbidden edges.\n\n",
+    );
+    s.push_str("[layers]\n");
+    s.push_str("# order lists strata top (may depend downward) to bottom, for example:\n");
+    s.push_str("# order = [\"app\", \"contract\"]\n");
+    s.push_str("# map assigns each module path to a layer (first match wins). Detected crates:\n");
+    s.push_str("# map = [\n");
+    for glob in detected_crate_globs(head) {
+        let _ = writeln!(s, "#     {{ layer = \"app\", glob = \"{glob}\" }},");
+    }
+    s.push_str("# ]\n");
+    s.push_str("# forbid = [{ from = \"contract\", to = \"app\" }]\n\n");
+    s.push_str("[views]\nenabled = [\"modules\"]\n\n");
+    s.push_str("[lint]\ndeny = [\"cycles\"]\nwarn = [\"fan_in\", \"fan_out\"]\n\n");
+    s.push_str("[ratchet]\nmode = \"new-only\"\n");
+    s
 }
 
 /// The items one source file defines, in section order.
@@ -2254,6 +2348,23 @@ trailing noise
             "no empty parent section:\n{md}"
         );
         assert!(md.contains("### Added\n- struct `Invoice`"));
+    }
+
+    #[test]
+    fn init_generates_a_valid_config_with_detected_globs() {
+        let mut graph = Graph::new();
+        let mut m = cl_node("crate::thing", NodeKind::Module);
+        m.span.file = "crates/foo/src/lib.rs".into();
+        graph.nodes = vec![m];
+
+        let toml = init_config(&graph);
+        // The detected crate glob is present (commented, for the user to assign a layer).
+        assert!(
+            toml.contains("crates/foo/**"),
+            "generated config should carry the detected glob:\n{toml}"
+        );
+        // The generated config parses as valid, so `csd init` never emits a broken file.
+        csd_config::Config::parse(&toml).expect("generated config must be valid");
     }
 
     #[test]
