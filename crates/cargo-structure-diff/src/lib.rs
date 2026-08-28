@@ -51,6 +51,7 @@ OPTIONS:
     --cmd <cmd>        trace: shell command that emits Mermaid (default: cargo test)
     -o, --out <f>      doc/snapshot: write output to <file> instead of stdout
     -h, --help         Print this help
+    -V, --version      Print the version and build commit
 
 trace mode is opt-in and observational: it runs <cmd> in the base and head
 worktrees, extracts the emitted `sequenceDiagram` Mermaid blocks, and diffs the
@@ -76,6 +77,8 @@ exits 0 on success, 2 on error.
 pub enum Cmd {
     /// Print usage and exit zero.
     Help,
+    /// Print the version (with the build's git commit) and exit zero.
+    Version,
     /// Run the diff gate against `base`.
     Diff {
         /// The git ref to treat as the base side.
@@ -202,6 +205,7 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
         let arg = args[i].as_str();
         match arg {
             "-h" | "--help" => return Ok(Cmd::Help),
+            "-V" | "--version" => return Ok(Cmd::Version),
             "--show" => show = true,
             "--full" => full = true,
             "--list" => list = true,
@@ -290,6 +294,20 @@ fn parse_format(value: &str) -> Result<Format> {
     }
 }
 
+/// The version line: the package version plus the build's git commit and its (deterministic) commit
+/// date when available, for example `csd 0.0.0 (a678f58 2026-08-28)`. Falls back to the bare version
+/// when the crate was built without a git checkout (a crates.io tarball).
+fn version_string() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let sha = env!("CSD_GIT_SHA");
+    let date = env!("CSD_GIT_DATE");
+    match (sha.is_empty(), date.is_empty()) {
+        (true, _) => format!("csd {version}"),
+        (false, true) => format!("csd {version} ({sha})"),
+        (false, false) => format!("csd {version} ({sha} {date})"),
+    }
+}
+
 /// Entry point shared by both binaries. Returns the process exit code.
 pub fn run(args: &[String]) -> i32 {
     let cmd = match parse_args(args) {
@@ -303,6 +321,10 @@ pub fn run(args: &[String]) -> i32 {
     match cmd {
         Cmd::Help => {
             print!("{HELP}");
+            0
+        }
+        Cmd::Version => {
+            println!("{}", version_string());
             0
         }
         Cmd::Diff {
@@ -1788,6 +1810,13 @@ deny = [\"layering\", \"cycles\"]
     fn parse_help_and_errors() {
         assert_eq!(parse_args(&["--help".to_string()]).unwrap(), Cmd::Help);
         assert!(parse_args(&[]).is_err(), "no subcommand is an error");
+        assert_eq!(run(&["--version".to_string()]), 0);
+        assert_eq!(parse_args(&["-V".to_string()]).unwrap(), Cmd::Version);
+        assert!(
+            version_string().starts_with("csd "),
+            "version line names the binary: {}",
+            version_string()
+        );
         assert!(
             parse_args(&["bogus".to_string()]).is_err(),
             "unknown arg is an error"
