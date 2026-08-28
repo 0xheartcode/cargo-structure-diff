@@ -17,7 +17,7 @@ name = "cargo-structure-diff"
 path = "src/cargo_shim.rs"
 
 [dependencies]
-csd-ir = { workspace = true }
+csd-ir = { workspace = true, features = ["serde"] }
 csd-diff = { workspace = true }
 csd-extract-rs = { workspace = true }
 csd-extract-db = { workspace = true }
@@ -25,3 +25,4 @@ csd-config = { workspace = true }
 csd-render = { workspace = true }
 csd-lint = { workspace = true }
 anyhow = { workspace = true }
+serde_json = { workspace = true }

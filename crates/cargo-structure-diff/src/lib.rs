@@ -32,23 +32,25 @@ const HELP: &str = "\
 cargo-structure-diff: structural diff and architectural lint gate
 
 USAGE:
-    csd diff [--base <ref>] [--show] [--full] [--list] [--scope <glob>]... [--format <fmt>]
+    csd diff [--base <ref>|--baseline <file>] [--show] [--full] [--list] [--scope <glob>]... [--format <fmt>]
+    csd snapshot [-o <file>|--out <file>]
     csd changelog [--base <ref>]
     csd trace [--base <ref>] [--cmd <shell command>]
     csd doc [-o <file>|--out <file>]
     cargo structure-diff diff [--base <ref>] [--show]
 
 OPTIONS:
-    --base <ref>    Base git ref to diff against (default: main)
-    --show          diff: print every rendered view even when nothing denies
-    --full          diff: render the whole graph, not just the pruned delta
-    --list          diff: print a one-line-per-change textual summary of the delta
-    --scope <glob>  diff: only render nodes whose source path matches <glob>
-                    (repeatable; crossing edges show an external stub)
-    --format <fmt>  diff: diagram syntax, one of mermaid|dot|ascii|boxes|svg (default: mermaid)
-    --cmd <cmd>     trace: shell command that emits Mermaid (default: cargo test)
-    -o, --out <f>   doc: write the report to <file> instead of stdout
-    -h, --help      Print this help
+    --base <ref>       Base git ref to diff against (default: main)
+    --baseline <file>  diff: use a JSON snapshot as the base instead of a git ref
+    --show             diff: print every rendered view even when nothing denies
+    --full             diff: render the whole graph, not just the pruned delta
+    --list             diff: print a one-line-per-change textual summary of the delta
+    --scope <glob>     diff: only render nodes whose source path matches <glob>
+                       (repeatable; crossing edges show an external stub)
+    --format <fmt>     diff: diagram syntax, one of mermaid|dot|ascii|boxes|svg (default: mermaid)
+    --cmd <cmd>        trace: shell command that emits Mermaid (default: cargo test)
+    -o, --out <f>      doc/snapshot: write output to <file> instead of stdout
+    -h, --help         Print this help
 
 trace mode is opt-in and observational: it runs <cmd> in the base and head
 worktrees, extracts the emitted `sequenceDiagram` Mermaid blocks, and diffs the
@@ -62,6 +64,11 @@ changelog mode is observational: it diffs the working tree against <ref> and
 emits a grouped Markdown changelog (added, removed, modified, and moved items per
 module, then dependency edges). It is the textual companion to the diagram, for a
 PR body or release note. No gate. It exits 0 on success, 2 on error.
+
+snapshot mode writes the current working tree as a JSON structure graph: a pinned
+baseline. Commit it at a release, then gate later work with `csd diff --baseline
+<file>` to assert against that structure without checking out the old ref. It
+exits 0 on success, 2 on error.
 ";
 
 /// A parsed invocation.
@@ -73,6 +80,8 @@ pub enum Cmd {
     Diff {
         /// The git ref to treat as the base side.
         base: String,
+        /// Diff against this pinned JSON snapshot instead of materializing `base` from git.
+        baseline: Option<String>,
         /// Print every rendered view even when nothing denies (for interactive use).
         show: bool,
         /// Render the whole graph, not just the pruned delta.
@@ -83,6 +92,11 @@ pub enum Cmd {
         list: bool,
         /// Diagram output syntax.
         format: Format,
+    },
+    /// Serialize the current working tree as a JSON structure snapshot (a pinned baseline).
+    Snapshot {
+        /// Output file; `None` writes to stdout.
+        out: Option<String>,
     },
     /// Run a trace command in base and head, then diff the observed Mermaid traces.
     Trace {
@@ -174,6 +188,7 @@ impl Report {
 /// design; no clap.
 pub fn parse_args(args: &[String]) -> Result<Cmd> {
     let mut base = DEFAULT_BASE.to_string();
+    let mut baseline: Option<String> = None;
     let mut cmd = DEFAULT_TRACE_CMD.to_string();
     let mut show = false;
     let mut full = false;
@@ -190,7 +205,15 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
             "--show" => show = true,
             "--full" => full = true,
             "--list" => list = true,
-            "diff" | "trace" | "doc" | "changelog" if sub.is_none() => sub = Some(arg),
+            "diff" | "trace" | "doc" | "changelog" | "snapshot" if sub.is_none() => sub = Some(arg),
+            "--baseline" => {
+                i += 1;
+                let value = args.get(i).context("--baseline requires a value")?;
+                baseline = Some(value.clone());
+            }
+            _ if arg.starts_with("--baseline=") => {
+                baseline = Some(arg["--baseline=".len()..].to_string());
+            }
             "-o" | "--out" => {
                 i += 1;
                 let value = args.get(i).context("--out requires a value")?;
@@ -238,9 +261,11 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
     match sub {
         Some("trace") => Ok(Cmd::Trace { base, cmd }),
         Some("doc") => Ok(Cmd::Doc { out }),
+        Some("snapshot") => Ok(Cmd::Snapshot { out }),
         Some("changelog") => Ok(Cmd::Changelog { base }),
         Some(_) => Ok(Cmd::Diff {
             base,
+            baseline,
             show,
             full,
             scope,
@@ -280,6 +305,7 @@ pub fn run(args: &[String]) -> i32 {
         }
         Cmd::Diff {
             base,
+            baseline,
             show,
             full,
             scope,
@@ -292,7 +318,7 @@ pub fn run(args: &[String]) -> i32 {
                 entry: None,
                 format,
             };
-            match run_diff(&base, show, list, &opts) {
+            match run_diff(&base, baseline.as_deref(), show, list, &opts) {
                 Ok(code) => code,
                 Err(e) => {
                     eprintln!("error: {e:#}");
@@ -300,6 +326,13 @@ pub fn run(args: &[String]) -> i32 {
                 }
             }
         }
+        Cmd::Snapshot { out } => match run_snapshot(out.as_deref()) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                2
+            }
+        },
         Cmd::Trace { base, cmd } => match run_trace(&base, &cmd) {
             Ok(code) => code,
             Err(e) => {
@@ -328,17 +361,42 @@ pub fn run(args: &[String]) -> i32 {
 ///
 /// With `list`, a deterministic one-line-per-change summary is printed to stdout before the
 /// diagrams; it composes with `show` and does not affect the exit code.
-fn run_diff(base: &str, show: bool, list: bool, opts: &RenderOpts) -> Result<i32> {
+fn run_diff(
+    base: &str,
+    baseline: Option<&str>,
+    show: bool,
+    list: bool,
+    opts: &RenderOpts,
+) -> Result<i32> {
     let repo = repo_root()?;
     let config = load_config(&repo)?;
-    let report = analyze(&repo, base, &config, opts)?;
-    report.print(base, show);
+    // The label printed in the summary: the snapshot file when pinned, else the git ref.
+    let (report, label) = match baseline {
+        Some(path) => {
+            let graph = load_baseline(path)?;
+            (analyze_baseline(&repo, &graph, &config, opts)?, path)
+        }
+        None => (analyze(&repo, base, &config, opts)?, base),
+    };
+    report.print(label, show);
     if list {
         for line in change_list(&report.changes) {
             println!("{line}");
         }
     }
     Ok(report.exit_code())
+}
+
+/// Write the working-tree structure snapshot to `out`, or stdout when `out` is `None`.
+fn run_snapshot(out: Option<&str>) -> Result<i32> {
+    let repo = repo_root()?;
+    let json = snapshot_json(&repo)?;
+    match out {
+        Some(path) => std::fs::write(path, &json)
+            .with_context(|| format!("failed to write snapshot {path}"))?,
+        None => println!("{json}"),
+    }
+    Ok(0)
 }
 
 /// Format the delta as a deterministic, reviewer-friendly change list, one line per change.
@@ -818,6 +876,44 @@ pub fn analyze(repo: &Path, base: &str, config: &Config, opts: &RenderOpts) -> R
     let base_graph = base_graph(repo, base)?;
     let head_graph = extract_head(repo)?;
     let file_renames = file_renames(repo, base)?;
+    Ok(analyze_graphs(
+        base_graph,
+        head_graph,
+        file_renames,
+        config,
+        opts,
+    ))
+}
+
+/// Diff the working tree against a pinned baseline graph loaded from a snapshot file.
+///
+/// Same pipeline as [`analyze`], but the base side comes from a serialized [`Graph`] rather than a
+/// git worktree, so there is no ref to derive git file-renames from (module reconciliation from git
+/// renames is therefore skipped; the structural fingerprint matcher still runs).
+pub fn analyze_baseline(
+    repo: &Path,
+    baseline: &Graph,
+    config: &Config,
+    opts: &RenderOpts,
+) -> Result<Report> {
+    let head_graph = extract_head(repo)?;
+    Ok(analyze_graphs(
+        baseline.clone(),
+        head_graph,
+        Vec::new(),
+        config,
+        opts,
+    ))
+}
+
+/// The shared diff/lint/render core, parameterized on the two graphs and any known file renames.
+fn analyze_graphs(
+    base_graph: Graph,
+    head_graph: Graph,
+    file_renames: Vec<FileRename>,
+    config: &Config,
+    opts: &RenderOpts,
+) -> Report {
     let changes = diff(
         &base_graph,
         &head_graph,
@@ -828,11 +924,28 @@ pub fn analyze(repo: &Path, base: &str, config: &Config, opts: &RenderOpts) -> R
     );
     let findings = lint(&head_graph, &changes, config);
     let diagrams = render_views(&head_graph, &changes, config, opts);
-    Ok(Report {
+    Report {
         changes,
         findings,
         diagrams,
-    })
+    }
+}
+
+/// Extract the working tree and serialize it as a pretty-printed JSON snapshot.
+///
+/// The snapshot is a pinned baseline: a later `csd diff --baseline <file>` diffs a new working tree
+/// against it without needing the original ref checked out. Deterministic, since the graph is
+/// normalized before extraction returns.
+fn snapshot_json(repo: &Path) -> Result<String> {
+    let head = extract_head(repo)?;
+    serde_json::to_string_pretty(&head).context("failed to serialize the structure snapshot")
+}
+
+/// Load a baseline graph from a JSON snapshot file produced by `csd snapshot`.
+fn load_baseline(path: &str) -> Result<Graph> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("failed to read baseline {path}"))?;
+    serde_json::from_str(&text).with_context(|| format!("failed to parse baseline {path}"))
 }
 
 /// Extract the current working tree as one head graph: the Rust module graph merged with the
@@ -1145,6 +1258,71 @@ deny = [\"layering\", \"cycles\"]
         );
     }
 
+    #[test]
+    fn parse_baseline_sets_the_snapshot_path() {
+        let cmd =
+            parse_args(&["diff".into(), "--baseline".into(), "structure.json".into()]).unwrap();
+        match cmd {
+            Cmd::Diff { baseline, .. } => {
+                assert_eq!(baseline.as_deref(), Some("structure.json"))
+            }
+            other => panic!("expected Diff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_snapshot_subcommand() {
+        assert_eq!(
+            parse_args(&["snapshot".into()]).unwrap(),
+            Cmd::Snapshot { out: None }
+        );
+        assert_eq!(
+            parse_args(&["snapshot".into(), "-o".into(), "s.json".into()]).unwrap(),
+            Cmd::Snapshot {
+                out: Some("s.json".into())
+            }
+        );
+    }
+
+    #[test]
+    fn pinned_snapshot_gates_like_a_git_ref() {
+        let repo = base_repo("snap-gate");
+        let dir = &repo.path;
+        let config = Config::load(&dir.join(".csd.toml")).unwrap();
+
+        // Pin the current structure to a JSON snapshot file, then load it back.
+        let snap = dir.join("structure.json");
+        std::fs::write(&snap, snapshot_json(dir).unwrap()).unwrap();
+        let baseline = load_baseline(&snap.to_string_lossy()).unwrap();
+
+        // The unchanged working tree has no delta against its own snapshot.
+        let clean = analyze_baseline(dir, &baseline, &config, &RenderOpts::default()).unwrap();
+        assert_eq!(clean.exit_code(), 0);
+        assert!(
+            clean.changes.is_empty(),
+            "unchanged tree must have an empty delta, got {:?}",
+            clean.changes
+        );
+
+        // A new forbidden edge in head denies against the pinned baseline, exactly as against a ref.
+        write(
+            dir,
+            "src/app/mod.rs",
+            "use crate::infra;\npub fn app_fn() {}\n",
+        );
+        let report = analyze_baseline(dir, &baseline, &config, &RenderOpts::default()).unwrap();
+        assert_eq!(
+            report.exit_code(),
+            1,
+            "a new forbidden edge must deny against the snapshot"
+        );
+        assert!(
+            report.findings.iter().any(|f| f.rule == "layering"),
+            "expected a layering finding, got {:?}",
+            report.findings
+        );
+    }
+
     /// A single-crate repo whose config enables the states view and denies new state cycles, with a
     /// base state machine that is acyclic (Red -> Green -> Yellow, Yellow self-loop dropped).
     fn state_repo(tag: &str) -> TmpRepo {
@@ -1387,6 +1565,7 @@ deny = [\"layering\", \"cycles\"]
             cmd,
             Cmd::Diff {
                 base: "main".to_string(),
+                baseline: None,
                 show: false,
                 full: true,
                 scope: vec!["src/a/**".to_string(), "src/b/**".to_string()],
@@ -1514,6 +1693,7 @@ deny = [\"layering\", \"cycles\"]
             cmd,
             Cmd::Diff {
                 base: "main".to_string(),
+                baseline: None,
                 show: false,
                 full: false,
                 scope: Vec::new(),
@@ -1529,6 +1709,7 @@ deny = [\"layering\", \"cycles\"]
         let joined = parse_args(&["diff".into(), "--base=dev".into()]).unwrap();
         let want = Cmd::Diff {
             base: "dev".to_string(),
+            baseline: None,
             show: false,
             full: false,
             scope: Vec::new(),
@@ -1546,6 +1727,7 @@ deny = [\"layering\", \"cycles\"]
             cmd,
             Cmd::Diff {
                 base: "main".to_string(),
+                baseline: None,
                 show: true,
                 full: false,
                 scope: Vec::new(),
@@ -1689,6 +1871,7 @@ trailing noise
             cmd,
             Cmd::Diff {
                 base: "main".to_string(),
+                baseline: None,
                 show: false,
                 full: false,
                 scope: Vec::new(),
