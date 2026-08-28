@@ -6,8 +6,9 @@
 //! `sweep` subcommand wires them to a real corpus repo; it clones and extracts, so it is never
 //! exercised by tests (no network in tests).
 //!
-//! Edge precision/recall is deliberately NOT computed: the extractor emits no edges yet (the
-//! use-path resolver, backlog bb67bbb, is unfinished), so any edge P/R number would be fabricated.
+//! Edge precision/recall is deliberately NOT computed: csd emits module Uses edges, but there is no
+//! resolved-graph oracle (cargo-modules or rustdoc JSON) wired in to score them against, so any edge
+//! P/R number would be unfounded.
 
 mod corpus;
 mod materialize;
@@ -302,7 +303,7 @@ fn render_markdown(input: RenderInput) -> String {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "- Edge precision/recall is PENDING and not reported: the extractor emits no edges yet, awaiting the use-path resolver (backlog bb67bbb). Any edge P/R here would be fabricated."
+        "- Edge precision/recall is not scored: csd now emits module Uses edges (see edge+ / edge- below), but there is no resolved-graph oracle (cargo-modules or rustdoc JSON) wired in to score them against, so any edge P/R number would be unfounded."
     );
     let _ = writeln!(
         out,
@@ -529,7 +530,7 @@ mod tests {
         });
         assert!(out.contains("sweep report: demo"));
         assert!(out.contains("Pairs analyzed: 5"));
-        assert!(out.contains("Edge precision/recall is PENDING"));
+        assert!(out.contains("Edge precision/recall is not scored"));
         assert!(out.contains("Git `.rs` file renames across all pairs: 4"));
         assert!(out.contains("Reconciled to a module Moved/Modified by csd: 2"));
         // The off row must carry the baseline counts in the right columns.
