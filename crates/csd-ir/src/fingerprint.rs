@@ -17,6 +17,7 @@ use std::hash::{Hash, Hasher};
 /// Deliberately excludes the node's own name so a rename does not change it. It is built by the
 /// extractor (backlog `extract`) and consumed by the differ (backlog `diff`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Fingerprint {
     /// Member and method names declared on the node (fields, variants, trait items).
     pub members: BTreeSet<String>,

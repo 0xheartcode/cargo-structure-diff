@@ -23,6 +23,8 @@ csd-lint = { path = "crates/csd-lint", version = "0.0.0" }
 # third-party, pinned at the workspace so every crate agrees
 anyhow = "1"
 thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.release]
 lto = "thin"
