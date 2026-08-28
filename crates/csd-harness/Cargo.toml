@@ -14,7 +14,8 @@ name = "csd-harness"
 path = "src/main.rs"
 
 [dependencies]
-csd-ir = { workspace = true }
+csd-ir = { workspace = true, features = ["serde"] }
 csd-diff = { workspace = true }
 csd-extract-rs = { workspace = true }
 anyhow = { workspace = true }
+serde_json = { workspace = true }
