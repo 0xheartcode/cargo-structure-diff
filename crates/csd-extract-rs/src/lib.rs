@@ -1758,7 +1758,8 @@ fn variant_from_pattern(match_pattern: TsNode, enum_name: &str, src: &[u8]) -> O
 }
 
 /// The to-variant(s) produced by a match arm: a direct variant expression, a `*self`/`self.field`
-/// assignment, or a returned variant. Bounded to the arm value and its direct statements.
+/// assignment, a returned variant, or a variant wrapped in an `Ok(..)`/`Some(..)` step result.
+/// Bounded to the arm value and its direct statements.
 fn arm_to_variants(value: TsNode, enum_name: &str, src: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     collect_tos(value, enum_name, src, &mut out);
@@ -1780,9 +1781,7 @@ fn collect_tos(node: TsNode, enum_name: &str, src: &[u8], out: &mut Vec<String>)
         }
         "return_expression" => {
             if let Some(inner) = node.named_child(0) {
-                if let Some(v) = variant_of_expr(inner, enum_name, src) {
-                    out.push(v);
-                }
+                out.extend(to_variants_of_expr(inner, enum_name, src));
             }
         }
         "assignment_expression" => {
@@ -1791,20 +1790,45 @@ fn collect_tos(node: TsNode, enum_name: &str, src: &[u8], out: &mut Vec<String>)
                 .map(is_self_target)
                 .unwrap_or(false);
             if self_target {
-                if let Some(v) = node
-                    .child_by_field_name("right")
-                    .and_then(|r| variant_of_expr(r, enum_name, src))
-                {
-                    out.push(v);
+                if let Some(right) = node.child_by_field_name("right") {
+                    out.extend(to_variants_of_expr(right, enum_name, src));
                 }
             }
         }
-        _ => {
-            if let Some(v) = variant_of_expr(node, enum_name, src) {
-                out.push(v);
+        _ => out.extend(to_variants_of_expr(node, enum_name, src)),
+    }
+}
+
+/// Idiomatic wrapper constructors whose sole argument carries the real to-state in a `-> Result<_>`
+/// / `-> Option<_>` step (`Ok(State::B)`, `Some(State::B)`). Only these are unwrapped, so a plain
+/// call argument (`self.notify(State::B)`) is never mistaken for a transition.
+const TO_WRAPPERS: [&str; 2] = ["Ok", "Some"];
+
+/// The variant name(s) a to-position expression evaluates to. A direct variant is read by
+/// [`variant_of_expr`]; additionally, an idiomatic `Ok(..)`/`Some(..)` wrapper is unwrapped to its
+/// argument(s) so a `-> Result<State>` / `-> Option<State>` step is recovered. Additive on purpose:
+/// the direct reading is always kept, so no previously detected transition is lost, and the
+/// membership check in [`finish`] drops any non-variant name (`Ok`/`Some` themselves, plain args).
+fn to_variants_of_expr(node: TsNode, enum_name: &str, src: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(v) = variant_of_expr(node, enum_name, src) {
+        out.push(v);
+    }
+    if node.kind() == "call_expression" {
+        let is_wrapper = node
+            .child_by_field_name("function")
+            .map(|f| f.kind() == "identifier" && TO_WRAPPERS.contains(&text(f, src).as_str()))
+            .unwrap_or(false);
+        if is_wrapper {
+            if let Some(args) = child_kind(node, "arguments") {
+                let mut cursor = args.walk();
+                for arg in args.named_children(&mut cursor) {
+                    out.extend(to_variants_of_expr(arg, enum_name, src));
+                }
             }
         }
     }
+    out
 }
 
 /// Whether `left` is a `*self` or `self.field` assignment target.
