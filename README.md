@@ -47,6 +47,15 @@ csd diff --baseline structure.json
 
 # Doc: a whole-codebase Markdown structure report (one diagram per view, no delta).
 csd doc -o STRUCTURE.md
+
+# Files: a per-file index of what each source file defines, with type members and fn signatures.
+csd files
+
+# Init: scaffold a .csd.toml pre-filled with this repo's real crate globs.
+csd init
+
+# Version: prints the build's commit, for example csd 0.0.0 (a678f58 2026-08-28T12:19:01Z).
+csd --version
 ```
 
 Views are selected in `.csd.toml` (`[views] enabled`); formats are `mermaid`, `dot`, `ascii`,
