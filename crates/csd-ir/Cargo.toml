@@ -11,4 +11,13 @@ authors.workspace = true
 [lints.rust]
 missing_docs = "warn"
 
+[features]
+# Opt-in serialization of the IR types, used by the snapshot artifact and the SHA-keyed IR cache.
+# Kept off by default so the extractor and differ do not pay for serde they do not use.
+serde = ["dep:serde"]
+
 [dependencies]
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
