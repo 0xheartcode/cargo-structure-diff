@@ -579,6 +579,204 @@ fn self_field_assignment_reads_rhs_variant() {
     assert_eq!(transitions(&g), want);
 }
 
+// ---------------------------------------------------------------------------------------------
+// SPEC 3.4 idiom coverage: one focused fixture per common state-machine transition idiom. Idioms
+// 1-3 are already handled by the extractor, so their tests document the honest behavior; idiom 4
+// (wrapped `Ok(..)`/`Some(..)` step results) is newly recovered by `to_variants_of_expr`.
+// ---------------------------------------------------------------------------------------------
+
+/// Idiom 1: a match arm whose value *is* the next variant (`A => Enum::B`).
+#[test]
+fn idiom1_match_arm_returns_variant() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/lib.rs",
+        r#"
+pub enum Gate { Shut, Ajar }
+
+impl Gate {
+    pub fn toggle(self) -> Gate {
+        match self {
+            Gate::Shut => Gate::Ajar,
+            Gate::Ajar => Gate::Shut,
+        }
+    }
+}
+"#,
+    );
+    let g = extract(root).unwrap();
+    assert_eq!(
+        transitions(&g),
+        vec![
+            (
+                "crate::Gate::Ajar".to_string(),
+                "crate::Gate::Shut".to_string()
+            ),
+            (
+                "crate::Gate::Shut".to_string(),
+                "crate::Gate::Ajar".to_string()
+            ),
+        ]
+    );
+}
+
+/// Idiom 2: reassignment through a deref of self (`*self = Enum::B`), both in a block arm and as a
+/// bare arm value.
+#[test]
+fn idiom2_deref_self_assignment() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/lib.rs",
+        r#"
+pub enum Motor { Idle, Spinning, Braking }
+
+impl Motor {
+    pub fn tick(&mut self) {
+        match self {
+            Motor::Idle => { *self = Motor::Spinning; }
+            Motor::Spinning => *self = Self::Braking,
+            Motor::Braking => {}
+        }
+    }
+}
+"#,
+    );
+    let g = extract(root).unwrap();
+    assert_eq!(
+        transitions(&g),
+        vec![
+            (
+                "crate::Motor::Idle".to_string(),
+                "crate::Motor::Spinning".to_string()
+            ),
+            (
+                "crate::Motor::Spinning".to_string(),
+                "crate::Motor::Braking".to_string()
+            ),
+        ]
+    );
+}
+
+/// Idiom 3: assignment to a state field (`self.state = Enum::B`). Documented by the existing
+/// `self_field_assignment_reads_rhs_variant`; this focused case pins the same behavior.
+#[test]
+fn idiom3_self_field_assignment() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/lib.rs",
+        r#"
+pub enum Phase { Boot, Ready }
+
+impl Phase {
+    pub fn advance(&mut self) {
+        match self {
+            Phase::Boot => self.state = Phase::Ready,
+            _ => {}
+        }
+    }
+}
+"#,
+    );
+    let g = extract(root).unwrap();
+    assert_eq!(
+        transitions(&g),
+        vec![(
+            "crate::Phase::Boot".to_string(),
+            "crate::Phase::Ready".to_string()
+        )]
+    );
+}
+
+/// Idiom 4: `fn step(self) -> Result<State> { .. }` / `-> Option<State>` wrapped-return forms. The
+/// to-state is carried inside an `Ok(..)`/`Some(..)`, both as a tail arm value and behind an explicit
+/// `return`. Newly recovered by `to_variants_of_expr`; the plain `-> Self` return form was already
+/// covered by `to_expr_constructor_forms_are_detected`.
+#[test]
+fn idiom4_result_and_option_wrapped_return() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/lib.rs",
+        r#"
+pub enum Task { Idle, Running, Done }
+
+impl Task {
+    pub fn step(self) -> Result<Task, ()> {
+        match self {
+            Task::Idle => Ok(Task::Running),
+            Task::Running => return Ok(Self::Done),
+            Task::Done => Ok(Task::Done), // self-loop: no edge
+        }
+    }
+
+    pub fn peek(self) -> Option<Task> {
+        match self {
+            Task::Idle => Some(Task::Done),
+            _ => None, // no variant argument: nothing to unwrap
+        }
+    }
+}
+"#,
+    );
+    let g = extract(root).unwrap();
+    assert_eq!(
+        transitions(&g),
+        vec![
+            (
+                "crate::Task::Idle".to_string(),
+                "crate::Task::Done".to_string()
+            ),
+            (
+                "crate::Task::Idle".to_string(),
+                "crate::Task::Running".to_string()
+            ),
+            (
+                "crate::Task::Running".to_string(),
+                "crate::Task::Done".to_string()
+            ),
+        ]
+    );
+}
+
+/// Precision guard for idiom 4: only `Ok(..)`/`Some(..)` are unwrapped. A variant passed to any
+/// other call (`self.notify(Enum::B)`, `emit(Enum::B)`) is an argument, not a to-state, so it must
+/// never be read as a transition.
+#[test]
+fn idiom4_wrapper_unwrap_does_not_leak_to_plain_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/lib.rs",
+        r#"
+pub enum Sig { A, B }
+
+impl Sig {
+    pub fn poke(&mut self) {
+        match self {
+            Sig::A => { self.notify(Sig::B); }
+            _ => {}
+        }
+    }
+
+    fn notify(&self, _s: Sig) {}
+}
+"#,
+    );
+    let g = extract(root).unwrap();
+    assert!(
+        transitions(&g).is_empty(),
+        "a variant passed to a non-wrapper call must not be a transition"
+    );
+}
+
 /// A crate exercising the type-view edges: a local trait realized by a local type, an external
 /// trait impl, an inherent impl, and struct fields of local, external, and wrapped-local types.
 fn type_view_fixture() -> Graph {
