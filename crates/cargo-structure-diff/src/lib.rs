@@ -272,7 +272,9 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
             list,
             format,
         }),
-        None => bail!("expected the `diff`, `trace`, or `doc` subcommand; try --help"),
+        None => bail!(
+            "expected one of the `diff`, `changelog`, `snapshot`, `trace`, or `doc` subcommands; try --help"
+        ),
     }
 }
 
