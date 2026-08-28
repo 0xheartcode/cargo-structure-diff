@@ -1,0 +1,41 @@
+name: Structure
+
+# Dogfood: run cargo-structure-diff on its own pull requests. Builds csd from the PR's own code,
+# diffs the branch against its base, comments the structural changelog, and fails on lint denials.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  structure:
+    name: structure gate (self)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build csd
+        run: cargo build --release --bin csd
+
+      - name: Fetch base branch
+        run: git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+
+      - name: Structure gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CSD_BIN: ${{ github.workspace }}/target/release/csd
+        run: scripts/csd-structure-gate.sh "origin/${{ github.base_ref }}"
