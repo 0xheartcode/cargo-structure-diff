@@ -13,14 +13,24 @@ fn main() {
     println!("cargo:rerun-if-changed=../../.git/refs");
 
     let sha = git(&["rev-parse", "--short", "HEAD"]);
-    let date = git(&["show", "-s", "--format=%cs", "HEAD"]);
+    // The commit time as a UTC ISO 8601 instant (for example 2026-08-28T12:19:01Z). It is the
+    // commit's own timestamp, not the wall-clock build time, so it stays deterministic per commit.
+    let date = git(&[
+        "show",
+        "-s",
+        "--format=%cd",
+        "--date=format-local:%Y-%m-%dT%H:%M:%SZ",
+        "HEAD",
+    ]);
     println!("cargo:rustc-env=CSD_GIT_SHA={sha}");
     println!("cargo:rustc-env=CSD_GIT_DATE={date}");
 }
 
-/// Run git and return trimmed stdout, or an empty string on any failure.
+/// Run git and return trimmed stdout, or an empty string on any failure. `TZ=UTC0` so a
+/// `format-local` date renders in UTC regardless of the builder's timezone.
 fn git(args: &[&str]) -> String {
     Command::new("git")
+        .env("TZ", "UTC0")
         .args(args)
         .output()
         .ok()

@@ -309,8 +309,8 @@ fn parse_format(value: &str) -> Result<Format> {
 }
 
 /// The version line: the package version plus the build's git commit and its (deterministic) commit
-/// date when available, for example `csd 0.0.0 (a678f58 2026-08-28)`. Falls back to the bare version
-/// when the crate was built without a git checkout (a crates.io tarball).
+/// timestamp when available, for example `csd 0.0.0 (a678f58 2026-08-28T12:19:01Z)`. Falls back to
+/// the bare version when the crate was built without a git checkout (a crates.io tarball).
 fn version_string() -> String {
     let version = env!("CARGO_PKG_VERSION");
     let sha = env!("CSD_GIT_SHA");
