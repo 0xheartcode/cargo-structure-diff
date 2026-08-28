@@ -33,6 +33,7 @@ cargo-structure-diff: structural diff and architectural lint gate
 
 USAGE:
     csd diff [--base <ref>] [--show] [--full] [--list] [--scope <glob>]... [--format <fmt>]
+    csd changelog [--base <ref>]
     csd trace [--base <ref>] [--cmd <shell command>]
     csd doc [-o <file>|--out <file>]
     cargo structure-diff diff [--base <ref>] [--show]
@@ -56,6 +57,11 @@ observed traces as a set. It exits 0 (2 only if the command fails to run).
 doc mode is observational: it extracts the current working tree and emits a
 self-contained Markdown structure report (one Mermaid diagram per enabled view,
 plus a module index). No base, no delta. It exits 0 on success, 2 on error.
+
+changelog mode is observational: it diffs the working tree against <ref> and
+emits a grouped Markdown changelog (added, removed, modified, and moved items per
+module, then dependency edges). It is the textual companion to the diagram, for a
+PR body or release note. No gate. It exits 0 on success, 2 on error.
 ";
 
 /// A parsed invocation.
@@ -89,6 +95,11 @@ pub enum Cmd {
     Doc {
         /// Output file; `None` writes to stdout.
         out: Option<String>,
+    },
+    /// Emit a grouped Markdown changelog of the base-to-head delta (no gate, no diagram).
+    Changelog {
+        /// The git ref to treat as the base side.
+        base: String,
     },
 }
 
@@ -179,7 +190,7 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
             "--show" => show = true,
             "--full" => full = true,
             "--list" => list = true,
-            "diff" | "trace" | "doc" if sub.is_none() => sub = Some(arg),
+            "diff" | "trace" | "doc" | "changelog" if sub.is_none() => sub = Some(arg),
             "-o" | "--out" => {
                 i += 1;
                 let value = args.get(i).context("--out requires a value")?;
@@ -227,6 +238,7 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
     match sub {
         Some("trace") => Ok(Cmd::Trace { base, cmd }),
         Some("doc") => Ok(Cmd::Doc { out }),
+        Some("changelog") => Ok(Cmd::Changelog { base }),
         Some(_) => Ok(Cmd::Diff {
             base,
             show,
@@ -296,6 +308,13 @@ pub fn run(args: &[String]) -> i32 {
             }
         },
         Cmd::Doc { out } => match run_doc(out.as_deref()) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                2
+            }
+        },
+        Cmd::Changelog { base } => match run_changelog(&base) {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("error: {e:#}");
@@ -406,6 +425,154 @@ fn edge_kind_name(kind: EdgeKind) -> &'static str {
         EdgeKind::Transitions => "transitions",
         EdgeKind::ForeignKey => "foreignkey",
     }
+}
+
+/// The last `::`-separated segment of an id: the item's short, human-facing name.
+fn short_name(id: &StableId) -> &str {
+    id.as_str()
+        .rsplit("::")
+        .next()
+        .unwrap_or_else(|| id.as_str())
+}
+
+/// The owning module of an id: everything up to the last `::` segment, or `(crate root)` when the
+/// id has no separator.
+fn owning_module(id: &StableId) -> String {
+    match id.as_str().rsplit_once("::") {
+        Some((parent, _)) => parent.to_string(),
+        None => "(crate root)".to_string(),
+    }
+}
+
+/// Node-change buckets for one owning module, in changelog section order.
+#[derive(Default)]
+struct ChangelogGroup {
+    added: Vec<String>,
+    removed: Vec<String>,
+    modified: Vec<String>,
+    moved: Vec<String>,
+}
+
+/// Render the delta as a grouped, human-facing Markdown changelog.
+///
+/// Node changes are grouped by owning module and split into Added, Removed, Modified, and Moved;
+/// edge changes are collected into a trailing Dependencies section. This is the textual companion
+/// to the rendered diagram: what changed, in prose, for a PR body or release note. Unlike the
+/// mechanical `--list`, it is grouped and titled. Pure and deterministic: groups are a `BTreeMap`
+/// and within a group the input order (the differ's stable sort) is preserved.
+pub fn changelog_markdown(base: &str, changes: &[Change]) -> String {
+    use std::collections::BTreeMap;
+
+    let mut groups: BTreeMap<String, ChangelogGroup> = BTreeMap::new();
+    let mut edges: Vec<String> = Vec::new();
+
+    for change in changes {
+        match change {
+            Change::Added(n) => {
+                groups
+                    .entry(owning_module(&n.id))
+                    .or_default()
+                    .added
+                    .push(format!(
+                        "{} `{}`",
+                        node_kind_name(n.kind),
+                        short_name(&n.id)
+                    ))
+            }
+            Change::Removed(n) => groups
+                .entry(owning_module(&n.id))
+                .or_default()
+                .removed
+                .push(format!(
+                    "{} `{}`",
+                    node_kind_name(n.kind),
+                    short_name(&n.id)
+                )),
+            Change::Modified { before, after } => {
+                let mut line =
+                    format!("{} `{}`", node_kind_name(after.kind), short_name(&after.id));
+                if let Some(detail) = member_detail(before, after) {
+                    line.push(' ');
+                    line.push_str(&detail);
+                }
+                groups
+                    .entry(owning_module(&after.id))
+                    .or_default()
+                    .modified
+                    .push(line);
+            }
+            Change::Moved { node, from, to } => groups
+                .entry(to.as_str().to_string())
+                .or_default()
+                .moved
+                .push(format!("`{}` from `{}`", short_name(node), from.as_str())),
+            Change::EdgeAdded(e) => edges.push(format!(
+                "+ `{}` -> `{}` ({})",
+                e.from.as_str(),
+                e.to.as_str(),
+                edge_kind_name(e.kind)
+            )),
+            Change::EdgeRemoved(e) => edges.push(format!(
+                "- `{}` -> `{}` ({})",
+                e.from.as_str(),
+                e.to.as_str(),
+                edge_kind_name(e.kind)
+            )),
+        }
+    }
+
+    let mut out = String::new();
+    let _ = writeln!(out, "# Structure changelog vs {base}");
+    let _ = writeln!(out);
+    if groups.is_empty() && edges.is_empty() {
+        let _ = writeln!(out, "No structural changes.");
+        return out;
+    }
+    for (module, g) in &groups {
+        let _ = writeln!(out, "## {module}");
+        let _ = writeln!(out);
+        changelog_section(&mut out, "Added", &g.added);
+        changelog_section(&mut out, "Removed", &g.removed);
+        changelog_section(&mut out, "Modified", &g.modified);
+        changelog_section(&mut out, "Moved here", &g.moved);
+    }
+    if !edges.is_empty() {
+        let _ = writeln!(out, "## Dependencies");
+        let _ = writeln!(out);
+        for e in &edges {
+            let _ = writeln!(out, "- {e}");
+        }
+        let _ = writeln!(out);
+    }
+    out
+}
+
+/// Write one titled bullet section, or nothing when `lines` is empty.
+fn changelog_section(out: &mut String, title: &str, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "### {title}");
+    for l in lines {
+        let _ = writeln!(out, "- {l}");
+    }
+    let _ = writeln!(out);
+}
+
+/// Diff the working tree against `base` and print the grouped Markdown changelog. Observational:
+/// no gate, no diagram, always exits 0 on success.
+fn run_changelog(base: &str) -> Result<i32> {
+    let repo = repo_root()?;
+    let config = load_config(&repo)?;
+    let opts = RenderOpts {
+        full: false,
+        scope: Vec::new(),
+        entry: None,
+        format: Format::default(),
+    };
+    let report = analyze(&repo, base, &config, &opts)?;
+    print!("{}", changelog_markdown(base, &report.changes));
+    Ok(0)
 }
 
 /// Default views for `csd doc` when `views.enabled` is empty: every view csd knows.
@@ -1619,5 +1786,57 @@ trailing noise
         emit_doc(&doc, Some(&out.to_string_lossy())).unwrap();
         let written = std::fs::read_to_string(&out).unwrap();
         assert_eq!(written, doc, "the -o file holds the whole report");
+    }
+
+    fn cl_node(id: &str, kind: NodeKind) -> csd_ir::Node {
+        csd_ir::Node {
+            id: StableId::new(id),
+            kind,
+            span: csd_ir::SourceSpan {
+                file: "src/lib.rs".into(),
+                start: 0,
+                end: 1,
+            },
+            attrs: std::collections::BTreeMap::new(),
+            fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn changelog_groups_by_module_and_titles_sections() {
+        let changes = vec![
+            Change::Added(cl_node("crate::billing::Invoice", NodeKind::Struct)),
+            Change::Removed(cl_node("crate::billing::legacy_charge", NodeKind::Fn)),
+            Change::Added(cl_node("crate::payments::Card", NodeKind::Struct)),
+            Change::EdgeAdded(csd_ir::Edge {
+                from: StableId::new("crate::billing"),
+                to: StableId::new("crate::payments"),
+                kind: EdgeKind::Uses,
+                span: cl_node("x", NodeKind::Module).span,
+                ordinal: None,
+            }),
+        ];
+        let md = changelog_markdown("main", &changes);
+
+        assert!(md.starts_with("# Structure changelog vs main\n"));
+        // Modules are grouped and alphabetised by the BTreeMap.
+        let billing = md.find("## crate::billing").expect("billing section");
+        let payments = md.find("## crate::payments").expect("payments section");
+        let deps = md.find("## Dependencies").expect("dependencies section");
+        assert!(billing < payments, "modules sort alphabetically");
+        assert!(payments < deps, "dependencies come last");
+        // Short names, not full paths, under the owning module.
+        assert!(md.contains("### Added\n- struct `Invoice`"));
+        assert!(md.contains("### Removed\n- fn `legacy_charge`"));
+        assert!(md.contains("- + `crate::billing` -> `crate::payments` (uses)"));
+    }
+
+    #[test]
+    fn changelog_reports_nothing_on_an_empty_delta() {
+        let md = changelog_markdown("dev", &[]);
+        assert_eq!(
+            md,
+            "# Structure changelog vs dev\n\nNo structural changes.\n"
+        );
     }
 }
