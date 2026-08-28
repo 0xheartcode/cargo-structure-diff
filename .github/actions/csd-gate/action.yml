@@ -1,0 +1,55 @@
+name: cargo-structure-diff gate
+description: >-
+  Diff a pull request against its base with cargo-structure-diff, post the structural changelog as a
+  sticky comment, and fail the check on architectural lint denials.
+
+inputs:
+  base:
+    description: Base ref to diff against. Defaults to origin/<the PR base branch>.
+    required: false
+    default: ""
+  ref:
+    description: Git ref of cargo-structure-diff to install the csd binary from.
+    required: false
+    default: main
+  comment:
+    description: Post the changelog as a sticky PR comment.
+    required: false
+    default: "true"
+  token:
+    description: Token used to read and post the PR comment.
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install csd
+      shell: bash
+      run: >-
+        cargo install --git https://github.com/0xheartcode/cargo-structure-diff
+        --rev "${{ inputs.ref }}" --bin csd --locked
+        || cargo install --git https://github.com/0xheartcode/cargo-structure-diff
+        --rev "${{ inputs.ref }}" --bin csd
+
+    - name: Resolve base ref
+      id: base
+      shell: bash
+      run: |
+        base="${{ inputs.base }}"
+        if [ -z "$base" ]; then
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}" || true
+          base="origin/${{ github.base_ref }}"
+        fi
+        echo "ref=$base" >> "$GITHUB_OUTPUT"
+
+    - name: Structure gate
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        CSD_COMMENT: ${{ inputs.comment }}
+      run: >-
+        "${{ github.action_path }}/../../../scripts/csd-structure-gate.sh"
+        "${{ steps.base.outputs.ref }}"
