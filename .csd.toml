@@ -1,25 +1,29 @@
-# cargo-structure-diff configuration (example; not yet consumed at v0.0.0)
+# cargo-structure-diff, configured to gate its own architecture.
 # See SPEC.md section 7 for the full schema.
 
 [layers]
-# declared architectural strata, top (allowed to depend down) to bottom
-order = ["api", "domain", "ports", "infra"]
-# modules are mapped to a layer by path glob (first match wins)
+# Two strata, top (may depend downward) to bottom. csd-ir is the shared contract every other
+# crate projects against; nothing it declares may depend back up on a sibling crate. First
+# matching glob wins, so the csd-ir mapping must precede the catch-all.
+order = ["app", "contract"]
 map = [
-    { layer = "api",    glob = "crates/*/src/api/**" },
-    { layer = "domain", glob = "crates/*/src/domain/**" },
-    { layer = "ports",  glob = "crates/*/src/ports/**" },
-    { layer = "infra",  glob = "crates/*/src/infra/**" },
+    { layer = "contract", glob = "crates/csd-ir/**" },
+    { layer = "app",      glob = "crates/**" },
 ]
-forbid = [{ from = "domain", to = "infra" }]
+# The contract must not depend on the application crates above it. This is currently satisfied
+# (csd-ir depends only on serde), so the gate is green; a future csd-ir -> sibling edge fails it.
+forbid = [{ from = "contract", to = "app" }]
 
 [views]
-enabled = ["modules", "states"]
+# The module view is the gate's error message: small and legible, and where layering shows.
+# Other views (overview, types, states, calls, schema) are available via csd doc or by listing
+# them here.
+enabled = ["modules"]
 
 [lint]
-deny = ["layering", "cycles", "unreachable_state"]
+deny = ["layering", "cycles"]
 warn = ["fan_in", "fan_out"]
 
-# default CI behaviour: fail only on violations NEW since the base ref
+# Default CI behaviour: fail only on violations new since the base ref.
 [ratchet]
 mode = "new-only"
