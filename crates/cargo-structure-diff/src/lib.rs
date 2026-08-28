@@ -807,7 +807,7 @@ pub fn files_markdown(head: &Graph) -> String {
         match n.kind {
             NodeKind::Module => items.modules.push(format!("`{}`", short_name(&n.id))),
             NodeKind::Struct | NodeKind::Enum | NodeKind::Trait => items.types.push(type_line(n)),
-            NodeKind::Fn => items.functions.push(format!("`{}`", short_name(&n.id))),
+            NodeKind::Fn => items.functions.push(fn_line(n)),
             // Variants render under their enum's members; tables belong to the schema view.
             NodeKind::Variant | NodeKind::Table => {}
         }
@@ -842,6 +842,15 @@ pub fn files_markdown(head: &Graph) -> String {
         changelog_section(&mut out, "Implements", &items.implements);
     }
     out
+}
+
+/// One line for a function node: its name with the captured signature (`foo(a: u32) -> bool`) when
+/// the extractor recorded one, else just the name.
+fn fn_line(n: &csd_ir::Node) -> String {
+    match n.attrs.get("sig") {
+        Some(sig) => format!("`{}{sig}`", short_name(&n.id)),
+        None => format!("`{}`", short_name(&n.id)),
+    }
 }
 
 /// One line for a type node: `struct `Name`` plus `{ field: Type, ... }` when member types are
@@ -2381,6 +2390,9 @@ trailing noise
         });
         let mut charge = cl_node("crate::billing::charge", NodeKind::Fn);
         charge.span.file = "src/billing.rs".into();
+        charge
+            .attrs
+            .insert("sig".into(), "(amount: Money) -> bool".into());
         graph.nodes = vec![order, charge];
         graph.normalize();
 
@@ -2390,7 +2402,10 @@ trailing noise
             md.contains("struct `Order` { id: u64, total: Money }"),
             "type line should carry member types:\n{md}"
         );
-        assert!(md.contains("### Functions\n- `charge`"));
+        assert!(
+            md.contains("### Functions\n- `charge(amount: Money) -> bool`"),
+            "function line should carry the captured signature:\n{md}"
+        );
     }
 
     #[test]
