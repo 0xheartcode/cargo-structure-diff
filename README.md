@@ -3,7 +3,9 @@
 > Extract structural graphs from a codebase, diff them across two git refs, render the delta as
 > one annotated diagram, and fail CI when a change violates a declared architectural constraint.
 
-**Status:** v0.0.0, pre-alpha. Scaffolding and backlog only. Nothing here does real work yet.
+**Status:** v0.0.0, pre-alpha and moving fast. The pipeline is real: extraction, diff with
+rename and move detection, six views, five output formats, architectural lints, a ratchet gate,
+and a PR-commenting CI action all work. Interfaces are not yet stable.
 
 ## What it is
 
@@ -26,6 +28,52 @@ Ships from one crate as two `[[bin]]` targets:
 > Note: the `csd` crate name and binary name already exist on crates.io (an unrelated
 > search-and-replace tool). We publish `cargo-structure-diff`; if the `csd` binary collides on a
 > user's PATH the reserved fallback is `strc`.
+
+## Usage
+
+```sh
+# Gate: diff the working tree against a base ref, render the delta, run the lints.
+# Exits non-zero on a denied architectural finding (the diagram is the error message).
+csd diff --base main
+csd diff --base main --show --format boxes   # also print the diagram, ASCII boxes
+csd diff --base main --list                  # one machine-readable line per change
+
+# Changelog: the grouped, human-facing companion to the diagram, for a PR body or release note.
+csd changelog --base main
+
+# Snapshot: pin the current structure as JSON, then gate later work against it without the old ref.
+csd snapshot -o structure.json
+csd diff --baseline structure.json
+
+# Doc: a whole-codebase Markdown structure report (one diagram per view, no delta).
+csd doc -o STRUCTURE.md
+```
+
+Views are selected in `.csd.toml` (`[views] enabled`); formats are `mermaid`, `dot`, `ascii`,
+`boxes`, and `svg`. The ratchet defaults to `new-only`, so CI fails on violations introduced by the
+change under review, not on pre-existing ones. See [`.csd.toml`](.csd.toml) and [`SPEC.md`](SPEC.md).
+
+## CI gate
+
+The composite action diffs a pull request against its base, posts the structural changelog as a
+single sticky comment, and fails the check on lint denials:
+
+```yaml
+# .github/workflows/structure.yml in a consumer repo
+on: pull_request
+permissions: { contents: read, pull-requests: write }
+jobs:
+  structure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: 0xheartcode/cargo-structure-diff/.github/actions/csd-gate@main
+```
+
+This repo dogfoods the same gate on its own pull requests via
+[`.github/workflows/structure.yml`](.github/workflows/structure.yml).
 
 ## Development
 
