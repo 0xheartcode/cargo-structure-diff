@@ -98,6 +98,10 @@ pub fn lint(head: &Graph, changes: &[Change], config: &Config) -> Vec<Finding> {
         findings.extend(destructive_migration(changes, sev));
     }
 
+    // Config sanity is advisory and unconditional: it does not depend on the deny/warn selection or
+    // the ratchet mode, and it always warns (never denies), so it can never fail the build.
+    findings.extend(config_layer_unused(head, config));
+
     findings.sort_by(|a, b| (&a.rule, &a.message).cmp(&(&b.rule, &b.message)));
     findings
 }
@@ -172,6 +176,38 @@ fn layering(
                     from_layer,
                     e.to.as_str(),
                     to_layer
+                ),
+            });
+        }
+    }
+    findings
+}
+
+/// config_sanity: warn when a declared architectural layer matches no module in the head graph. A
+/// layer whose glob matches nothing is almost always a misconfiguration, and a silently-dead
+/// constraint gives false confidence because the gate it guards can never fire. The rule is purely
+/// advisory: it always warns, never denies, so it does not affect [`has_denials`], and it is
+/// independent of both the deny/warn selection and the ratchet mode (it is about the config, not the
+/// delta). It runs only when `layers.order` is non-empty, since an empty layers section is a valid
+/// minimal config rather than a misconfig. Findings are emitted in `layers.order` order.
+fn config_layer_unused(head: &Graph, config: &Config) -> Vec<Finding> {
+    if config.layers.order.is_empty() {
+        return Vec::new();
+    }
+    let matched: BTreeSet<&str> = head
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Module)
+        .filter_map(|n| config.layer_of(n.span.file.as_str()))
+        .collect();
+    let mut findings = Vec::new();
+    for layer in &config.layers.order {
+        if !matched.contains(layer.as_str()) {
+            findings.push(Finding {
+                rule: "config_sanity".to_string(),
+                severity: Severity::Warn,
+                message: format!(
+                    "layer {layer:?} is declared but matches no module; check its glob in .csd.toml"
                 ),
             });
         }
@@ -978,6 +1014,85 @@ deny = ["layering", "cycles"]
         assert!(lint(&head, &[], &cfg("")).is_empty());
     }
 
+    // A layer ("ghost") whose glob matches no plausible module path.
+    const LAYERS_UNUSED: &str = r#"
+[layers]
+order = ["app", "infra", "ghost"]
+map = [
+    { layer = "app",   glob = "src/app/**" },
+    { layer = "infra", glob = "src/infra/**" },
+    { layer = "ghost", glob = "src/ghost/**" },
+]
+
+[lint]
+deny = ["layering", "cycles"]
+"#;
+
+    #[test]
+    fn matched_layers_produce_no_config_sanity_finding() {
+        // Both declared layers (app, infra) match a real module, so nothing is unused.
+        let head = Graph {
+            nodes: vec![
+                module("crate::app", "src/app/mod.rs"),
+                module("crate::infra", "src/infra/mod.rs"),
+            ],
+            edges: vec![],
+        };
+        let f = lint(&head, &[], &cfg(LAYERS));
+        assert!(
+            f.iter().all(|f| f.rule != "config_sanity"),
+            "no layer is unused: {f:?}"
+        );
+    }
+
+    #[test]
+    fn unused_layer_produces_one_warn_config_sanity_finding() {
+        // app and infra match; ghost matches nothing.
+        let head = Graph {
+            nodes: vec![
+                module("crate::app", "src/app/mod.rs"),
+                module("crate::infra", "src/infra/mod.rs"),
+            ],
+            edges: vec![],
+        };
+        let f = lint(&head, &[], &cfg(LAYERS_UNUSED));
+        let cs: Vec<_> = f.iter().filter(|f| f.rule == "config_sanity").collect();
+        assert_eq!(
+            cs.len(),
+            1,
+            "expected exactly one config_sanity finding: {f:?}"
+        );
+        assert_eq!(cs[0].severity, Severity::Warn);
+        assert_eq!(
+            cs[0].message,
+            "layer \"ghost\" is declared but matches no module; check its glob in .csd.toml"
+        );
+    }
+
+    #[test]
+    fn unused_layer_finding_does_not_deny() {
+        let head = Graph {
+            nodes: vec![module("crate::app", "src/app/mod.rs")],
+            edges: vec![],
+        };
+        let f = lint(&head, &[], &cfg(LAYERS_UNUSED));
+        // Both infra and ghost are unused here, but every config_sanity finding only warns.
+        assert!(f.iter().any(|f| f.rule == "config_sanity"));
+        assert!(!has_denials(&f), "config_sanity must never deny: {f:?}");
+    }
+
+    #[test]
+    fn config_sanity_silent_without_declared_layers() {
+        // An empty layers section is a valid minimal config, not a misconfig.
+        let head = Graph {
+            nodes: vec![module("crate::app", "src/app/mod.rs")],
+            edges: vec![],
+        };
+        assert!(lint(&head, &[], &cfg(""))
+            .iter()
+            .all(|f| f.rule != "config_sanity"));
+    }
+
     fn calls(from: &str, to: &str) -> Edge {
         Edge {
             from: StableId::new(from),
@@ -1138,8 +1253,9 @@ mode = "all"
             ],
             edges: vec![uses("crate::app", "crate::infra")],
         };
-        let toml =
-            "[layers]\norder = [\"app\",\"infra\"]\nforbid = [{from=\"app\",to=\"infra\"}]\n";
+        // Both layers are mapped to the real modules, so config_sanity stays silent too and the
+        // only thing under test is that the unselected layering rule does not fire.
+        let toml = "[layers]\norder = [\"app\",\"infra\"]\nmap = [{layer=\"app\",glob=\"src/app/**\"},{layer=\"infra\",glob=\"src/infra/**\"}]\nforbid = [{from=\"app\",to=\"infra\"}]\n";
         let changes = vec![Change::EdgeAdded(uses("crate::app", "crate::infra"))];
         assert!(lint(&head, &changes, &cfg(toml)).is_empty());
     }
