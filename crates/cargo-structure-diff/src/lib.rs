@@ -35,6 +35,7 @@ USAGE:
     csd diff [--base <ref>|--baseline <file>] [--show] [--full] [--list] [--scope <glob>]... [--format <fmt>]
     csd snapshot [-o <file>|--out <file>]
     csd changelog [--base <ref>]
+    csd files [-o <file>|--out <file>]
     csd trace [--base <ref>] [--cmd <shell command>]
     csd doc [-o <file>|--out <file>]
     cargo structure-diff diff [--base <ref>] [--show]
@@ -70,6 +71,11 @@ snapshot mode writes the current working tree as a JSON structure graph: a pinne
 baseline. Commit it at a release, then gate later work with `csd diff --baseline
 <file>` to assert against that structure without checking out the old ref. It
 exits 0 on success, 2 on error.
+
+files mode is observational: it prints a per-file structural index of the working
+tree, listing for each source file the modules, types (with their members), and
+functions it defines, plus the trait realizations declared in it. No base, no
+delta. It exits 0 on success, 2 on error.
 ";
 
 /// A parsed invocation.
@@ -117,6 +123,11 @@ pub enum Cmd {
     Changelog {
         /// The git ref to treat as the base side.
         base: String,
+    },
+    /// Emit a per-file structural index of the working tree (no delta, no diagram).
+    Files {
+        /// Output file; `None` writes to stdout.
+        out: Option<String>,
     },
 }
 
@@ -209,7 +220,9 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
             "--show" => show = true,
             "--full" => full = true,
             "--list" => list = true,
-            "diff" | "trace" | "doc" | "changelog" | "snapshot" if sub.is_none() => sub = Some(arg),
+            "diff" | "trace" | "doc" | "changelog" | "snapshot" | "files" if sub.is_none() => {
+                sub = Some(arg)
+            }
             "--baseline" => {
                 i += 1;
                 let value = args.get(i).context("--baseline requires a value")?;
@@ -266,6 +279,7 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
         Some("trace") => Ok(Cmd::Trace { base, cmd }),
         Some("doc") => Ok(Cmd::Doc { out }),
         Some("snapshot") => Ok(Cmd::Snapshot { out }),
+        Some("files") => Ok(Cmd::Files { out }),
         Some("changelog") => Ok(Cmd::Changelog { base }),
         Some(_) => Ok(Cmd::Diff {
             base,
@@ -351,6 +365,13 @@ pub fn run(args: &[String]) -> i32 {
             }
         }
         Cmd::Snapshot { out } => match run_snapshot(out.as_deref()) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                2
+            }
+        },
+        Cmd::Files { out } => match run_files(out.as_deref()) {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("error: {e:#}");
@@ -659,6 +680,103 @@ pub fn changelog_markdown(base: &str, changes: &[Change]) -> String {
         let _ = writeln!(out);
     }
     out
+}
+
+/// Extract the working tree and print (or write) a per-file structural index. Observational: no
+/// gate, no diagram, always exits 0 on success.
+fn run_files(out: Option<&str>) -> Result<i32> {
+    let repo = repo_root()?;
+    let head = extract_head(&repo)?;
+    emit_doc(&files_markdown(&head), out)?;
+    Ok(0)
+}
+
+/// The items one source file defines, in section order.
+#[derive(Default)]
+struct FileItems {
+    modules: Vec<String>,
+    types: Vec<String>,
+    functions: Vec<String>,
+    implements: Vec<String>,
+}
+
+/// Render a per-file structural index: for each source file, the modules, types (with their
+/// members and member types when known), and functions it defines, plus the trait realizations
+/// declared in it. Pure and deterministic: files and their nodes come from the normalized graph, so
+/// order is stable. This answers "what does this file define" without opening it.
+pub fn files_markdown(head: &Graph) -> String {
+    use std::collections::BTreeMap;
+
+    let mut by_file: BTreeMap<&str, FileItems> = BTreeMap::new();
+    for n in &head.nodes {
+        let items = by_file.entry(n.span.file.as_str()).or_default();
+        match n.kind {
+            NodeKind::Module => items.modules.push(format!("`{}`", short_name(&n.id))),
+            NodeKind::Struct | NodeKind::Enum | NodeKind::Trait => items.types.push(type_line(n)),
+            NodeKind::Fn => items.functions.push(format!("`{}`", short_name(&n.id))),
+            // Variants render under their enum's members; tables belong to the schema view.
+            NodeKind::Variant | NodeKind::Table => {}
+        }
+    }
+
+    // Attribute each trait realization to the file its subject node lives in.
+    let file_of: BTreeMap<&StableId, &str> = head
+        .nodes
+        .iter()
+        .map(|n| (&n.id, n.span.file.as_str()))
+        .collect();
+    for e in &head.edges {
+        if e.kind == EdgeKind::Implements {
+            if let Some(file) = file_of.get(&e.from) {
+                by_file.entry(file).or_default().implements.push(format!(
+                    "`{}` implements `{}`",
+                    short_name(&e.from),
+                    short_name(&e.to)
+                ));
+            }
+        }
+    }
+
+    let mut out = String::from("# File structure index\n\n");
+    out.push_str("Generated by `csd files`: what each source file defines.\n\n");
+    for (file, items) in &by_file {
+        let _ = writeln!(out, "## `{file}`");
+        let _ = writeln!(out);
+        changelog_section(&mut out, "Modules", &items.modules);
+        changelog_section(&mut out, "Types", &items.types);
+        changelog_section(&mut out, "Functions", &items.functions);
+        changelog_section(&mut out, "Implements", &items.implements);
+    }
+    out
+}
+
+/// One line for a type node: `struct `Name`` plus `{ field: Type, ... }` when member types are
+/// known, or a bare member list when only names are, or just the name when it has neither.
+fn type_line(n: &csd_ir::Node) -> String {
+    let kind = node_kind_name(n.kind);
+    let name = short_name(&n.id);
+    let Some(fp) = &n.fingerprint else {
+        return format!("{kind} `{name}`");
+    };
+    if !fp.member_types.is_empty() {
+        let members: Vec<String> = fp
+            .member_types
+            .iter()
+            .map(|(m, t)| {
+                if t.is_empty() {
+                    m.clone()
+                } else {
+                    format!("{m}: {t}")
+                }
+            })
+            .collect();
+        format!("{kind} `{name}` {{ {} }}", members.join(", "))
+    } else if !fp.members.is_empty() {
+        let members: Vec<&str> = fp.members.iter().map(String::as_str).collect();
+        format!("{kind} `{name}` {{ {} }}", members.join(", "))
+    } else {
+        format!("{kind} `{name}`")
+    }
 }
 
 /// Write one titled bullet section, or nothing when `lines` is empty.
@@ -2136,6 +2254,32 @@ trailing noise
             "no empty parent section:\n{md}"
         );
         assert!(md.contains("### Added\n- struct `Invoice`"));
+    }
+
+    #[test]
+    fn files_index_groups_definitions_by_file_with_member_types() {
+        let mut graph = Graph::new();
+        let mut order = cl_node("crate::billing::Order", NodeKind::Struct);
+        order.span.file = "src/billing.rs".into();
+        order.fingerprint = Some(csd_ir::Fingerprint {
+            member_types: [("id", "u64"), ("total", "Money")]
+                .iter()
+                .map(|(m, t)| (m.to_string(), t.to_string()))
+                .collect(),
+            ..Default::default()
+        });
+        let mut charge = cl_node("crate::billing::charge", NodeKind::Fn);
+        charge.span.file = "src/billing.rs".into();
+        graph.nodes = vec![order, charge];
+        graph.normalize();
+
+        let md = files_markdown(&graph);
+        assert!(md.contains("## `src/billing.rs`"));
+        assert!(
+            md.contains("struct `Order` { id: u64, total: Money }"),
+            "type line should carry member types:\n{md}"
+        );
+        assert!(md.contains("### Functions\n- `charge`"));
     }
 
     #[test]
