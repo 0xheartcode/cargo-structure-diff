@@ -24,6 +24,12 @@ use csd_render::{render, Format, RenderOpts, View};
 /// Default base ref when `--base` is omitted.
 const DEFAULT_BASE: &str = "main";
 
+/// Default head ref for `walk` when `--head` is omitted.
+const DEFAULT_HEAD: &str = "HEAD";
+
+/// Default view for `walk` when `--view` is omitted.
+const DEFAULT_VIEW: &str = "modules";
+
 /// Default trace command when `--cmd` is omitted.
 const DEFAULT_TRACE_CMD: &str = "cargo test";
 
@@ -35,8 +41,10 @@ USAGE:
     csd diff [--base <ref>|--baseline <file>] [--show] [--full] [--list] [--scope <glob>]... [--format <fmt>]
     csd snapshot [-o <file>|--out <file>]
     csd changelog [--base <ref>]
+    csd drift [--base <ref>|--baseline <file>]
     csd files [-o <file>|--out <file>]
     csd init [-o <file>|--out <file>]
+    csd walk [--base <ref>] [--head <ref>] [--view <name>] [--full] [--format <fmt>]
     csd trace [--base <ref>] [--cmd <shell command>]
     csd doc [-o <file>|--out <file>]
     cargo structure-diff diff [--base <ref>] [--show]
@@ -50,6 +58,8 @@ OPTIONS:
     --scope <glob>     diff: only render nodes whose source path matches <glob>
                        (repeatable; crossing edges show an external stub)
     --format <fmt>     diff: diagram syntax, one of mermaid|dot|ascii|boxes|svg (default: mermaid)
+    --head <ref>       walk: ref that ends the range, inclusive (default: HEAD)
+    --view <name>      walk: view to render each frame (default: modules)
     --cmd <cmd>        trace: shell command that emits Mermaid (default: cargo test)
     -o, --out <f>      doc/snapshot: write output to <file> instead of stdout
     -h, --help         Print this help
@@ -82,6 +92,18 @@ init writes a starter .csd.toml pre-filled with the crate path globs detected in
 this repo, so the layer mapping matches real modules instead of guessed paths.
 With no --out it writes .csd.toml and refuses to overwrite an existing one; pass
 --out - to print to stdout. It exits 0 on success, 2 on error.
+
+drift mode is observational: it prints a compact count of how much the working
+tree structure has changed since a base ref (or a --baseline snapshot), broken
+down by nodes and edges added, removed, modified, and moved. It answers how far
+the structure has moved since the release, without a diagram. It exits 0 on
+success, 2 on error.
+
+walk mode renders one frame per first-parent commit in <base>..<head>, oldest to
+newest, so you can flip through how the architecture evolved. By default each
+frame is the delta from its parent; --full draws the whole graph at each commit.
+Pairs well with --format ascii for an in-terminal flip-through. It exits 0 on
+success, 2 on error.
 ";
 
 /// A parsed invocation.
@@ -139,6 +161,26 @@ pub enum Cmd {
     Init {
         /// Output file; `None` writes `.csd.toml` (refusing to overwrite), `-` writes stdout.
         out: Option<String>,
+    },
+    /// Summarize how far the working tree has drifted from a base ref or a pinned baseline.
+    Drift {
+        /// The git ref to measure drift from (ignored when `baseline` is set).
+        base: String,
+        /// Measure drift from this JSON snapshot instead of a git ref.
+        baseline: Option<String>,
+    },
+    /// Render one frame per first-parent commit across a range, oldest to newest.
+    Walk {
+        /// The git ref that begins the range (exclusive), the parent of the first frame.
+        base: String,
+        /// The git ref that ends the range (inclusive). Defaults to `HEAD`.
+        head: String,
+        /// The view to render each frame in (for example `modules`).
+        view: String,
+        /// Render the whole graph at each commit instead of the delta from its parent.
+        full: bool,
+        /// Diagram output syntax.
+        format: Format,
     },
 }
 
@@ -213,6 +255,8 @@ impl Report {
 /// design; no clap.
 pub fn parse_args(args: &[String]) -> Result<Cmd> {
     let mut base = DEFAULT_BASE.to_string();
+    let mut head = DEFAULT_HEAD.to_string();
+    let mut view = DEFAULT_VIEW.to_string();
     let mut baseline: Option<String> = None;
     let mut cmd = DEFAULT_TRACE_CMD.to_string();
     let mut show = false;
@@ -231,7 +275,8 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
             "--show" => show = true,
             "--full" => full = true,
             "--list" => list = true,
-            "diff" | "trace" | "doc" | "changelog" | "snapshot" | "files" | "init"
+            "diff" | "trace" | "doc" | "changelog" | "snapshot" | "files" | "init" | "walk"
+            | "drift"
                 if sub.is_none() =>
             {
                 sub = Some(arg)
@@ -259,6 +304,22 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
             }
             _ if arg.starts_with("--base=") => {
                 base = arg["--base=".len()..].to_string();
+            }
+            "--head" => {
+                i += 1;
+                let value = args.get(i).context("--head requires a value")?;
+                head = value.clone();
+            }
+            _ if arg.starts_with("--head=") => {
+                head = arg["--head=".len()..].to_string();
+            }
+            "--view" => {
+                i += 1;
+                let value = args.get(i).context("--view requires a value")?;
+                view = value.clone();
+            }
+            _ if arg.starts_with("--view=") => {
+                view = arg["--view=".len()..].to_string();
             }
             "--scope" => {
                 i += 1;
@@ -294,7 +355,15 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
         Some("snapshot") => Ok(Cmd::Snapshot { out }),
         Some("files") => Ok(Cmd::Files { out }),
         Some("init") => Ok(Cmd::Init { out }),
+        Some("walk") => Ok(Cmd::Walk {
+            base,
+            head,
+            view,
+            full,
+            format,
+        }),
         Some("changelog") => Ok(Cmd::Changelog { base }),
+        Some("drift") => Ok(Cmd::Drift { base, baseline }),
         Some(_) => Ok(Cmd::Diff {
             base,
             baseline,
@@ -414,6 +483,26 @@ pub fn run(args: &[String]) -> i32 {
             }
         },
         Cmd::Changelog { base } => match run_changelog(&base) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                2
+            }
+        },
+        Cmd::Walk {
+            base,
+            head,
+            view,
+            full,
+            format,
+        } => match run_walk(&base, &head, &view, full, format) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                2
+            }
+        },
+        Cmd::Drift { base, baseline } => match run_drift(&base, baseline.as_deref()) {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("error: {e:#}");
@@ -907,6 +996,176 @@ fn run_changelog(base: &str) -> Result<i32> {
     };
     let report = analyze(&repo, base, &config, &opts)?;
     print!("{}", changelog_markdown(base, &report.changes));
+    Ok(0)
+}
+
+/// Node and edge change tallies, for the drift summary.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct DriftCounts {
+    nodes_added: usize,
+    nodes_removed: usize,
+    nodes_modified: usize,
+    nodes_moved: usize,
+    edges_added: usize,
+    edges_removed: usize,
+}
+
+impl DriftCounts {
+    /// The total number of structural changes.
+    fn total(&self) -> usize {
+        self.nodes_added
+            + self.nodes_removed
+            + self.nodes_modified
+            + self.nodes_moved
+            + self.edges_added
+            + self.edges_removed
+    }
+}
+
+/// Tally a delta into [`DriftCounts`].
+fn count_changes(changes: &[Change]) -> DriftCounts {
+    let mut c = DriftCounts::default();
+    for change in changes {
+        match change {
+            Change::Added(_) => c.nodes_added += 1,
+            Change::Removed(_) => c.nodes_removed += 1,
+            Change::Modified { .. } => c.nodes_modified += 1,
+            Change::Moved { .. } => c.nodes_moved += 1,
+            Change::EdgeAdded(_) => c.edges_added += 1,
+            Change::EdgeRemoved(_) => c.edges_removed += 1,
+        }
+    }
+    c
+}
+
+/// Render a compact drift summary: per-kind counts and a total. `from` labels what head is compared
+/// against (a ref or a snapshot path). Pure and deterministic.
+fn drift_markdown(from: &str, changes: &[Change]) -> String {
+    let c = count_changes(changes);
+    let mut out = String::new();
+    let _ = writeln!(out, "# Structure drift vs {from}");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "- nodes added:    {}", c.nodes_added);
+    let _ = writeln!(out, "- nodes removed:  {}", c.nodes_removed);
+    let _ = writeln!(out, "- nodes modified: {}", c.nodes_modified);
+    let _ = writeln!(out, "- nodes moved:    {}", c.nodes_moved);
+    let _ = writeln!(out, "- edges added:    {}", c.edges_added);
+    let _ = writeln!(out, "- edges removed:  {}", c.edges_removed);
+    let _ = writeln!(out);
+    let node_total = c.nodes_added + c.nodes_removed + c.nodes_modified + c.nodes_moved;
+    let edge_total = c.edges_added + c.edges_removed;
+    let _ = writeln!(
+        out,
+        "Total: {} structural change(s) ({node_total} node, {edge_total} edge).",
+        c.total()
+    );
+    out
+}
+
+/// Print a drift summary of the working tree against a base ref or a `--baseline` snapshot.
+/// Observational: no gate, always exits 0 on success.
+fn run_drift(base: &str, baseline: Option<&str>) -> Result<i32> {
+    let repo = repo_root()?;
+    let config = load_config(&repo)?;
+    let opts = RenderOpts {
+        full: false,
+        scope: Vec::new(),
+        entry: None,
+        format: Format::default(),
+    };
+    let (report, label) = match baseline {
+        Some(path) => {
+            let graph = load_baseline(path)?;
+            (analyze_baseline(&repo, &graph, &config, &opts)?, path)
+        }
+        None => (analyze(&repo, base, &config, &opts)?, base),
+    };
+    print!("{}", drift_markdown(label, &report.changes));
+    Ok(0)
+}
+
+/// The [`View`] a name selects, or `None` for an unknown name.
+fn view_from_name(name: &str) -> Option<View> {
+    Some(match name {
+        "modules" => View::Modules,
+        "states" => View::States,
+        "types" => View::Types,
+        "calls" => View::Calls,
+        "callgraph" => View::CallGraph,
+        "schema" => View::Schema,
+        "overview" => View::Overview,
+        _ => return None,
+    })
+}
+
+/// The first-parent commit shas in `base..head`, oldest to newest.
+fn commits_first_parent(repo: &Path, base: &str, head: &str) -> Result<Vec<String>> {
+    let range = format!("{base}..{head}");
+    let out = git(repo, &["rev-list", "--first-parent", "--reverse", &range])
+        .with_context(|| format!("failed to list commits in {range}"))?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// The subject line of a commit.
+fn git_subject(repo: &Path, sha: &str) -> Result<String> {
+    Ok(git(repo, &["show", "-s", "--format=%s", sha])?
+        .trim()
+        .to_string())
+}
+
+/// Render one frame per first-parent commit in `base..head`, oldest to newest.
+///
+/// Each commit is materialized in a throwaway worktree and extracted. By default a frame is the
+/// delta from its parent (the previous commit, or `base` for the first); with `full`, each frame is
+/// the whole graph at that commit. Deterministic: the commit order and the per-commit extraction are
+/// both stable. Observational, always exits 0 on success.
+fn run_walk(base: &str, head: &str, view_name: &str, full: bool, format: Format) -> Result<i32> {
+    let repo = repo_root()?;
+    let config = load_config(&repo)?;
+    let view = view_from_name(view_name).with_context(|| {
+        format!("unknown --view {view_name:?}; expected modules, states, types, calls, callgraph, schema, or overview")
+    })?;
+
+    let shas = commits_first_parent(&repo, base, head)?;
+    if shas.is_empty() {
+        println!("no first-parent commits in {base}..{head}");
+        return Ok(0);
+    }
+
+    // The parent of the first frame is `base` itself, so a delta frame has a prior graph to diff.
+    let mut prev = base_graph(&repo, base)?;
+    for sha in &shas {
+        let graph = base_graph(&repo, sha)?;
+        let subject = git_subject(&repo, sha)?;
+        let short = sha.get(..7).unwrap_or(sha.as_str());
+        let changes = if full {
+            Vec::new()
+        } else {
+            diff(
+                &prev,
+                &graph,
+                DiffOptions {
+                    rename_threshold: Some(0.7),
+                    file_renames: Vec::new(),
+                },
+            )
+        };
+        let opts = RenderOpts {
+            full,
+            scope: Vec::new(),
+            entry: Some(call_entry(&graph, &config)),
+            format,
+        };
+        println!("=== {short} {subject} ===");
+        println!("{}", render(view, &graph, &changes, &opts));
+        println!();
+        prev = graph;
+    }
     Ok(0)
 }
 
@@ -1565,6 +1824,117 @@ deny = [\"layering\", \"cycles\"]
             "a pre-existing violation must not fail the default new-only ratchet, findings: {:?}",
             report.findings
         );
+    }
+
+    #[test]
+    fn drift_counts_and_summarizes_a_delta() {
+        let changes = vec![
+            Change::Added(cl_node("crate::A", NodeKind::Struct)),
+            Change::Added(cl_node("crate::B", NodeKind::Struct)),
+            Change::Removed(cl_node("crate::C", NodeKind::Fn)),
+            Change::Moved {
+                node: StableId::new("crate::D"),
+                from: StableId::new("crate::x"),
+                to: StableId::new("crate::y"),
+            },
+            Change::EdgeAdded(csd_ir::Edge {
+                from: StableId::new("crate::A"),
+                to: StableId::new("crate::B"),
+                kind: EdgeKind::Uses,
+                span: cl_node("s", NodeKind::Module).span,
+                ordinal: None,
+            }),
+        ];
+        let c = count_changes(&changes);
+        assert_eq!(c.nodes_added, 2);
+        assert_eq!(c.nodes_removed, 1);
+        assert_eq!(c.nodes_moved, 1);
+        assert_eq!(c.edges_added, 1);
+        assert_eq!(c.total(), 5);
+
+        let md = drift_markdown("v1.0", &changes);
+        assert!(md.starts_with("# Structure drift vs v1.0\n"));
+        assert!(md.contains("- nodes added:    2"));
+        assert!(md.contains("Total: 5 structural change(s) (4 node, 1 edge)."));
+    }
+
+    #[test]
+    fn view_from_name_maps_known_and_rejects_unknown() {
+        assert_eq!(view_from_name("modules"), Some(View::Modules));
+        assert_eq!(view_from_name("overview"), Some(View::Overview));
+        assert_eq!(view_from_name("bogus"), None);
+    }
+
+    #[test]
+    fn walk_parses_range_and_view_options() {
+        let cmd = parse_args(&[
+            "walk".into(),
+            "--base".into(),
+            "v1".into(),
+            "--head".into(),
+            "v2".into(),
+            "--view".into(),
+            "overview".into(),
+            "--full".into(),
+            "--format".into(),
+            "ascii".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            cmd,
+            Cmd::Walk {
+                base: "v1".into(),
+                head: "v2".into(),
+                view: "overview".into(),
+                full: true,
+                format: Format::Ascii,
+            }
+        );
+    }
+
+    #[test]
+    fn walk_defaults_head_to_working_head_and_view_to_modules() {
+        let cmd = parse_args(&["walk".into()]).unwrap();
+        assert_eq!(
+            cmd,
+            Cmd::Walk {
+                base: "main".into(),
+                head: "HEAD".into(),
+                view: "modules".into(),
+                full: false,
+                format: Format::Mermaid,
+            }
+        );
+    }
+
+    #[test]
+    fn commits_first_parent_lists_oldest_to_newest() {
+        let repo = TmpRepo::new("walk");
+        let dir = &repo.path;
+        git_ok(dir, &["-c", "init.defaultBranch=main", "init", "-q"]);
+        write(dir, "src/lib.rs", "pub struct A;\n");
+        git_ok(dir, &["add", "-A"]);
+        git_ok(dir, &["commit", "-q", "-m", "c1"]);
+        let base = git(dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        write(dir, "src/lib.rs", "pub struct A;\npub struct B;\n");
+        git_ok(dir, &["add", "-A"]);
+        git_ok(dir, &["commit", "-q", "-m", "c2"]);
+        write(
+            dir,
+            "src/lib.rs",
+            "pub struct A;\npub struct B;\npub struct C;\n",
+        );
+        git_ok(dir, &["add", "-A"]);
+        git_ok(dir, &["commit", "-q", "-m", "c3"]);
+
+        let shas = commits_first_parent(dir, &base, "HEAD").unwrap();
+        assert_eq!(
+            shas.len(),
+            2,
+            "base..HEAD excludes base, includes c2 and c3"
+        );
+        let subjects: Vec<String> = shas.iter().map(|s| git_subject(dir, s).unwrap()).collect();
+        assert_eq!(subjects, ["c2", "c3"], "oldest to newest");
     }
 
     #[test]
