@@ -735,6 +735,7 @@ impl FileExtractor {
                     let id = format!("{mod_path}::{name}");
                     let fp = fn_fingerprint(node, src, doc);
                     self.push(id.clone(), NodeKind::Fn, span_of(node, file), Some(fp));
+                    self.set_attr("sig", fn_sig(node, src));
                     if let Some(body) = node.child_by_field_name("body") {
                         self.collect_calls(body, &id, mod_path, None, ctx);
                     }
@@ -813,6 +814,7 @@ impl FileExtractor {
                     let id = format!("{self_type}::{name}");
                     let fp = fn_fingerprint(item, src, &doc);
                     self.push(id.clone(), NodeKind::Fn, span_of(item, file), Some(fp));
+                    self.set_attr("sig", fn_sig(item, src));
                     if let Some(mbody) = item.child_by_field_name("body") {
                         self.collect_calls(mbody, &id, mod_path, Some(&self_type), ctx);
                     }
@@ -1059,6 +1061,14 @@ impl FileExtractor {
             attrs: BTreeMap::new(),
             fingerprint,
         });
+    }
+
+    /// Insert an attribute on the most recently pushed node. Used to attach display/diff metadata
+    /// (the function `sig`) right after the node is emitted.
+    fn set_attr(&mut self, key: &str, value: String) {
+        if let Some(last) = self.nodes.last_mut() {
+            last.attrs.insert(key.to_string(), value);
+        }
     }
 }
 
@@ -1447,6 +1457,43 @@ fn fn_fingerprint(node: TsNode, src: &[u8], doc: &str) -> Fingerprint {
         add_types(ret, src, &mut fp.field_types);
     }
     fp
+}
+
+/// The display/diff signature of a `function_item`: its parameter list and return type in source
+/// order, read verbatim from the source text. A receiver (`self`/`&self`/`&mut self`) is the first
+/// entry when present; a typed parameter reads as `pattern: type`; a parameter with no type (only
+/// `self` in valid Rust) falls back to its pattern text. A missing return type means unit, so the
+/// `-> ...` suffix is omitted. Examples: `(id: u64, name: &str) -> bool`, `(&self, other: &Node)`,
+/// `()`. This is display metadata only: it is stored on the node's `attrs` and never feeds the
+/// fingerprint. Verbatim type text keeps it deterministic (same source yields the same string).
+fn fn_sig(node: TsNode, src: &[u8]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(params) = child_kind(node, "parameters") {
+        let mut cursor = params.walk();
+        for param in params.named_children(&mut cursor) {
+            match param.kind() {
+                "self_parameter" => parts.push(text(param, src)),
+                "parameter" => {
+                    let pat = param
+                        .child_by_field_name("pattern")
+                        .map(|p| text(p, src))
+                        .unwrap_or_default();
+                    match param.child_by_field_name("type") {
+                        Some(ty) => parts.push(format!("{pat}: {}", text(ty, src))),
+                        None => parts.push(pat),
+                    }
+                }
+                "variadic_parameter" => parts.push(text(param, src)),
+                _ => {}
+            }
+        }
+    }
+    let mut sig = format!("({})", parts.join(", "));
+    if let Some(ret) = node.child_by_field_name("return_type") {
+        sig.push_str(" -> ");
+        sig.push_str(&text(ret, src));
+    }
+    sig
 }
 
 /// A fingerprint with only the doc hash set.
