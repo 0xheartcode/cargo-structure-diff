@@ -3040,6 +3040,100 @@ mod tests {
     }
 
     #[test]
+    fn fn_with_zero_unresolved_draws_no_dyn_signal() {
+        // A fn explicitly annotated `unresolved_calls = 0` is fully resolved: the > 0 filter must
+        // exclude it, so no format invents a dyn ceiling. Guards the honesty filter itself.
+        let head = Graph {
+            nodes: vec![fn_node_dyn("crate::a::f", 0), fn_node("crate::b::g")],
+            edges: vec![calls("crate::a::f", "crate::b::g", 0)],
+        };
+        for format in [Format::Dot, Format::Ascii, Format::Boxes, Format::Svg] {
+            let out = render_full(View::CallGraph, format, &head);
+            assert!(
+                !out.contains("dyn"),
+                "a zero-unresolved fn must draw no dyn signal ({format:?}):\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_removed_table_and_fk_carry_text_markers() {
+        // erDiagram cannot colour, so a removed table gets a `csd_delta removed` row and a removed
+        // FK a `(removed)` label suffix. Without this a deleted table renders as if unchanged.
+        let head = Graph {
+            nodes: vec![table_node("users", "id: Int4")],
+            edges: vec![],
+        };
+        let changes = vec![
+            Change::Removed(table_node("posts", "id: Int4, user_id: Int4")),
+            Change::EdgeRemoved(foreign_key("posts", "users")),
+        ];
+        let out = render(View::Schema, &head, &changes, &RenderOpts::default());
+        assert!(
+            out.contains("        csd_delta removed\n"),
+            "removed table marker missing:\n{out}"
+        );
+        assert!(
+            out.contains("references (removed)"),
+            "removed fk marker missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn module_removed_edge_carries_dashed_marker() {
+        // A removed module edge recovered from the delta renders dashed with the `|-|` marker;
+        // without it a removed dependency reads as a live one.
+        let head = Graph {
+            nodes: vec![module("crate::a"), module("crate::b")],
+            edges: vec![],
+        };
+        let changes = vec![Change::EdgeRemoved(uses("crate::a", "crate::b"))];
+        let out = render(View::Modules, &head, &changes, &RenderOpts::default());
+        assert!(
+            out.contains("-.->|-|"),
+            "removed module edge marker missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn call_graph_removed_edge_carries_dashed_marker() {
+        // The call-graph view (not the sequence view) must also mark a removed call edge.
+        let head = Graph {
+            nodes: vec![fn_node("crate::a::f"), fn_node("crate::b::g")],
+            edges: vec![],
+        };
+        let changes = vec![Change::EdgeRemoved(calls("crate::a::f", "crate::b::g", 0))];
+        let out = render(View::CallGraph, &head, &changes, &RenderOpts::default());
+        assert!(
+            out.contains("-.->|-|"),
+            "removed call-graph edge marker missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn dot_removed_edge_is_dashed_red() {
+        // The DOT module delta golden covers a removed node; this pins the removed EDGE style.
+        let head = Graph {
+            nodes: vec![module("crate::a"), module("crate::b")],
+            edges: vec![],
+        };
+        let changes = vec![Change::EdgeRemoved(uses("crate::a", "crate::b"))];
+        let out = render(
+            View::Modules,
+            &head,
+            &changes,
+            &RenderOpts {
+                format: Format::Dot,
+                ..RenderOpts::default()
+            },
+        );
+        assert!(
+            out.contains("[style=dashed,color=\"#ef4444\"]"),
+            "removed dot edge style missing:\n{out}"
+        );
+    }
+
+    #[test]
     fn type_view_lists_added_and_removed_methods() {
         // Struct S (fields unchanged) gains method `foo` and loses method `bar`; a plain method
         // `baz` stays. Fields still render; methods carry +/-/() markers.
