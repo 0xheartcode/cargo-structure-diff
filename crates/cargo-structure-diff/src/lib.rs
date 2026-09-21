@@ -1067,6 +1067,19 @@ fn drift_markdown(from: &str, changes: &[Change]) -> String {
 fn run_drift(base: &str, baseline: Option<&str>) -> Result<i32> {
     let repo = repo_root()?;
     let config = load_config(&repo)?;
+    print!("{}", drift_report(&repo, &config, base, baseline)?);
+    Ok(0)
+}
+
+/// The drift report for the repo at `repo`: how far its structure has moved from `base` (or from a
+/// pinned `baseline` snapshot), as Markdown. Split from [`run_drift`] so it takes an explicit repo
+/// path and returns the text, which makes it testable against a fixture without touching the cwd.
+fn drift_report(
+    repo: &Path,
+    config: &Config,
+    base: &str,
+    baseline: Option<&str>,
+) -> Result<String> {
     let opts = RenderOpts {
         full: false,
         scope: Vec::new(),
@@ -1076,12 +1089,11 @@ fn run_drift(base: &str, baseline: Option<&str>) -> Result<i32> {
     let (report, label) = match baseline {
         Some(path) => {
             let graph = load_baseline(path)?;
-            (analyze_baseline(&repo, &graph, &config, &opts)?, path)
+            (analyze_baseline(repo, &graph, config, &opts)?, path)
         }
-        None => (analyze(&repo, base, &config, &opts)?, base),
+        None => (analyze(repo, base, config, &opts)?, base),
     };
-    print!("{}", drift_markdown(label, &report.changes));
-    Ok(0)
+    Ok(drift_markdown(label, &report.changes))
 }
 
 /// The [`View`] a name selects, or `None` for an unknown name.
@@ -1127,21 +1139,41 @@ fn git_subject(repo: &Path, sha: &str) -> Result<String> {
 fn run_walk(base: &str, head: &str, view_name: &str, full: bool, format: Format) -> Result<i32> {
     let repo = repo_root()?;
     let config = load_config(&repo)?;
+    print!(
+        "{}",
+        walk_report(&repo, &config, base, head, view_name, full, format)?
+    );
+    Ok(0)
+}
+
+/// Assemble the walk report for the repo at `repo`: one frame per first-parent commit in
+/// `base..head`, oldest to newest, returned as text. Split from [`run_walk`] so it takes an explicit
+/// repo path and returns the frames instead of printing, which makes it testable against a fixture.
+#[allow(clippy::too_many_arguments)]
+fn walk_report(
+    repo: &Path,
+    config: &Config,
+    base: &str,
+    head: &str,
+    view_name: &str,
+    full: bool,
+    format: Format,
+) -> Result<String> {
     let view = view_from_name(view_name).with_context(|| {
         format!("unknown --view {view_name:?}; expected modules, states, types, calls, callgraph, schema, or overview")
     })?;
 
-    let shas = commits_first_parent(&repo, base, head)?;
+    let shas = commits_first_parent(repo, base, head)?;
     if shas.is_empty() {
-        println!("no first-parent commits in {base}..{head}");
-        return Ok(0);
+        return Ok(format!("no first-parent commits in {base}..{head}\n"));
     }
 
+    let mut out = String::new();
     // The parent of the first frame is `base` itself, so a delta frame has a prior graph to diff.
-    let mut prev = base_graph(&repo, base)?;
+    let mut prev = base_graph(repo, base)?;
     for sha in &shas {
-        let graph = base_graph(&repo, sha)?;
-        let subject = git_subject(&repo, sha)?;
+        let graph = base_graph(repo, sha)?;
+        let subject = git_subject(repo, sha)?;
         let short = sha.get(..7).unwrap_or(sha.as_str());
         let changes = if full {
             Vec::new()
@@ -1158,15 +1190,15 @@ fn run_walk(base: &str, head: &str, view_name: &str, full: bool, format: Format)
         let opts = RenderOpts {
             full,
             scope: Vec::new(),
-            entry: Some(call_entry(&graph, &config)),
+            entry: Some(call_entry(&graph, config)),
             format,
         };
-        println!("=== {short} {subject} ===");
-        println!("{}", render(view, &graph, &changes, &opts));
-        println!();
+        let _ = writeln!(out, "=== {short} {subject} ===");
+        let _ = writeln!(out, "{}", render(view, &graph, &changes, &opts));
+        let _ = writeln!(out);
         prev = graph;
     }
-    Ok(0)
+    Ok(out)
 }
 
 /// Default views for `csd doc` when `views.enabled` is empty: every view csd knows.
@@ -1935,6 +1967,81 @@ deny = [\"layering\", \"cycles\"]
         );
         let subjects: Vec<String> = shas.iter().map(|s| git_subject(dir, s).unwrap()).collect();
         assert_eq!(subjects, ["c2", "c3"], "oldest to newest");
+    }
+
+    /// Build a three-commit repo whose src/lib.rs grows one module per commit. Returns the repo and
+    /// the sha of the first commit (the walk/drift base).
+    fn growing_repo() -> (TmpRepo, String) {
+        let repo = TmpRepo::new("walkdrift");
+        let dir = &repo.path;
+        git_ok(dir, &["-c", "init.defaultBranch=main", "init", "-q"]);
+        write(dir, "src/lib.rs", "pub mod a;\n");
+        write(dir, "src/a.rs", "pub fn f() {}\n");
+        git_ok(dir, &["add", "-A"]);
+        git_ok(dir, &["commit", "-q", "-m", "c1"]);
+        let base = git(dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        write(dir, "src/lib.rs", "pub mod a;\npub mod b;\n");
+        write(dir, "src/b.rs", "pub fn g() {}\n");
+        git_ok(dir, &["add", "-A"]);
+        git_ok(dir, &["commit", "-q", "-m", "add module b"]);
+        (repo, base)
+    }
+
+    #[test]
+    fn walk_report_renders_one_frame_per_commit() {
+        let (repo, base) = growing_repo();
+        let out = walk_report(
+            &repo.path,
+            &Config::default(),
+            &base,
+            "HEAD",
+            "modules",
+            true,
+            Format::Ascii,
+        )
+        .unwrap();
+        // One commit past base (the "add module b" commit) => exactly one frame, with its subject.
+        assert_eq!(out.matches("=== ").count(), 1, "one frame expected:\n{out}");
+        assert!(
+            out.contains("add module b"),
+            "frame subject missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn walk_report_notes_an_empty_range() {
+        let (repo, _base) = growing_repo();
+        let out = walk_report(
+            &repo.path,
+            &Config::default(),
+            "HEAD",
+            "HEAD",
+            "modules",
+            false,
+            Format::Ascii,
+        )
+        .unwrap();
+        assert_eq!(out, "no first-parent commits in HEAD..HEAD\n");
+    }
+
+    #[test]
+    fn drift_report_counts_structural_change_since_base() {
+        let (repo, base) = growing_repo();
+        let moved = drift_report(&repo.path, &Config::default(), &base, None).unwrap();
+        // Adding module b (and its fn) is real structural drift, so the report is non-empty and
+        // names the base it measured from.
+        assert!(moved.contains(&base[..7]), "base label missing:\n{moved}");
+        assert!(
+            moved.to_lowercase().contains("node") || moved.to_lowercase().contains("edge"),
+            "expected a node/edge tally:\n{moved}"
+        );
+
+        // Drift from the working head to itself is zero: the report says so rather than tallying.
+        let still = drift_report(&repo.path, &Config::default(), "HEAD", None).unwrap();
+        assert!(
+            still.contains('0') && !still.contains("=== "),
+            "head-to-head drift should be zero:\n{still}"
+        );
     }
 
     #[test]
