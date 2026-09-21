@@ -668,6 +668,40 @@ fn unresolved_calls(head: &Graph) -> BTreeMap<&str, u32> {
         .collect()
 }
 
+/// Append the honest dyn ceiling to a Mermaid graph: a `dyn` stub and a dashed edge from every
+/// rendered non-stub fn with unresolved (dynamic/generic) callees. Shared by the call-graph and the
+/// flattened overview view so neither can silently hide dynamic dispatch, and so the emission lives
+/// in one place. Stubs are numbered `dyn0`, `dyn1`, ... in render order.
+fn mermaid_dyn_ceiling(
+    out: &mut String,
+    render_ids: &[&StableId],
+    stubs: &BTreeSet<&StableId>,
+    unresolved: &BTreeMap<&str, u32>,
+    handles: &BTreeMap<&StableId, String>,
+) {
+    let mut dyn_idx = 0;
+    for id in render_ids {
+        if stubs.contains(id) {
+            continue;
+        }
+        if unresolved.contains_key(id.as_str()) {
+            let _ = writeln!(out, "    dyn{dyn_idx}[\"dyn\"]:::context");
+            let _ = writeln!(out, "    {} -.-> dyn{dyn_idx}", handles[id]);
+            dyn_idx += 1;
+        }
+    }
+}
+
+/// The render-node indices that need a `dyn` ceiling box: one per fn in `gv.unresolved` that is in
+/// the rendered set, in `gv.unresolved` order. Shared by the boxes and svg layouts, which each
+/// append their own node kind for the box but agree on which fns get one.
+fn dyn_ceiling_targets(gv: &GraphView, index: &BTreeMap<&StableId, usize>) -> Vec<usize> {
+    gv.unresolved
+        .iter()
+        .filter_map(|(id, _)| index.get(id).copied())
+        .collect()
+}
+
 /// Depth-first pre-order emit of one fn's messages, then its dyn note, recursing into callees.
 ///
 /// `stack` holds the ancestors on the current path; an edge back to any of them is skipped so cycles
@@ -1199,17 +1233,7 @@ fn call_graph_view(head: &Graph, changes: &[Change], opts: &RenderOpts) -> Strin
     }
 
     // Honest dyn ceiling: a dashed edge to a `dyn` stub for each rendered fn with unresolved calls.
-    let mut dyn_idx = 0;
-    for id in &sel.render_ids {
-        if sel.stubs.contains(id) {
-            continue;
-        }
-        if unresolved.contains_key(id.as_str()) {
-            let _ = writeln!(out, "    dyn{dyn_idx}[\"dyn\"]:::context");
-            let _ = writeln!(out, "    {} -.-> dyn{dyn_idx}", handles[id]);
-            dyn_idx += 1;
-        }
-    }
+    mermaid_dyn_ceiling(&mut out, &sel.render_ids, &sel.stubs, &unresolved, &handles);
 
     out
 }
@@ -1535,17 +1559,7 @@ fn overview_view(head: &Graph, changes: &[Change], opts: &RenderOpts) -> String 
     // Honest dyn ceiling: a dashed edge to a `dyn` stub for each rendered fn with unresolved calls,
     // matching the call-graph view so the flattened overview never hides dynamic dispatch either.
     let unresolved = unresolved_calls(head);
-    let mut dyn_idx = 0;
-    for id in &sel.render_ids {
-        if sel.stubs.contains(id) {
-            continue;
-        }
-        if unresolved.contains_key(id.as_str()) {
-            let _ = writeln!(out, "    dyn{dyn_idx}[\"dyn\"]:::context");
-            let _ = writeln!(out, "    {} -.-> dyn{dyn_idx}", handles[id]);
-            dyn_idx += 1;
-        }
-    }
+    mermaid_dyn_ceiling(&mut out, &sel.render_ids, &sel.stubs, &unresolved, &handles);
 
     out
 }
@@ -1981,15 +1995,13 @@ fn boxes_view(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -
 
     // Honest dyn ceiling: one `dyn` box per rendered fn with unresolved dynamic/generic callees, so
     // the layered diagram shows the dispatch that has no static target instead of dropping it.
-    for (id, _count) in &gv.unresolved {
-        if let Some(&f) = index.get(id) {
-            let dyn_idx = nodes.len();
-            nodes.push(boxes::BoxNode {
-                marker: ' ',
-                name: "dyn".to_string(),
-            });
-            edges.push((f, dyn_idx));
-        }
+    for f in dyn_ceiling_targets(&gv, &index) {
+        let dyn_idx = nodes.len();
+        nodes.push(boxes::BoxNode {
+            marker: ' ',
+            name: "dyn".to_string(),
+        });
+        edges.push((f, dyn_idx));
     }
 
     boxes::layout(&nodes, &edges)
@@ -2066,17 +2078,15 @@ fn svg_view(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -> 
 
     // Honest dyn ceiling: one `dyn` context box per rendered fn with unresolved dynamic/generic
     // callees, so the SVG shows the ceiling instead of silently omitting it.
-    for (id, _count) in &gv.unresolved {
-        if let Some(&f) = index.get(id) {
-            let dyn_idx = nodes.len();
-            let (stroke, fill) = class_svg_colours(Class::Context);
-            nodes.push(svg::SvgNode {
-                label: "dyn".to_string(),
-                stroke: stroke.to_string(),
-                fill: fill.to_string(),
-            });
-            edges.push((f, dyn_idx));
-        }
+    for f in dyn_ceiling_targets(&gv, &index) {
+        let dyn_idx = nodes.len();
+        let (stroke, fill) = class_svg_colours(Class::Context);
+        nodes.push(svg::SvgNode {
+            label: "dyn".to_string(),
+            stroke: stroke.to_string(),
+            fill: fill.to_string(),
+        });
+        edges.push((f, dyn_idx));
     }
 
     svg::layout_svg(&nodes, &edges)
@@ -2904,6 +2914,30 @@ mod tests {
         assert!(
             !out.contains("f0 --> f0"),
             "must not collapse to one node:\n{out}"
+        );
+    }
+
+    #[test]
+    fn multiple_dyn_stubs_are_numbered_distinctly() {
+        // Two fns each with unresolved calls: the shared mermaid ceiling must number them dyn0 and
+        // dyn1 with separate edges. A single-stub fixture never advances the counter, so this
+        // guards the dyn_idx increment the dedup centralized.
+        let head = Graph {
+            nodes: vec![fn_node_dyn("crate::a::f", 1), fn_node_dyn("crate::b::g", 2)],
+            edges: vec![],
+        };
+        let out = render_full(View::CallGraph, Format::Mermaid, &head);
+        assert!(
+            out.contains("dyn0[\"dyn\"]:::context"),
+            "dyn0 missing:\n{out}"
+        );
+        assert!(
+            out.contains("dyn1[\"dyn\"]:::context"),
+            "dyn1 missing:\n{out}"
+        );
+        assert!(
+            out.contains("-.-> dyn0") && out.contains("-.-> dyn1"),
+            "each dyn fn must point at its own stub:\n{out}"
         );
     }
 
