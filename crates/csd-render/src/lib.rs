@@ -78,14 +78,15 @@ pub enum Format {
     /// Mermaid diagram source (the default, one syntax per view).
     #[default]
     Mermaid,
-    /// Graphviz DOT `digraph` for the graph views (modules, types, states, call-graph, schema).
+    /// Graphviz DOT `digraph` for every graph-shaped view (all but the Calls sequence view).
     Dot,
-    /// cargo-tree-style ASCII text for the DAG views (modules, types, call-graph).
+    /// cargo-tree-style ASCII text for every graph-shaped view (all but the Calls sequence view).
     Ascii,
-    /// Native layered ASCII boxes-and-arrows for the DAG views (modules, types, call-graph, and the
-    /// flattened overview). Pure Rust, no external tools; see [`boxes`] and [`boxes_view`].
+    /// Native layered ASCII boxes-and-arrows for every graph-shaped view (all but the Calls
+    /// sequence view). Pure Rust, no external tools; see [`boxes`] and [`boxes_view`].
     Boxes,
-    /// A rendered SVG image via the pure-Rust layout crate (no Node/Chromium). Graph views only.
+    /// A rendered SVG image via the pure-Rust layout crate (no Node/Chromium). Every graph-shaped
+    /// view (all but the Calls sequence view).
     Svg,
 }
 
@@ -1795,19 +1796,17 @@ fn ascii_marker(class: Class) -> char {
 /// Roots are nodes with no in-edge (else all nodes, sorted); each subtree is printed with
 /// indentation and `->` branches, every node prefixed by its delta marker. A node already on the
 /// current path is marked `(cycle)` and not re-expanded, so cycles terminate; a node expanded under
-/// another root is not re-expanded either. A flat sorted `from -> to` edge list follows. States,
-/// Calls (sequence) and Schema are not DAG-shaped, so they degrade to a one-line note.
+/// another root is not re-expanded either. A flat sorted `from -> to` edge list follows. Only the
+/// Calls (sequence) view is not graph-shaped, so it alone degrades to a one-line note.
 fn ascii_view(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -> String {
-    match view {
-        View::States | View::Calls | View::Schema | View::Overview => {
-            return String::from(
-                "%% ascii format not supported for this view; use --format mermaid\n",
-            );
-        }
-        View::Modules | View::Types | View::CallGraph => {}
-    }
-    // Modules/Types/CallGraph are graph-shaped, so select_graph never returns None here.
-    let gv = select_graph(head, changes, opts, view).expect("DAG views are graph-shaped");
+    // select_graph is the single source of truth for view support: it returns None only for the
+    // sequence (Calls) view, which is not graph-shaped. Every graph-shaped view renders here, so
+    // the four generic formats can never disagree on which views they support.
+    let Some(gv) = select_graph(head, changes, opts, view) else {
+        return String::from(
+            "%% ascii format not supported for the sequence view; use --format mermaid\n",
+        );
+    };
 
     if gv.sel.render_ids.is_empty() {
         return String::from("%% no structural changes in this view\n");
@@ -1921,16 +1920,13 @@ fn ascii_walk<'a>(
 /// boxes form and degrade to a one-line note. Node names are the short id (last `::segment`); a
 /// scope stub is suffixed ` (external)`. Output is deterministic.
 fn boxes_view(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -> String {
-    match view {
-        View::States | View::Calls | View::Schema => {
-            return String::from(
-                "%% boxes format not supported for this view; use --format mermaid\n",
-            );
-        }
-        View::Modules | View::Types | View::CallGraph | View::Overview => {}
-    }
-    // The four arms above are all graph-shaped, so select_graph never returns None here.
-    let gv = select_graph(head, changes, opts, view).expect("DAG views are graph-shaped");
+    // One source of truth (select_graph's None) decides view support; only the sequence (Calls)
+    // view is not graph-shaped. See ascii_view for the full rationale.
+    let Some(gv) = select_graph(head, changes, opts, view) else {
+        return String::from(
+            "%% boxes format not supported for the sequence view; use --format mermaid\n",
+        );
+    };
 
     if gv.sel.render_ids.is_empty() {
         return String::from("%% no structural changes in this view\n");
@@ -2011,15 +2007,13 @@ fn class_svg_colours(class: Class) -> (&'static str, &'static str) {
 
 /// Render a graph view as an SVG image via the pure-Rust layout crate (no external tools).
 fn svg_view(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -> String {
-    match view {
-        View::States | View::Calls | View::Schema => {
-            return String::from(
-                "<!-- svg not supported for this view; use --format mermaid -->\n",
-            );
-        }
-        View::Modules | View::Types | View::CallGraph | View::Overview => {}
-    }
-    let gv = select_graph(head, changes, opts, view).expect("DAG views are graph-shaped");
+    // One source of truth (select_graph's None) decides view support; only the sequence (Calls)
+    // view is not graph-shaped. See ascii_view for the full rationale.
+    let Some(gv) = select_graph(head, changes, opts, view) else {
+        return String::from(
+            "<!-- svg not supported for the sequence view; use --format mermaid -->\n",
+        );
+    };
     if gv.sel.render_ids.is_empty() {
         return String::from("<!-- no structural changes in this view -->\n");
     }
@@ -3527,10 +3521,11 @@ mod tests {
     }
 
     #[test]
-    fn boxes_state_view_not_supported() {
+    fn boxes_state_view_renders_the_graph() {
+        // Boxes supports every graph-shaped view; a real state machine renders, it is not refused.
         let head = Graph {
-            nodes: vec![variant("crate::S::a")],
-            edges: vec![],
+            nodes: vec![variant("crate::S::a"), variant("crate::S::b")],
+            edges: vec![transition("crate::S::a", "crate::S::b")],
         };
         let out = render(
             View::States,
@@ -3538,24 +3533,76 @@ mod tests {
             &[],
             &RenderOpts {
                 format: Format::Boxes,
+                full: true,
                 ..RenderOpts::default()
             },
         );
-        assert_eq!(
-            out,
-            "%% boxes format not supported for this view; use --format mermaid\n"
+        assert!(
+            !out.contains("not supported"),
+            "state view should render in boxes, not be refused:\n{out}"
         );
     }
 
     #[test]
-    fn ascii_state_view_not_supported() {
+    fn ascii_state_view_renders_the_graph() {
+        // The generic graph formats support every view except the Calls sequence view. A real state
+        // machine (variants with a transition) renders as a DAG, it is not refused.
         let head = Graph {
-            nodes: vec![variant("crate::S::a")],
-            edges: vec![],
+            nodes: vec![variant("crate::S::a"), variant("crate::S::b")],
+            edges: vec![transition("crate::S::a", "crate::S::b")],
         };
         let out = render(
             View::States,
             &head,
+            &[],
+            &RenderOpts {
+                format: Format::Ascii,
+                full: true,
+                ..RenderOpts::default()
+            },
+        );
+        assert!(
+            !out.contains("not supported"),
+            "state view should render in ascii, not be refused:\n{out}"
+        );
+        assert!(out.contains('a') && out.contains('b'), "{out}");
+    }
+
+    #[test]
+    fn all_generic_formats_agree_on_overview() {
+        // Regression: ascii once refused Overview while boxes and svg accepted it. Every generic
+        // graph format must agree on which views are supported (Overview is supported by all).
+        let head = Graph {
+            nodes: vec![module("crate::a"), module("crate::b")],
+            edges: vec![uses("crate::a", "crate::b")],
+        };
+        for format in [Format::Dot, Format::Ascii, Format::Boxes, Format::Svg] {
+            let out = render(
+                View::Overview,
+                &head,
+                &[],
+                &RenderOpts {
+                    format,
+                    full: true,
+                    ..RenderOpts::default()
+                },
+            );
+            assert!(
+                !out.contains("not supported"),
+                "{format:?} refused Overview but must support it:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn ascii_sequence_view_is_the_only_refusal() {
+        // Calls is the one non-graph-shaped view; it alone degrades to the note.
+        let out = render(
+            View::Calls,
+            &Graph {
+                nodes: vec![],
+                edges: vec![],
+            },
             &[],
             &RenderOpts {
                 format: Format::Ascii,
@@ -3564,7 +3611,7 @@ mod tests {
         );
         assert_eq!(
             out,
-            "%% ascii format not supported for this view; use --format mermaid\n"
+            "%% ascii format not supported for the sequence view; use --format mermaid\n"
         );
     }
 }
