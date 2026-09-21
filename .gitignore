@@ -9,3 +9,6 @@ Cargo.lock.orig
 
 # methodology tooling and its output stay local, never published
 /local/
+
+# cargo-mutants artifacts
+mutants.out*/
