@@ -166,7 +166,9 @@ fn replay_repo(
     init_config: &Config,
     cache: &mut Cache,
 ) -> Result<Vec<PairResult>> {
-    let zero_config = Config::default();
+    // The real zero-config behaviour a user gets with no .csd.toml (module view, cycles warned),
+    // not a bare Config::default that would lint nothing.
+    let zero_config = cargo_structure_diff::zero_config_defaults();
     let mut results = Vec::with_capacity(pairs.len());
 
     for pair in pairs {
@@ -358,9 +360,8 @@ fn write_json(results: &[PairResult], dir: &Path) -> Result<()> {
 struct Totals {
     pairs: usize,
     zero_red: usize,
+    zero_warnings: usize,
     init_red: usize,
-    zero_denials: usize,
-    init_denials: usize,
     init_warnings: usize,
     nondeterministic: usize,
     rs_renames: usize,
@@ -373,8 +374,7 @@ fn totals_of(results: &[PairResult]) -> Totals {
         t.pairs += 1;
         t.zero_red += usize::from(r.zero.denied);
         t.init_red += usize::from(r.init.denied);
-        t.zero_denials += r.zero.denials;
-        t.init_denials += r.init.denials;
+        t.zero_warnings += r.zero.warnings;
         t.init_warnings += r.init.warnings;
         t.nondeterministic += usize::from(!r.deterministic);
         t.rs_renames += r.rs_renames;
@@ -407,7 +407,7 @@ fn summary_markdown(results: &[PairResult]) -> String {
     // Per-repo table.
     let _ = writeln!(
         out,
-        "| repo | pairs | zero-config red | init red | init denials | init warns | nondet | rename splits |"
+        "| repo | pairs | zero red | zero warns | init red | init warns | nondet | rename splits |"
     );
     let _ = writeln!(out, "| --- | --- | --- | --- | --- | --- | --- | --- |");
     let mut repos: Vec<&str> = results.iter().map(|r| r.repo.as_str()).collect();
@@ -426,8 +426,8 @@ fn summary_markdown(results: &[PairResult]) -> String {
             repo,
             t.pairs,
             t.zero_red,
+            t.zero_warnings,
             t.init_red,
-            t.init_denials,
             t.init_warnings,
             t.nondeterministic,
             t.rename_splits
