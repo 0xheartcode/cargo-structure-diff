@@ -14,12 +14,16 @@ Dependencies are not a native git-issue field, so each issue body carries a
         labels:area:ir, blocking, type:feat priority:critical milestone:m0
 422be96 [closed] extract: resolve cross-crate use paths to workspace dependency edges
         labels:area:extract, blocking, type:feat priority:critical milestone:m6
+51c75cf [closed] init: generated gate must deny nothing by default
+        labels:area:cli, area:lint, independent, type:fix priority:critical milestone:adoption
 775ae67 [closed] diff: rename/move matcher with fingerprint similarity and threshold
         labels:area:diff, blocking, type:feat priority:critical milestone:m0
 e462549 [closed] extract/render: states view only for real state machines
         labels:area:render, blocking, type:feat priority:critical milestone:m6
 0121366 [closed] config: parse .csd.toml (layers, glob map, views, lint, ratchet)
         labels:area:config, independent, type:feat priority:high milestone:m1
+039df7c [closed] lint/cli: zero-config surfaces cycles as a warning plus a layering hint
+        labels:area:lint, area:cli priority:high milestone:adoption
 0591220 [closed] render-types: classDiagram with member-level delta
         labels:area:render, blocking, type:feat priority:high milestone:m3
 07ab983 [closed] extract-impls: Implements and Associates edges
@@ -30,6 +34,8 @@ e462549 [closed] extract/render: states view only for real state machines
         labels:area:cli, blocking, type:feat priority:high milestone:m1
 0a83140 [closed] extract-rs: module tree and use-path collection via tree-sitter
         labels:area:extract, blocking, type:feat priority:high milestone:m0
+10194ca [closed] cli: diff --view must override .csd.toml enabled views
+        labels:area:cli, independent, type:fix priority:high milestone:adoption
 1ca8a08 [closed] extract-calls: Calls edges with source-order ordinals
         labels:area:extract, blocking, type:feat priority:high milestone:m4
 22cc17f [closed] harness: select refactor-heavy pairs for the sweep
@@ -38,6 +44,8 @@ e462549 [closed] extract/render: states view only for real state machines
         labels:area:render, independent, type:feat priority:high milestone:m2
 311ff60 [closed] lint-states: reachability and cycle rules
         labels:area:lint, independent, type:feat priority:high milestone:m2
+3f2c636 [closed] harness: replay the gate across the corpus to measure noise vs signal
+        labels:area:harness, independent, type:feat priority:high milestone:adoption
 4894e6a [closed] lint: layering and cycles over the module graph with ratchet
         labels:area:lint, blocking, type:feat priority:high milestone:m1
 53b3162 [closed] render: combined overview view (the code schema) - modules containing types + fns with all edges
@@ -52,10 +60,14 @@ e462549 [closed] extract/render: states view only for real state machines
         labels:area:cli, blocking, type:feat priority:high milestone:m4
 681e0a7 [closed] render: module graph to Mermaid flowchart with delta colouring
         labels:area:render, blocking, type:feat priority:high milestone:m1
+6dea66f [closed] init: infer crate-level layers and emit forbids as warnings (hybrid)
+        labels:area:cli priority:high milestone:adoption
 7344e8d [closed] extract-rs: namespace node ids per crate for workspaces
         labels:area:extract, independent, type:feat priority:high milestone:m1
 743edea [closed] cli: --list textual per-node change summary
         labels:area:cli, independent, type:feat priority:high milestone:m6
+76d42ea [open] release: CHANGELOG, MSRV, tri-OS CI, README rewrite, bump 0.1.0
+        labels:area:infra priority:high milestone:adoption
 7916cfb [closed] cli: csd doc - browsable whole-codebase structure report (SchemaSpy-style)
         labels:area:cli, area:render, independent, type:feat priority:high milestone:m6
 87f08db [closed] harness: threshold sweep and metrics
@@ -70,6 +82,8 @@ b59eafb [closed] render: native ASCII boxes-and-arrows layout for graph views
         labels:area:render, independent, type:feat priority:high milestone:m6
 b951fc4 [closed] harness: git worktree materialization and IR cache by SHA
         labels:area:harness, blocking, type:feat priority:high milestone:m0
+bb02da0 [closed] docs: demo gallery of replayed PR comments
+        labels:area:docs priority:high milestone:adoption
 bb67bbb [closed] extract-rs: precision-first use-path mini-resolver
         labels:area:extract, blocking, type:feat priority:high milestone:m1
 c1b3a2b [closed] diff: flat set diff over nodes and edges
@@ -78,6 +92,8 @@ e84ac0e [closed] cli: wire the states view into csd diff
         labels:area:cli, blocking, type:feat priority:high milestone:m2
 ebf7c6d [closed] ir/diff: per-member types for precise member-diff
         labels:area:ir, blocking, type:feat priority:high milestone:m6
+fb801b9 [closed] action: harden the csd-gate composite action
+        labels:area:infra priority:high milestone:adoption
 ff3a772 [closed] extract-rs: item nodes with member fingerprints
         labels:area:extract, independent, type:feat priority:high milestone:m0
 25768fb [closed] harness: generate M0-REPORT.md go/no-go artifact

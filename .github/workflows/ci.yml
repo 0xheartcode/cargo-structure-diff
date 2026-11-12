@@ -1,15 +1,16 @@
 name: CI
 
-# Mirrors the local `just gate` recipe exactly: fmt-check, clippy -D warnings, test.
-# Calls cargo directly so the workflow runs without installing `just`.
+# fmt-check and clippy run once on Linux (they are platform-independent); the test suite runs on
+# Linux, macOS and Windows so golden output and path handling are verified on every target. Together
+# these mirror the local `just gate` recipe. cargo is called directly so no `just` install is needed.
 
 on:
   push:
   pull_request:
 
 jobs:
-  gate:
-    name: fmt + clippy + test (stable)
+  lint:
+    name: fmt + clippy (stable, linux)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -28,6 +29,23 @@ jobs:
 
       - name: Clippy (warnings denied)
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test (stable, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
 
       - name: Test
         run: cargo test --workspace
