@@ -145,8 +145,11 @@ pub struct PairResult {
     pub counts: ChangeCounts,
     /// Gate outcome with no `.csd.toml`.
     pub zero: GateOutcome,
-    /// Gate outcome under the config `csd init` generates.
+    /// Gate outcome under the config `csd init` generates (inferred layering as a warning).
     pub init: GateOutcome,
+    /// Gate outcome under the `init` config with the inferred layering promoted to `deny` - the
+    /// signal measurement: would enforcing the inferred architecture have failed this PR?
+    pub layering_deny: GateOutcome,
     /// Git `.rs` file renames in this pair (reliable module-move ground truth).
     pub rs_renames: usize,
     /// Of those, how many came out as delete+add noise instead of a reconciled move.
@@ -169,6 +172,11 @@ fn replay_repo(
     // The real zero-config behaviour a user gets with no .csd.toml (module view, cycles warned),
     // not a bare Config::default that would lint nothing.
     let zero_config = cargo_structure_diff::zero_config_defaults();
+    // The signal measurement: the inferred layering promoted from a warning to a deny, as a team
+    // would do once it trusts the layers. Everything else matches the init config.
+    let mut layering_deny_config = init_config.clone();
+    layering_deny_config.lint.deny = vec!["layering".to_string()];
+    layering_deny_config.lint.warn = vec!["cycles".to_string()];
     let mut results = Vec::with_capacity(pairs.len());
 
     for pair in pairs {
@@ -182,6 +190,7 @@ fn replay_repo(
         let changes = diff(&base, &head, gate_opts(&renames));
         let zero = gate(&head, &changes, &zero_config);
         let init = gate(&head, &changes, init_config);
+        let layering_deny = gate(&head, &changes, &layering_deny_config);
         let wall_ms = start.elapsed().as_millis();
 
         // Determinism: the verdict path is pure over normalized graphs, so a second run must agree.
@@ -202,6 +211,7 @@ fn replay_repo(
             counts: count_changes(&changes),
             zero,
             init,
+            layering_deny,
             rs_renames,
             rename_splits,
             deterministic,
@@ -363,6 +373,7 @@ struct Totals {
     zero_warnings: usize,
     init_red: usize,
     init_warnings: usize,
+    layering_red: usize,
     nondeterministic: usize,
     rs_renames: usize,
     rename_splits: usize,
@@ -376,6 +387,7 @@ fn totals_of(results: &[PairResult]) -> Totals {
         t.init_red += usize::from(r.init.denied);
         t.zero_warnings += r.zero.warnings;
         t.init_warnings += r.init.warnings;
+        t.layering_red += usize::from(r.layering_deny.denied);
         t.nondeterministic += usize::from(!r.deterministic);
         t.rs_renames += r.rs_renames;
         t.rename_splits += r.rename_splits;
@@ -402,14 +414,22 @@ fn summary_markdown(results: &[PairResult]) -> String {
         "Rename splits (pure .rs move shown as delete+add): {} of {} .rs renames (must be 0)",
         overall.rename_splits, overall.rs_renames
     );
-    let _ = writeln!(out);
-
-    // Per-repo table.
     let _ = writeln!(
         out,
-        "| repo | pairs | zero red | zero warns | init red | init warns | nondet | rename splits |"
+        "Signal - PRs the inferred layering would have failed if promoted to deny: {} of {}",
+        overall.layering_red, overall.pairs
     );
-    let _ = writeln!(out, "| --- | --- | --- | --- | --- | --- | --- | --- |");
+    let _ = writeln!(out);
+
+    // Per-repo table. `lay red` is the signal column: reds if the inferred layering were enforced.
+    let _ = writeln!(
+        out,
+        "| repo | pairs | zero red | zero warns | init red | init warns | lay red | nondet | rename splits |"
+    );
+    let _ = writeln!(
+        out,
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+    );
     let mut repos: Vec<&str> = results.iter().map(|r| r.repo.as_str()).collect();
     repos.sort_unstable();
     repos.dedup();
@@ -422,13 +442,14 @@ fn summary_markdown(results: &[PairResult]) -> String {
         let t = totals_of(&slice);
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             repo,
             t.pairs,
             t.zero_red,
             t.zero_warnings,
             t.init_red,
             t.init_warnings,
+            t.layering_red,
             t.nondeterministic,
             t.rename_splits
         );
@@ -472,6 +493,47 @@ edges a repo declares in `.csd.toml`; the generated `init` config declares none 
 a warning (Rust module graphs are naturally cyclic), so out of the box the gate is informational and \
 cannot produce a false red. Denials appear here only once a repo declares layers - which is where \
 the gate's signal comes from."
+        );
+    }
+    let _ = writeln!(out);
+
+    // The signal worklist: PRs the inferred layering would have failed if promoted to deny. Each is
+    // a candidate real catch to hand-audit (real upward dependency vs an inference artefact).
+    let _ = writeln!(
+        out,
+        "## Signal: PRs the inferred layering would deny if promoted (audit worklist)"
+    );
+    let _ = writeln!(out);
+    let mut any_signal = false;
+    for r in results {
+        if !r.layering_deny.denied {
+            continue;
+        }
+        any_signal = true;
+        let _ = writeln!(
+            out,
+            "- **{}** `{}` ({})",
+            r.repo,
+            short(&r.commit),
+            r.subject
+        );
+        for f in r
+            .layering_deny
+            .findings
+            .iter()
+            .filter(|f| f.severity == "deny")
+        {
+            let _ = writeln!(out, "    - `{}`: {}", f.rule, f.message);
+        }
+    }
+    if !any_signal {
+        let _ = writeln!(
+            out,
+            "_None._ Across the replayed PRs, no change introduced an upward (lower-tier -> \
+higher-tier) crate dependency, so even enforcing the inferred layering as a deny would have failed \
+nothing. Crate-level dependency inversions are rare in a blind recent sample (as renames were); the \
+layering gate is a guardrail against a specific regression, not a frequent catcher. Intra-crate \
+layering - where architecture usually erodes - is not inferred yet and is the place to grow signal."
         );
     }
     out

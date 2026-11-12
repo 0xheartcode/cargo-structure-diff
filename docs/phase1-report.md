@@ -88,3 +88,27 @@ non-determinism, zero rename noise. The gate is safe to ship.
 ```sh
 cargo run -p csd-harness -- replay 50 --out /tmp/replay   # writes replay.json + a markdown summary
 ```
+
+## Addendum: signal measurement and the cycles refinement
+
+The report above proved zero noise but left one claim resting on a synthetic example: that declared
+layering catches real regressions. Two follow-ups measured it.
+
+**Signal measurement.** The replay gained a third config dimension: the inferred `csd init` layering
+*promoted to a deny*. Replaying the same 250 PRs with it enforced, the gate would have failed **0 of
+250**. No change in a blind recent sample introduced an upward (lower-tier -> higher-tier) crate
+dependency. This is the honest shape of the tool: crate-level layering is a guardrail against a rare
+but serious regression (a dependency inversion), not a frequent catcher. It reshapes positioning -
+the day-to-day value is the structural changelog, the diagram, and the guardrail, not a steady stream
+of caught violations - and it points at the real signal frontier: **intra-crate** layering
+(`src/domain` must not use `src/infra`), where architecture actually erodes and which `csd init` does
+not infer yet. That is the next feature to build, now backed by evidence rather than a hunch.
+
+**Cycles refinement.** The `cycles` lint now ignores containment edges - a module referencing its own
+ancestor or descendant (`axum::extract` -> `axum`, or a crate root re-exporting a child via `pub
+use`). Including them made every crate one giant trivial cycle; on axum a genuine 5-module cycle was
+inflated into a bogus 28-module one. Measured on the corpus, excluding containment edges collapses
+axum's 28-module SCC to 5 and leaves ripgrep's genuine cross-module cycle intact. In the replay this
+dropped axum's spurious new-cycle warning (the added module only joined the web through nesting edges)
+while keeping ripgrep's real one - a more precise warning, still never a red. Computed from module
+ids alone, so no IR change was needed.
