@@ -129,6 +129,9 @@ pub enum Cmd {
         list: bool,
         /// Diagram output syntax.
         format: Format,
+        /// Render only this view, overriding `.csd.toml`'s `views.enabled`. `None` uses the config
+        /// (defaulting to the module view). Set only when `--view` is passed explicitly.
+        view: Option<String>,
     },
     /// Serialize the current working tree as a JSON structure snapshot (a pinned baseline).
     Snapshot {
@@ -256,7 +259,8 @@ impl Report {
 pub fn parse_args(args: &[String]) -> Result<Cmd> {
     let mut base = DEFAULT_BASE.to_string();
     let mut head = DEFAULT_HEAD.to_string();
-    let mut view = DEFAULT_VIEW.to_string();
+    // `None` until `--view` is passed, so `diff` can tell "user chose a view" from "defaulted".
+    let mut view: Option<String> = None;
     let mut baseline: Option<String> = None;
     let mut cmd = DEFAULT_TRACE_CMD.to_string();
     let mut show = false;
@@ -316,10 +320,10 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
             "--view" => {
                 i += 1;
                 let value = args.get(i).context("--view requires a value")?;
-                view = value.clone();
+                view = Some(value.clone());
             }
             _ if arg.starts_with("--view=") => {
-                view = arg["--view=".len()..].to_string();
+                view = Some(arg["--view=".len()..].to_string());
             }
             "--scope" => {
                 i += 1;
@@ -358,7 +362,7 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
         Some("walk") => Ok(Cmd::Walk {
             base,
             head,
-            view,
+            view: view.unwrap_or_else(|| DEFAULT_VIEW.to_string()),
             full,
             format,
         }),
@@ -372,6 +376,7 @@ pub fn parse_args(args: &[String]) -> Result<Cmd> {
             scope,
             list,
             format,
+            view,
         }),
         None => bail!(
             "expected one of the `diff`, `changelog`, `snapshot`, `trace`, or `doc` subcommands; try --help"
@@ -432,6 +437,7 @@ pub fn run(args: &[String]) -> i32 {
             scope,
             list,
             format,
+            view,
         } => {
             let opts = RenderOpts {
                 full,
@@ -439,7 +445,14 @@ pub fn run(args: &[String]) -> i32 {
                 entry: None,
                 format,
             };
-            match run_diff(&base, baseline.as_deref(), show, list, &opts) {
+            match run_diff(
+                &base,
+                baseline.as_deref(),
+                show,
+                list,
+                view.as_deref(),
+                &opts,
+            ) {
                 Ok(code) => code,
                 Err(e) => {
                     eprintln!("error: {e:#}");
@@ -521,10 +534,22 @@ fn run_diff(
     baseline: Option<&str>,
     show: bool,
     list: bool,
+    view: Option<&str>,
     opts: &RenderOpts,
 ) -> Result<i32> {
     let repo = repo_root()?;
-    let config = load_config(&repo)?;
+    let mut config = load_config(&repo)?;
+    // An explicit `--view` overrides the config's `views.enabled` for this run, so
+    // `csd diff --view call-graph` renders that view rather than silently ignoring the flag and
+    // showing whatever the config enables. Validated against the known views so a typo fails loudly.
+    if let Some(name) = view {
+        if view_from_name(name).is_none() {
+            bail!(
+                "unknown --view {name:?}; expected one of modules, states, types, calls, callgraph, schema, overview"
+            );
+        }
+        config.views.enabled = vec![name.to_string()];
+    }
     // The label printed in the summary: the snapshot file when pinned, else the git ref.
     let (report, label) = match baseline {
         Some(path) => {
@@ -1099,14 +1124,16 @@ fn drift_report(
     Ok(drift_markdown(label, &report.changes))
 }
 
-/// The [`View`] a name selects, or `None` for an unknown name.
+/// The [`View`] a name selects, or `None` for an unknown name. The single source of truth for view
+/// names, shared by `csd walk`, the `csd diff --view` override, and [`render_views`]. `call-graph`
+/// is accepted as an alias for `callgraph` so the hyphenated spelling in docs and on the CLI works.
 fn view_from_name(name: &str) -> Option<View> {
     Some(match name {
         "modules" => View::Modules,
         "states" => View::States,
         "types" => View::Types,
         "calls" => View::Calls,
-        "callgraph" => View::CallGraph,
+        "callgraph" | "call-graph" => View::CallGraph,
         "schema" => View::Schema,
         "overview" => View::Overview,
         _ => return None,
@@ -1551,15 +1578,9 @@ fn render_views(
     };
     let mut diagrams = Vec::new();
     for name in enabled {
-        let view = match name.as_str() {
-            "modules" => View::Modules,
-            "states" => View::States,
-            "types" => View::Types,
-            "calls" => View::Calls,
-            "callgraph" => View::CallGraph,
-            "schema" => View::Schema,
-            "overview" => View::Overview,
-            _ => continue,
+        // One source of truth for view names (shared with walk and the diff --view override).
+        let Some(view) = view_from_name(&name) else {
+            continue;
         };
         // Thread the CLI opts through; the entry (calls view only) always comes from config.
         let view_opts = RenderOpts {
@@ -2360,6 +2381,7 @@ deny = [\"layering\", \"cycles\"]
                 scope: vec!["src/a/**".to_string(), "src/b/**".to_string()],
                 list: false,
                 format: Format::Dot,
+                view: None,
             }
         );
     }
@@ -2488,6 +2510,7 @@ deny = [\"layering\", \"cycles\"]
                 scope: Vec::new(),
                 list: false,
                 format: Format::Mermaid,
+                view: None,
             }
         );
     }
@@ -2504,6 +2527,7 @@ deny = [\"layering\", \"cycles\"]
             scope: Vec::new(),
             list: false,
             format: Format::Mermaid,
+            view: None,
         };
         assert_eq!(split, want);
         assert_eq!(joined, want);
@@ -2522,6 +2546,7 @@ deny = [\"layering\", \"cycles\"]
                 scope: Vec::new(),
                 list: false,
                 format: Format::Mermaid,
+                view: None,
             }
         );
     }
@@ -2661,6 +2686,29 @@ trailing noise
     }
 
     #[test]
+    fn parse_diff_view_is_some_only_when_passed() {
+        // No --view: diff defaults to the config, carried as None.
+        let bare = parse_args(&["diff".into()]).unwrap();
+        assert!(matches!(bare, Cmd::Diff { view: None, .. }));
+        // --view X on diff is captured as an explicit override.
+        let set = parse_args(&["diff".into(), "--view".into(), "types".into()]).unwrap();
+        assert!(matches!(set, Cmd::Diff { view: Some(v), .. } if v == "types"));
+        // The hyphenated alias parses through to the override and is a known view.
+        let alias = parse_args(&["diff".into(), "--view=call-graph".into()]).unwrap();
+        assert!(matches!(alias, Cmd::Diff { view: Some(v), .. } if v == "call-graph"));
+        assert!(view_from_name("call-graph").is_some());
+        // An unknown view is a usage error before any repo IO, so run maps it to exit 2.
+        assert_eq!(
+            run(&[
+                "diff".to_string(),
+                "--view".to_string(),
+                "bogus".to_string()
+            ]),
+            2
+        );
+    }
+
+    #[test]
     fn parse_reads_list_flag() {
         let cmd = parse_args(&["diff".into(), "--list".into()]).unwrap();
         assert_eq!(
@@ -2673,6 +2721,7 @@ trailing noise
                 scope: Vec::new(),
                 list: true,
                 format: Format::Mermaid,
+                view: None,
             }
         );
     }
