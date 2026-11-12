@@ -215,8 +215,19 @@ fn config_layer_unused(head: &Graph, config: &Config) -> Vec<Finding> {
     findings
 }
 
-/// Cycles: report each non-trivial strongly-connected component of the module `Uses` graph. Under
-/// new-only, a component is reported only when a newly added edge lies inside it.
+/// Whether two module ids are in an ancestor/descendant (nesting) relationship, e.g. `axum` and
+/// `axum::extract`. A module referencing an item from its own ancestor or descendant is ordinary
+/// nesting, not a dependency cycle, so the cycles lint ignores edges between such pairs.
+fn is_containment(a: &StableId, b: &StableId) -> bool {
+    let (a, b) = (a.as_str(), b.as_str());
+    a.len() != b.len()
+        && (b.strip_prefix(a).is_some_and(|rest| rest.starts_with("::"))
+            || a.strip_prefix(b).is_some_and(|rest| rest.starts_with("::")))
+}
+
+/// Cycles: report each non-trivial strongly-connected component of the module `Uses` graph, treating
+/// a module and its own ancestor/descendant as nested rather than cyclic (see [`is_containment`]).
+/// Under new-only, a component is reported only when a newly added non-nesting edge lies inside it.
 fn cycles(
     head: &Graph,
     config: &Config,
@@ -231,9 +242,19 @@ fn cycles(
         .map(|n| &n.id)
         .collect();
 
+    // Build the module dependency graph, but ignore containment edges: a module using an item from
+    // its own ancestor (`axum::extract` -> `axum`) or descendant (`axum` re-exporting `axum::extract`
+    // via `pub use`) is ordinary nesting, not a dependency cycle. Including them makes every crate one
+    // giant trivial cycle - on real code (axum) that inflated a genuine 5-module cycle into a bogus
+    // 28-module one. Excluding them leaves only cycles between modules that are not nested in each
+    // other, which is what "module cycle" should mean.
     let mut adj: BTreeMap<&StableId, Vec<&StableId>> = BTreeMap::new();
     for e in &head.edges {
-        if e.kind == EdgeKind::Uses && module_ids.contains(&e.from) && module_ids.contains(&e.to) {
+        if e.kind == EdgeKind::Uses
+            && module_ids.contains(&e.from)
+            && module_ids.contains(&e.to)
+            && !is_containment(&e.from, &e.to)
+        {
             adj.entry(&e.from).or_default().push(&e.to);
         }
     }
@@ -250,9 +271,11 @@ fn cycles(
         }
         let members: BTreeSet<&StableId> = scc.iter().copied().collect();
         if restrict {
+            // The cycle is new only if a newly added NON-containment edge sits inside it; a new
+            // nesting edge (a `pub use` re-export) is not what formed the cycle.
             let has_new = added
                 .iter()
-                .any(|(f, t)| members.contains(f) && members.contains(t));
+                .any(|(f, t)| members.contains(f) && members.contains(t) && !is_containment(f, t));
             if !has_new {
                 continue;
             }
@@ -826,6 +849,53 @@ deny = ["layering", "cycles"]
         assert!(lint(&head, &changes, &cfg(LAYERS))
             .iter()
             .all(|f| f.rule != "cycles"));
+    }
+
+    #[test]
+    fn containment_edges_do_not_form_a_cycle() {
+        // A module and its own submodule reference each other (the child uses the parent, the parent
+        // re-exports the child). That is ordinary nesting, not a dependency cycle, so nothing fires -
+        // even though the two edges form a 2-node strongly-connected component.
+        let head = Graph {
+            nodes: vec![
+                module("crate::a", "src/a.rs"),
+                module("crate::a::b", "src/a/b.rs"),
+            ],
+            edges: vec![
+                uses("crate::a", "crate::a::b"),
+                uses("crate::a::b", "crate::a"),
+            ],
+        };
+        let changes = vec![Change::EdgeAdded(uses("crate::a::b", "crate::a"))];
+        assert!(
+            lint(&head, &changes, &cfg(LAYERS))
+                .iter()
+                .all(|f| f.rule != "cycles"),
+            "nesting must not be reported as a module cycle"
+        );
+    }
+
+    #[test]
+    fn sibling_cycle_survives_containment_filtering() {
+        // Two sibling modules under a common parent genuinely cycle. Containment filtering must not
+        // hide this: `crate::a::x` and `crate::a::y` are not nested in each other.
+        let head = Graph {
+            nodes: vec![
+                module("crate::a::x", "src/a/x.rs"),
+                module("crate::a::y", "src/a/y.rs"),
+            ],
+            edges: vec![
+                uses("crate::a::x", "crate::a::y"),
+                uses("crate::a::y", "crate::a::x"),
+            ],
+        };
+        let changes = vec![Change::EdgeAdded(uses("crate::a::y", "crate::a::x"))];
+        let f = lint(&head, &changes, &cfg(LAYERS));
+        assert_eq!(
+            f.iter().filter(|f| f.rule == "cycles").count(),
+            1,
+            "a genuine sibling cycle must still be reported: {f:?}"
+        );
     }
 
     #[test]
