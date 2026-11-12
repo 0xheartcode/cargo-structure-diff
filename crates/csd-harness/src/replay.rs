@@ -467,10 +467,11 @@ fn summary_markdown(results: &[PairResult]) -> String {
     if !any {
         let _ = writeln!(
             out,
-            "_No denials fired across the replay._ With the current gate, the `init` config enables \
-only `cycles` as a denying lint (and the zero-config gate enables none), so a clean run here means \
-no new module import cycle was introduced in the replayed PRs - true zero noise, but also the signal \
-ceiling of the gate as it stands."
+            "_No denials fired across the replay._ By design the gate denies only on the layering \
+edges a repo declares in `.csd.toml`; the generated `init` config declares none and keeps `cycles` \
+a warning (Rust module graphs are naturally cyclic), so out of the box the gate is informational and \
+cannot produce a false red. Denials appear here only once a repo declares layers - which is where \
+the gate's signal comes from."
         );
     }
     out
