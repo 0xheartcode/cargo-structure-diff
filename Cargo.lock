@@ -25,7 +25,7 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "cargo-structure-diff"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "csd-config",
@@ -81,7 +81,7 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
 name = "csd-config"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "glob",
  "serde",
@@ -91,14 +91,14 @@ dependencies = [
 
 [[package]]
 name = "csd-diff"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "csd-ir",
 ]
 
 [[package]]
 name = "csd-extract-db"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "csd-ir",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "csd-extract-rs"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "csd-ir",
@@ -121,7 +121,7 @@ dependencies = [
 
 [[package]]
 name = "csd-goldens"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "csd-diff",
  "csd-extract-rs",
@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "csd-harness"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "cargo-structure-diff",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "csd-ir"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "csd-lint"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "csd-config",
  "csd-ir",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "csd-render"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "csd-ir",
  "glob",

@@ -1,0 +1,4 @@
+# Normalize line endings to LF in the working tree on every platform. The golden tests compare csd's
+# `\n`-terminated output against string literals in the source, so a CRLF checkout on Windows would
+# fail them spuriously. Keeping every text file LF makes the suite deterministic across OSes.
+* text=auto eol=lf
