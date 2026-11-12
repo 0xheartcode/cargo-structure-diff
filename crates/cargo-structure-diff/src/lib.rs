@@ -538,6 +538,9 @@ fn run_diff(
     opts: &RenderOpts,
 ) -> Result<i32> {
     let repo = repo_root()?;
+    // Remember whether the run is zero-config, to nudge the user toward declaring layering - the
+    // only thing that gives the gate teeth (a denying finding) rather than warnings alone.
+    let zero_config = !repo.join(".csd.toml").exists();
     let mut config = load_config(&repo)?;
     // An explicit `--view` overrides the config's `views.enabled` for this run, so
     // `csd diff --view call-graph` renders that view rather than silently ignoring the flag and
@@ -563,6 +566,15 @@ fn run_diff(
         for line in change_list(&report.changes) {
             println!("{line}");
         }
+    }
+    // Zero-config runs warn but never deny. Point the user at the one step that makes the gate fail
+    // a build on a real architectural regression: declaring layers. Printed once, to stderr, only
+    // when nothing already denied (a denial is its own, louder message).
+    if zero_config && !report.denied() {
+        eprintln!(
+            "note: no .csd.toml - running with defaults (module view, cycles warned). \
+Run `csd init`, then declare layers to fail the build on forbidden dependencies."
+        );
     }
     Ok(report.exit_code())
 }
@@ -854,55 +866,248 @@ fn run_init(out: Option<&str>) -> Result<i32> {
     Ok(0)
 }
 
+/// A crate's short name: the first `::`-separated segment of a module id (`axum::extract` -> `axum`).
+fn crate_of(id: &str) -> &str {
+    id.split("::").next().unwrap_or(id)
+}
+
+/// A source glob for a module file: its crate root followed by `/**`, or `src/**` for a crate rooted
+/// at the repo root. `None` for a file not under a `src/` directory.
+fn glob_of(file: &str) -> Option<String> {
+    if let Some(idx) = file.find("/src/") {
+        Some(format!("{}/**", &file[..idx]))
+    } else if file.starts_with("src/") {
+        Some("src/**".to_string())
+    } else {
+        None
+    }
+}
+
 /// The `crates/<name>/**` (or `src/**`) globs for every crate a module was extracted from, sorted
 /// and de-duplicated, so a generated config maps real paths rather than guessed ones.
 fn detected_crate_globs(head: &Graph) -> Vec<String> {
-    use std::collections::BTreeSet;
-    let mut roots: BTreeSet<String> = BTreeSet::new();
-    for n in &head.nodes {
-        if n.kind != NodeKind::Module {
-            continue;
-        }
-        let file = n.span.file.as_str();
-        if let Some(idx) = file.find("/src/") {
-            roots.insert(format!("{}/**", &file[..idx]));
-        } else if file.starts_with("src/") {
-            roots.insert("src/**".to_string());
-        }
-    }
-    roots.into_iter().collect()
+    head.nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Module)
+        .filter_map(|n| glob_of(n.span.file.as_str()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
-/// Render a starter `.csd.toml`: a commented layer-mapping template pre-filled with this repo's
-/// detected crate globs, plus sensible defaults (module view, `cycles` as a warning, new-only
-/// ratchet). The layers section is left commented so the config is valid immediately and denies
-/// nothing until the user assigns layers - the generated gate cannot produce a false red on a fresh
-/// repo, which is the whole point of a tool teams keep installed.
+/// Map each crate (by module-id prefix) to a representative source glob. Deterministic: the first
+/// glob in id-sorted order wins, and a crate whose files are not under a `src/` dir is omitted.
+fn crate_to_glob(head: &Graph) -> std::collections::BTreeMap<String, String> {
+    let mut nodes: Vec<&csd_ir::Node> = head
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Module)
+        .collect();
+    nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut m = std::collections::BTreeMap::new();
+    for n in nodes {
+        if let Some(g) = glob_of(n.span.file.as_str()) {
+            m.entry(crate_of(n.id.as_str()).to_string()).or_insert(g);
+        }
+    }
+    m
+}
+
+/// The inter-crate dependency edges implied by module `Uses` edges that cross a crate boundary.
+fn crate_deps(head: &Graph) -> std::collections::BTreeSet<(String, String)> {
+    use std::collections::BTreeSet;
+    let mods: BTreeSet<&str> = head
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Module)
+        .map(|n| n.id.as_str())
+        .collect();
+    let mut deps = BTreeSet::new();
+    for e in &head.edges {
+        if e.kind != EdgeKind::Uses {
+            continue;
+        }
+        let (f, t) = (e.from.as_str(), e.to.as_str());
+        if !mods.contains(f) || !mods.contains(t) {
+            continue;
+        }
+        let (cf, ct) = (crate_of(f), crate_of(t));
+        if cf != ct {
+            deps.insert((cf.to_string(), ct.to_string()));
+        }
+    }
+    deps
+}
+
+/// Longest dependency-chain depth of a crate (its dependencies' max depth + 1; a leaf is 0),
+/// memoized. The crate graph is a DAG - cargo forbids crate cycles - and a visiting guard returns 0
+/// defensively should an unexpected cycle appear, so this always terminates.
+fn crate_depth(
+    c: &str,
+    succ: &std::collections::BTreeMap<String, Vec<String>>,
+    memo: &mut std::collections::BTreeMap<String, usize>,
+    visiting: &mut std::collections::BTreeSet<String>,
+) -> usize {
+    if let Some(&d) = memo.get(c) {
+        return d;
+    }
+    if visiting.contains(c) {
+        return 0;
+    }
+    visiting.insert(c.to_string());
+    let d = succ
+        .get(c)
+        .map(|ss| {
+            ss.iter()
+                .map(|s| 1 + crate_depth(s, succ, memo, visiting))
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    visiting.remove(c);
+    memo.insert(c.to_string(), d);
+    d
+}
+
+/// Assign each crate a tier equal to its longest dependency-chain depth: leaves (depend on nothing
+/// in the workspace) are tier 0, the most dependent crate the highest tier. Dependencies flow from
+/// higher tiers down to lower, so a layered architecture forbids the reverse.
+fn crate_tiers(
+    crates: &std::collections::BTreeSet<String>,
+    deps: &std::collections::BTreeSet<(String, String)>,
+) -> std::collections::BTreeMap<String, usize> {
+    use std::collections::BTreeMap;
+    let mut succ: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (f, t) in deps {
+        succ.entry(f.clone()).or_default().push(t.clone());
+    }
+    let mut memo = BTreeMap::new();
+    let mut visiting = std::collections::BTreeSet::new();
+    let mut tiers = BTreeMap::new();
+    for c in crates {
+        let d = crate_depth(c, &succ, &mut memo, &mut visiting);
+        tiers.insert(c.clone(), d);
+    }
+    tiers
+}
+
+/// Render a starter `.csd.toml`.
+///
+/// For a multi-crate workspace it infers a layered architecture from the current crate dependency
+/// DAG: one layer per crate, ordered top (most dependent) to bottom, with `forbid` rules that ban
+/// the reverse of every observed inter-tier dependency. Those reverse edges do not exist today (the
+/// crate graph is acyclic), so the generated gate passes on the current tree and, under the default
+/// new-only ratchet, flags only a future PR that introduces an upward dependency. Per the Phase-1
+/// decision the inferred rules are emitted as a `layering` *warning* with a commented `deny` the user
+/// promotes when ready, so adopting the tool never turns a build red by surprise. `cycles` is always
+/// a warning (Rust module graphs are naturally cyclic). A single-crate repo has no crate layering to
+/// infer, so it gets a commented template to fill in by hand.
 ///
 /// Public so the validation harness can replay the gate under exactly the config `csd init` would
 /// generate for a repo, rather than a hand-maintained copy that could drift from the real template.
 pub fn init_config(head: &Graph) -> String {
+    let globs = crate_to_glob(head);
+    let crates: std::collections::BTreeSet<String> = globs.keys().cloned().collect();
+    let deps = crate_deps(head);
+    let tiers = crate_tiers(&crates, &deps);
+    let distinct_tiers: std::collections::BTreeSet<usize> = tiers.values().copied().collect();
+
+    // Inference only adds value when there are at least two crates on at least two tiers; otherwise
+    // there is no cross-crate ordering to encode, so fall back to the hand-fill template.
+    if crates.len() < 2 || distinct_tiers.len() < 2 {
+        return init_template(head);
+    }
+
+    let layer_name = |tier: usize| format!("tier{tier}");
+    let mut s = String::new();
+    s.push_str("# cargo-structure-diff configuration, generated by `csd init`.\n");
+    s.push_str("# Layers were inferred from the crate dependency graph: one per crate, ordered\n");
+    s.push_str(
+        "# top (most dependent) to bottom. The forbid rules ban upward dependencies, which\n",
+    );
+    s.push_str("# do not exist today; the ratchet catches a future PR that introduces one.\n\n");
+
+    s.push_str("[layers]\n");
+    // order: highest tier (top) first.
+    let order: Vec<String> = distinct_tiers
+        .iter()
+        .rev()
+        .map(|&t| layer_name(t))
+        .collect();
+    let _ = writeln!(
+        s,
+        "order = [{}]",
+        order
+            .iter()
+            .map(|l| format!("\"{l}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    // A comment naming the crates in each tier, top to bottom.
+    for &t in distinct_tiers.iter().rev() {
+        let members: Vec<&str> = crates
+            .iter()
+            .filter(|c| tiers[*c] == t)
+            .map(String::as_str)
+            .collect();
+        let _ = writeln!(s, "# {}: {}", layer_name(t), members.join(", "));
+    }
+    s.push_str("map = [\n");
+    for (crate_name, glob) in &globs {
+        let _ = writeln!(
+            s,
+            "    {{ layer = \"{}\", glob = \"{}\" }},  # {}",
+            layer_name(tiers[crate_name]),
+            glob,
+            crate_name
+        );
+    }
+    s.push_str("]\n");
+    // forbid: for every pair of tiers, ban the lower depending on the higher (an upward edge).
+    s.push_str("forbid = [\n");
+    let tier_list: Vec<usize> = distinct_tiers.iter().copied().collect();
+    for (i, &lo) in tier_list.iter().enumerate() {
+        for &hi in &tier_list[i + 1..] {
+            let _ = writeln!(
+                s,
+                "    {{ from = \"{}\", to = \"{}\" }},",
+                layer_name(lo),
+                layer_name(hi)
+            );
+        }
+    }
+    s.push_str("]\n\n");
+
+    s.push_str("[views]\nenabled = [\"modules\"]\n\n");
+    // layering is inferred, so it is a WARNING by default: adopting the tool never turns a build red
+    // by surprise. Promote it to deny (uncomment below) once the inferred layering reflects intent.
+    s.push_str(
+        "[lint]\n# deny = [\"layering\"]  # uncomment to fail the build on an upward dependency\n",
+    );
+    s.push_str("warn = [\"layering\", \"cycles\"]\n\n");
+    s.push_str("[ratchet]\nmode = \"new-only\"\n");
+    s
+}
+
+/// The hand-fill fallback config for a single-crate repo (nothing to infer): a valid file that
+/// denies nothing, warns on cycles, and carries the detected glob plus a commented layer template.
+fn init_template(head: &Graph) -> String {
     let mut s = String::new();
     s.push_str("# cargo-structure-diff configuration, generated by `csd init`.\n");
     s.push_str(
-        "# Assign the detected crates to architectural layers, then declare forbidden edges.\n\n",
+        "# Single crate detected: assign modules to layers by glob, then declare forbidden edges.\n\n",
     );
     s.push_str("[layers]\n");
     s.push_str("# order lists strata top (may depend downward) to bottom, for example:\n");
-    s.push_str("# order = [\"app\", \"contract\"]\n");
-    s.push_str("# map assigns each module path to a layer (first match wins). Detected crates:\n");
+    s.push_str("# order = [\"app\", \"core\"]\n");
+    s.push_str("# map assigns each module path to a layer (first match wins). Detected roots:\n");
     s.push_str("# map = [\n");
     for glob in detected_crate_globs(head) {
         let _ = writeln!(s, "#     {{ layer = \"app\", glob = \"{glob}\" }},");
     }
     s.push_str("# ]\n");
-    s.push_str("# forbid = [{ from = \"contract\", to = \"app\" }]\n\n");
+    s.push_str("# forbid = [{ from = \"core\", to = \"app\" }]\n\n");
     s.push_str("[views]\nenabled = [\"modules\"]\n\n");
-    // cycles is a WARN, not a deny: Rust module graphs are naturally cyclic (sibling modules
-    // import from each other, and the crate root re-exports its children with `pub use`), so a new
-    // module joining that web is not a build-breaking defect. The generated gate therefore fails
-    // only on layering edges the user declares above; a new cycle is surfaced as a warning. Move
-    // `cycles` into `deny` to fail on new cycles once a repo has an acyclic module design to defend.
     s.push_str("[lint]\n# deny = [\"layering\"]  # uncomment once layers are declared above\n");
     s.push_str("warn = [\"cycles\"]\n\n");
     s.push_str("[ratchet]\nmode = \"new-only\"\n");
@@ -1463,14 +1668,27 @@ fn repo_root() -> Result<PathBuf> {
     Ok(PathBuf::from(out.trim()))
 }
 
-/// Load `.csd.toml` from `repo` if present, else the default config.
+/// Load `.csd.toml` from `repo` if present, else the zero-config defaults.
 fn load_config(repo: &Path) -> Result<Config> {
     let path = repo.join(".csd.toml");
     if path.exists() {
         Ok(Config::load(&path)?)
     } else {
-        Ok(Config::default())
+        Ok(zero_config_defaults())
     }
+}
+
+/// The config used when a repo has no `.csd.toml`: the module view plus `cycles` as a warning. A
+/// warning never fails the build (so zero-config can never cry wolf), but it makes `csd diff` worth
+/// running out of the box - a PR that introduces a new module import cycle is surfaced. The moment a
+/// repo adds a `.csd.toml` the user is in full control and these defaults no longer apply. Kept here,
+/// and public, so the validation harness replays the real zero-config behaviour rather than a bare
+/// `Config::default` that would lint nothing.
+pub fn zero_config_defaults() -> Config {
+    let mut config = Config::default();
+    config.views.enabled = vec!["modules".to_string()];
+    config.lint.warn = vec!["cycles".to_string()];
+    config
 }
 
 /// Run the whole pipeline against `repo`: base ref vs the current working tree.
@@ -2933,6 +3151,114 @@ trailing noise
                 "generated config must not reference the unimplemented lint {dead:?}"
             );
         }
+    }
+
+    /// A crate-root module node living under `crates/<name>/src/lib.rs`.
+    fn crate_mod(name: &str) -> csd_ir::Node {
+        let mut n = cl_node(name, NodeKind::Module);
+        n.span.file = format!("crates/{name}/src/lib.rs");
+        n
+    }
+
+    /// A module `Uses` edge from `from` to `to`.
+    fn uses_edge(from: &str, to: &str) -> csd_ir::Edge {
+        csd_ir::Edge {
+            from: StableId::new(from),
+            to: StableId::new(to),
+            kind: EdgeKind::Uses,
+            span: cl_node("x", NodeKind::Module).span,
+            ordinal: None,
+        }
+    }
+
+    #[test]
+    fn init_infers_crate_tiers_and_passes_on_the_current_tree() {
+        // app depends on util and core; util depends on core. Tiers: core=0, util=1, app=2.
+        let mut graph = Graph::new();
+        graph.nodes = vec![crate_mod("app"), crate_mod("util"), crate_mod("core")];
+        graph.edges = vec![
+            uses_edge("app", "util"),
+            uses_edge("app", "core"),
+            uses_edge("util", "core"),
+        ];
+        graph.normalize();
+
+        let toml = init_config(&graph);
+        let config = csd_config::Config::parse(&toml).expect("inferred config must parse");
+
+        // Top (most dependent) to bottom.
+        assert_eq!(
+            config.layers.order,
+            vec![
+                "tier2".to_string(),
+                "tier1".to_string(),
+                "tier0".to_string()
+            ],
+            "layer order should be top-to-bottom:\n{toml}"
+        );
+        // Each crate maps to the tier its dependency depth puts it in.
+        assert_eq!(config.layer_of("crates/app/src/lib.rs"), Some("tier2"));
+        assert_eq!(config.layer_of("crates/util/src/lib.rs"), Some("tier1"));
+        assert_eq!(config.layer_of("crates/core/src/lib.rs"), Some("tier0"));
+        // Inferred layering is a warning, never a deny, so adoption cannot turn a build red.
+        assert!(
+            config.lint.deny.is_empty(),
+            "inferred config must deny nothing"
+        );
+        assert!(config.lint.warn.iter().any(|w| w == "layering"));
+
+        // Passes today: promote layering to deny AND check every current edge (ratchet all). The
+        // inferred forbids ban only upward edges, which the acyclic crate graph does not contain,
+        // so no layering finding may fire on the tree the config was generated from.
+        let mut strict = config.clone();
+        strict.lint.deny.push("layering".to_string());
+        strict.ratchet.mode = csd_config::RatchetMode::All;
+        let changes: Vec<Change> = graph.edges.iter().cloned().map(Change::EdgeAdded).collect();
+        let findings = csd_lint::lint(&graph, &changes, &strict);
+        let layering: Vec<_> = findings.iter().filter(|f| f.rule == "layering").collect();
+        assert!(
+            layering.is_empty(),
+            "the inferred config must pass on its own source tree, got: {layering:?}"
+        );
+    }
+
+    #[test]
+    fn inferred_layering_catches_a_new_upward_dependency() {
+        // Generate the layered config from the acyclic app/util/core workspace.
+        let mut graph = Graph::new();
+        graph.nodes = vec![crate_mod("app"), crate_mod("util"), crate_mod("core")];
+        graph.edges = vec![
+            uses_edge("app", "util"),
+            uses_edge("app", "core"),
+            uses_edge("util", "core"),
+        ];
+        graph.normalize();
+        let toml = init_config(&graph);
+        let mut config = csd_config::Config::parse(&toml).unwrap();
+        // Promote the inferred warning to a deny, as a team would once the layering reflects intent.
+        config.lint.deny.push("layering".to_string());
+
+        // A PR adds an upward dependency: core (tier0) now uses app (tier2). Under the default
+        // new-only ratchet the gate must flag exactly this newly added edge.
+        let upward = uses_edge("core", "app");
+        let mut head = graph.clone();
+        head.edges.push(upward.clone());
+        head.normalize();
+        let changes = vec![Change::EdgeAdded(upward)];
+
+        let findings = csd_lint::lint(&head, &changes, &config);
+        let layering: Vec<_> = findings.iter().filter(|f| f.rule == "layering").collect();
+        assert_eq!(
+            layering.len(),
+            1,
+            "a new upward dependency must deny exactly once, got: {findings:?}"
+        );
+        assert_eq!(layering[0].severity, Severity::Deny);
+        assert!(
+            layering[0].message.contains("tier0") && layering[0].message.contains("tier2"),
+            "the finding should name the offending layers: {}",
+            layering[0].message
+        );
     }
 
     #[test]
