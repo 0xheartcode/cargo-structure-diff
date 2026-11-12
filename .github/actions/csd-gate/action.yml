@@ -36,10 +36,28 @@ runs:
       id: base
       shell: bash
       run: |
+        set -euo pipefail
         base="${{ inputs.base }}"
         if [ -z "$base" ]; then
-          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}" || true
-          base="origin/${{ github.base_ref }}"
+          base_branch="${{ github.base_ref }}"
+          if [ -z "$base_branch" ]; then
+            echo "csd-gate: no base provided and github.base_ref is empty (not a pull_request event?)." >&2
+            echo "csd-gate: pass the 'base' input, e.g. base: origin/main." >&2
+            exit 1
+          fi
+          # actions/checkout defaults to a shallow clone, so the base commit is usually absent.
+          # Fetch just the base branch tip; csd diffs that against the working tree.
+          if ! git fetch --no-tags --depth=1 origin "$base_branch"; then
+            echo "csd-gate: failed to fetch base branch '$base_branch' from origin." >&2
+            echo "csd-gate: ensure the workflow has 'contents: read' and actions/checkout ran." >&2
+            exit 1
+          fi
+          base="origin/$base_branch"
+        fi
+        # Verify the base ref actually resolves before handing it to csd, for a clear early error.
+        if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
+          echo "csd-gate: base ref '$base' does not resolve to a commit after fetch." >&2
+          exit 1
         fi
         echo "ref=$base" >> "$GITHUB_OUTPUT"
 
