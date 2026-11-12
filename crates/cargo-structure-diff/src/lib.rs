@@ -216,9 +216,10 @@ impl Report {
         i32::from(self.denied())
     }
 
-    /// Print the always-on summary. On a denial, the findings and diagrams go to stderr (the
-    /// diagram is the error message). With `show`, the diagrams are also printed on a clean run,
-    /// to stdout, so the tool is usable interactively.
+    /// Print the always-on summary. Findings (deny and warn) go to stderr whenever any exist, so a
+    /// warning is surfaced even on a clean run - the gate can show it and an interactive run sees it.
+    /// On a denial the diagrams also go to stderr (the diagram is the error message); with `show`
+    /// they are printed on a clean run too, to stdout, so the tool is usable interactively.
     fn print(&self, base: &str, show: bool) {
         let denials = self
             .findings
@@ -231,7 +232,7 @@ impl Report {
             self.changes.len()
         );
         let denied = self.denied();
-        if denied {
+        if !self.findings.is_empty() {
             eprintln!("\nlint findings:");
             for f in &self.findings {
                 let tag = match f.severity {
