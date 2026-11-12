@@ -134,9 +134,13 @@ name = "csd-harness"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "cargo-structure-diff",
+ "csd-config",
  "csd-diff",
  "csd-extract-rs",
  "csd-ir",
+ "csd-lint",
+ "serde",
  "serde_json",
 ]
 

@@ -17,5 +17,11 @@ path = "src/main.rs"
 csd-ir = { workspace = true, features = ["serde"] }
 csd-diff = { workspace = true }
 csd-extract-rs = { workspace = true }
+csd-config = { workspace = true }
+csd-lint = { workspace = true }
+# The CLI crate's library, so the replay runs the gate under exactly the config `csd init`
+# generates (via its public `init_config`), never a drifting hand-maintained copy.
+cargo-structure-diff = { path = "../cargo-structure-diff" }
 anyhow = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }

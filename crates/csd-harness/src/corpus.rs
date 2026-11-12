@@ -29,21 +29,46 @@ pub struct Repo {
     pub name: &'static str,
     /// Clone URL.
     pub url: &'static str,
+    /// The commit the replay walks back from, pinned so a run is reproducible regardless of when
+    /// the clone was last fetched. New history past this SHA is simply ignored.
+    pub pin: &'static str,
 }
 
-/// The fixed corpus: a few large, active Rust codebases with plenty of real refactors.
+/// The fixed corpus: five large, active Rust codebases of deliberately different shapes so the
+/// replay exercises the gate across varied module structures:
+/// - `ripgrep`  - a small-to-mid multi-crate workspace (search tool).
+/// - `bat`      - a single-binary app (a `cat` clone), the simplest shape.
+/// - `tokio`    - a large async-runtime workspace with deep internal module graphs.
+/// - `axum`     - a web-framework workspace (tower/hyper ecosystem).
+/// - `nushell`  - a very large multi-crate workspace (a shell), the stress case.
+///
+/// Each repo is pinned at a recorded SHA (its HEAD when first added) so results are reproducible:
+/// the walker starts from the pin, not the clone's current tip.
 pub const CORPUS: &[Repo] = &[
-    Repo {
-        name: "tokio",
-        url: "https://github.com/tokio-rs/tokio",
-    },
     Repo {
         name: "ripgrep",
         url: "https://github.com/BurntSushi/ripgrep",
+        pin: "3fce3b5bb0236da2df6d99672afb8a719642eca7",
     },
     Repo {
         name: "bat",
         url: "https://github.com/sharkdp/bat",
+        pin: "b671e53c2cd0177beb357cf6cb997ee4215c7155",
+    },
+    Repo {
+        name: "tokio",
+        url: "https://github.com/tokio-rs/tokio",
+        pin: "ab0814fc8c62b3d8be40aad068e2fed6562cfeb0",
+    },
+    Repo {
+        name: "axum",
+        url: "https://github.com/tokio-rs/axum",
+        pin: "fc9aae614c069ac2114874786fc7381e42fced1b",
+    },
+    Repo {
+        name: "nushell",
+        url: "https://github.com/nushell/nushell",
+        pin: "ab6c901127083f940c39e68670850dbd69f1ee10",
     },
 ];
 
