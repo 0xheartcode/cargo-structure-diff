@@ -874,9 +874,10 @@ fn detected_crate_globs(head: &Graph) -> Vec<String> {
 }
 
 /// Render a starter `.csd.toml`: a commented layer-mapping template pre-filled with this repo's
-/// detected crate globs, plus sensible defaults (module view, cycle lint, new-only ratchet). The
-/// layers section is left commented so the config is valid immediately and the user opts in to a
-/// constraint by uncommenting and assigning layers.
+/// detected crate globs, plus sensible defaults (module view, `cycles` as a warning, new-only
+/// ratchet). The layers section is left commented so the config is valid immediately and denies
+/// nothing until the user assigns layers - the generated gate cannot produce a false red on a fresh
+/// repo, which is the whole point of a tool teams keep installed.
 ///
 /// Public so the validation harness can replay the gate under exactly the config `csd init` would
 /// generate for a repo, rather than a hand-maintained copy that could drift from the real template.
@@ -897,7 +898,13 @@ pub fn init_config(head: &Graph) -> String {
     s.push_str("# ]\n");
     s.push_str("# forbid = [{ from = \"contract\", to = \"app\" }]\n\n");
     s.push_str("[views]\nenabled = [\"modules\"]\n\n");
-    s.push_str("[lint]\ndeny = [\"cycles\"]\nwarn = [\"fan_in\", \"fan_out\"]\n\n");
+    // cycles is a WARN, not a deny: Rust module graphs are naturally cyclic (sibling modules
+    // import from each other, and the crate root re-exports its children with `pub use`), so a new
+    // module joining that web is not a build-breaking defect. The generated gate therefore fails
+    // only on layering edges the user declares above; a new cycle is surfaced as a warning. Move
+    // `cycles` into `deny` to fail on new cycles once a repo has an acyclic module design to defend.
+    s.push_str("[lint]\n# deny = [\"layering\"]  # uncomment once layers are declared above\n");
+    s.push_str("warn = [\"cycles\"]\n\n");
     s.push_str("[ratchet]\nmode = \"new-only\"\n");
     s
 }
@@ -2902,7 +2909,30 @@ trailing noise
             "generated config should carry the detected glob:\n{toml}"
         );
         // The generated config parses as valid, so `csd init` never emits a broken file.
-        csd_config::Config::parse(&toml).expect("generated config must be valid");
+        let config = csd_config::Config::parse(&toml).expect("generated config must be valid");
+        // Regression (Phase-1 replay triage): the generated gate must have NO denying lint, so it
+        // cannot produce a false red on a fresh repo. `cycles` is a warning - Rust module graphs
+        // are naturally cyclic, so a new cycle is information, not a build failure. Deny power comes
+        // only from layering the user declares. See the replay: axum/ripgrep had 28-/9-module SCCs
+        // from ordinary cross-module `use`, which `deny = ["cycles"]` would have failed builds on.
+        assert!(
+            config.lint.deny.is_empty(),
+            "the generated config must deny nothing by default, got deny = {:?}",
+            config.lint.deny
+        );
+        assert_eq!(
+            config.lint.warn,
+            vec!["cycles".to_string()],
+            "cycles should be the sole default warning"
+        );
+        // And it must not advertise lints the linter does not implement (fan_in/fan_out were dead).
+        for dead in ["fan_in", "fan_out"] {
+            assert!(
+                !config.lint.warn.iter().any(|w| w == dead)
+                    && !config.lint.deny.iter().any(|d| d == dead),
+                "generated config must not reference the unimplemented lint {dead:?}"
+            );
+        }
     }
 
     #[test]
