@@ -13,6 +13,7 @@
 mod corpus;
 mod materialize;
 mod metrics;
+mod replay;
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -40,9 +41,10 @@ fn main() -> Result<()> {
         Some("corpus") => run_corpus(),
         Some("ir") => run_ir(&args[2..]),
         Some("sweep") => run_sweep(&args[2..]),
+        Some("replay") => replay::run_replay(&args[2..]),
         _ => {
             eprintln!(
-                "csd-harness: usage: pairs <repo> [n] | corpus | ir <repo> <sha> | sweep [--refactor] [repo-name] [n] [candidates]. See SPEC.md section 6."
+                "csd-harness: usage: pairs <repo> [n] | corpus | ir <repo> <sha> | sweep [--refactor] [repo-name] [n] [candidates] | replay [repo-name] [n] [--out <dir>]. See SPEC.md section 6 and the Phase-1 mission."
             );
             Ok(())
         }
