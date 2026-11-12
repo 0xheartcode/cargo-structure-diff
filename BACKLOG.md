@@ -66,7 +66,7 @@ e462549 [closed] extract/render: states view only for real state machines
         labels:area:extract, independent, type:feat priority:high milestone:m1
 743edea [closed] cli: --list textual per-node change summary
         labels:area:cli, independent, type:feat priority:high milestone:m6
-76d42ea [open] release: CHANGELOG, MSRV, tri-OS CI, README rewrite, bump 0.1.0
+76d42ea [closed] release: CHANGELOG, MSRV, tri-OS CI, README rewrite, bump 0.1.0
         labels:area:infra priority:high milestone:adoption
 7916cfb [closed] cli: csd doc - browsable whole-codebase structure report (SchemaSpy-style)
         labels:area:cli, area:render, independent, type:feat priority:high milestone:m6
