@@ -42,9 +42,13 @@ e462549 [closed] extract/render: states view only for real state machines
         labels:area:harness, independent, type:feat priority:high milestone:m0
 2a3e316 [closed] render-states: stateDiagram-v2 with delta colouring
         labels:area:render, independent, type:feat priority:high milestone:m2
+2b2e571 [closed] lint: cycles ignores containment edges so it reports real cycles
+        labels:area:lint, independent, type:fix priority:high milestone:adoption
 311ff60 [closed] lint-states: reachability and cycle rules
         labels:area:lint, independent, type:feat priority:high milestone:m2
 3f2c636 [closed] harness: replay the gate across the corpus to measure noise vs signal
+        labels:area:harness, independent, type:feat priority:high milestone:adoption
+433136b [closed] harness: measure signal by replaying inferred layering promoted to deny
         labels:area:harness, independent, type:feat priority:high milestone:adoption
 4894e6a [closed] lint: layering and cycles over the module graph with ratchet
         labels:area:lint, blocking, type:feat priority:high milestone:m1
