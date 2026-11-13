@@ -29,6 +29,10 @@ delete + add**.
   violation and a rename shown as a move. Regenerate with `scripts/gen-gallery.sh`.
 
 ### Changed
+- Collapsed the seven library crates (`csd-ir`, `csd-config`, `csd-diff`, `csd-extract-rs`,
+  `csd-extract-db`, `csd-render`, `csd-lint`) into the single `cargo-structure-diff` crate as modules
+  (`crate::ir`, `crate::diff`, …), so csd installs and publishes as one crate. `csd-harness` and
+  `csd-goldens` remain internal `publish = false` test crates that depend on it.
 - `csd diff --view <name>` now overrides the views enabled in `.csd.toml` instead of being silently
   ignored, and validates the name. `call-graph` is accepted as an alias for `callgraph`.
 - `csd init` generates a config that denies nothing by default. Module cycles are a warning, not a

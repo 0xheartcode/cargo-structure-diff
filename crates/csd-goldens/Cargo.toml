@@ -12,7 +12,5 @@ publish = false
 [dependencies]
 
 [dev-dependencies]
-csd-ir = { workspace = true }
-csd-extract-rs = { workspace = true }
-csd-diff = { workspace = true }
+cargo-structure-diff = { workspace = true }
 tempfile = "3"

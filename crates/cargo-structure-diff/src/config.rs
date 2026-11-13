@@ -111,7 +111,7 @@ pub struct Views {
     /// View names, for example `modules`, `states`, `types`, `calls`.
     #[serde(default)]
     pub enabled: Vec<String>,
-    /// Entry-point function id for the `calls` sequence slice (for example `crate::main`). When
+    /// Entry-point function id for the `calls` sequence slice (for example `crate::config::main`). When
     /// unset, the CLI picks the first function with outgoing calls.
     #[serde(default)]
     pub entry: Option<String>,
@@ -133,10 +133,10 @@ pub struct Lint {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Calls {
-    /// Globs matched against a caller function id, for example `crate::server::*`.
+    /// Globs matched against a caller function id, for example `crate::config::server::*`.
     #[serde(default)]
     pub hot: Vec<String>,
-    /// Globs matched against a callee's owning module id, for example `crate::db`.
+    /// Globs matched against a callee's owning module id, for example `crate::config::db`.
     #[serde(default)]
     pub io: Vec<String>,
 }

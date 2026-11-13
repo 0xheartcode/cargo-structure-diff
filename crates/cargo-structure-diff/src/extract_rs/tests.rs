@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::Path;
 
-use csd_ir::{EdgeKind, Graph, Node, NodeKind};
+use crate::ir::{EdgeKind, Graph, Node, NodeKind};
 
 use super::extract;
 

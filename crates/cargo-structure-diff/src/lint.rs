@@ -25,8 +25,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use csd_config::{Config, RatchetMode};
-use csd_ir::{Change, EdgeKind, Graph, NodeKind, StableId};
+use crate::config::{Config, RatchetMode};
+use crate::ir::{Change, EdgeKind, Graph, NodeKind, StableId};
 
 /// Whether a finding fails the build or only reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -510,7 +510,7 @@ fn io_in_hot_path(
 
 /// Parse a Table node's `columns` attribute ("id: Int4, name: Varchar", sorted by name, as emitted
 /// by csd-extract-db) into a `name -> type` map. Missing attribute yields an empty map.
-fn parse_columns_attr(node: &csd_ir::Node) -> BTreeMap<&str, &str> {
+fn parse_columns_attr(node: &crate::ir::Node) -> BTreeMap<&str, &str> {
     let mut cols = BTreeMap::new();
     let Some(raw) = node.attrs.get("columns") else {
         return cols;
@@ -653,14 +653,14 @@ fn strongly_connected<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use csd_ir::{Edge, SourceSpan};
+    use crate::ir::{Edge, SourceSpan};
 
     fn cfg(toml: &str) -> Config {
         Config::parse(toml).unwrap()
     }
 
-    fn module(id: &str, file: &str) -> csd_ir::Node {
-        csd_ir::Node {
+    fn module(id: &str, file: &str) -> crate::ir::Node {
+        crate::ir::Node {
             id: StableId::new(id),
             kind: NodeKind::Module,
             span: SourceSpan {
@@ -687,8 +687,8 @@ mod tests {
         }
     }
 
-    fn variant(id: &str) -> csd_ir::Node {
-        csd_ir::Node {
+    fn variant(id: &str) -> crate::ir::Node {
+        crate::ir::Node {
             id: StableId::new(id),
             kind: NodeKind::Variant,
             span: SourceSpan {
@@ -878,7 +878,7 @@ deny = ["layering", "cycles"]
     #[test]
     fn sibling_cycle_survives_containment_filtering() {
         // Two sibling modules under a common parent genuinely cycle. Containment filtering must not
-        // hide this: `crate::a::x` and `crate::a::y` are not nested in each other.
+        // hide this: `crate::lint::a::x` and `crate::lint::a::y` are not nested in each other.
         let head = Graph {
             nodes: vec![
                 module("crate::a::x", "src/a/x.rs"),
@@ -1177,8 +1177,8 @@ deny = ["layering", "cycles"]
         }
     }
 
-    fn fn_node(id: &str) -> csd_ir::Node {
-        csd_ir::Node {
+    fn fn_node(id: &str) -> crate::ir::Node {
+        crate::ir::Node {
             id: StableId::new(id),
             kind: NodeKind::Fn,
             span: SourceSpan {
@@ -1330,12 +1330,12 @@ mode = "all"
         assert!(lint(&head, &changes, &cfg(toml)).is_empty());
     }
 
-    fn table(id: &str, columns: &str) -> csd_ir::Node {
+    fn table(id: &str, columns: &str) -> crate::ir::Node {
         let mut attrs = BTreeMap::new();
         if !columns.is_empty() {
             attrs.insert("columns".to_string(), columns.to_string());
         }
-        csd_ir::Node {
+        crate::ir::Node {
             id: StableId::new(id),
             kind: NodeKind::Table,
             span: SourceSpan {

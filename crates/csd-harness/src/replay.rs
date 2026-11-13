@@ -3,7 +3,7 @@
 //! Where the [`crate::metrics`] sweep answers "does rename detection lie?", this module answers the
 //! product question that decides adoption (see the Phase-1 mission): **when the gate goes red, is it
 //! right?** For each first-parent pair (one merged PR) it runs the exact verdict path the real gate
-//! runs - [`csd_diff::diff`] at the gate's rename threshold, then [`csd_lint::lint`] - under two
+//! runs - [`cargo_structure_diff::diff::diff`] at the gate's rename threshold, then [`cargo_structure_diff::lint::lint`] - under two
 //! configs:
 //!
 //! - **zero**: [`Config::default`], what a user gets with no `.csd.toml`.
@@ -22,10 +22,10 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use csd_config::Config;
-use csd_diff::{diff, DiffOptions, FileRename};
-use csd_ir::{Change, Graph, NodeKind};
-use csd_lint::{has_denials, lint, Finding, Severity};
+use cargo_structure_diff::config::Config;
+use cargo_structure_diff::diff::{diff, DiffOptions, FileRename};
+use cargo_structure_diff::ir::{Change, Graph, NodeKind};
+use cargo_structure_diff::lint::{has_denials, lint, Finding, Severity};
 use serde::Serialize;
 
 use crate::corpus::{self, CommitPair, Repo};
@@ -580,7 +580,7 @@ fn prev_is_valued_flag(args: &[String], idx: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use csd_ir::{Node, SourceSpan, StableId};
+    use cargo_structure_diff::ir::{Node, SourceSpan, StableId};
 
     fn module(id: &str, file: &str) -> Node {
         Node {

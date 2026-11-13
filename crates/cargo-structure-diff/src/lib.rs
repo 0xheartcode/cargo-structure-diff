@@ -9,17 +9,28 @@
 //! The real work lives in [`analyze`] so both binaries stay thin and the pipeline is testable
 //! without touching the process working directory.
 
+// The library modules, formerly separate workspace crates. One graph IR; every view is a projection
+// over it (SPEC.md section 4). Kept as modules of the single published crate so csd ships as one
+// `cargo install`/`cargo publish`, with the layering now enforced at the module level.
+pub mod config;
+pub mod diff;
+pub mod extract_db;
+pub mod extract_rs;
+pub mod ir;
+pub mod lint;
+pub mod render;
+
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::config::Config;
+use crate::diff::{diff, member_diff, DiffOptions, FileRename};
+use crate::ir::{Change, EdgeKind, Graph, NodeKind, StableId};
+use crate::lint::{has_denials, lint, Finding, Severity};
+use crate::render::{render, Format, RenderOpts, View};
 use anyhow::{bail, Context, Result};
-use csd_config::Config;
-use csd_diff::{diff, member_diff, DiffOptions, FileRename};
-use csd_ir::{Change, EdgeKind, Graph, NodeKind, StableId};
-use csd_lint::{has_denials, lint, Finding, Severity};
-use csd_render::{render, Format, RenderOpts, View};
 
 /// Default base ref when `--base` is omitted.
 const DEFAULT_BASE: &str = "main";
@@ -594,7 +605,7 @@ fn run_snapshot(out: Option<&str>) -> Result<i32> {
 
 /// Format the delta as a deterministic, reviewer-friendly change list, one line per change.
 ///
-/// The order follows `csd_diff::diff`'s stable sort (added nodes, removed, modified, moved, then
+/// The order follows `crate::diff::diff`'s stable sort (added nodes, removed, modified, moved, then
 /// edge add/remove), so the list is byte-stable across runs. See [`change_line`] for the formats.
 fn change_list(changes: &[Change]) -> Vec<String> {
     changes.iter().map(change_line).collect()
@@ -641,7 +652,7 @@ fn change_line(change: &Change) -> String {
 
 /// The `(+f ~g -h)` per-member detail for a modified node, or `None` when nothing differs at the
 /// member level (a bare `~` line). Parts are ordered added, changed, removed.
-fn member_detail(before: &csd_ir::Node, after: &csd_ir::Node) -> Option<String> {
+fn member_detail(before: &crate::ir::Node, after: &crate::ir::Node) -> Option<String> {
     let delta = member_diff(before, after);
     if delta.added.is_empty() && delta.changed.is_empty() && delta.removed.is_empty() {
         return None;
@@ -899,7 +910,7 @@ fn detected_crate_globs(head: &Graph) -> Vec<String> {
 /// Map each crate (by module-id prefix) to a representative source glob. Deterministic: the first
 /// glob in id-sorted order wins, and a crate whose files are not under a `src/` dir is omitted.
 fn crate_to_glob(head: &Graph) -> std::collections::BTreeMap<String, String> {
-    let mut nodes: Vec<&csd_ir::Node> = head
+    let mut nodes: Vec<&crate::ir::Node> = head
         .nodes
         .iter()
         .filter(|n| n.kind == NodeKind::Module)
@@ -1176,7 +1187,7 @@ pub fn files_markdown(head: &Graph) -> String {
 
 /// One line for a function node: its name with the captured signature (`foo(a: u32) -> bool`) when
 /// the extractor recorded one, else just the name.
-fn fn_line(n: &csd_ir::Node) -> String {
+fn fn_line(n: &crate::ir::Node) -> String {
     match n.attrs.get("sig") {
         Some(sig) => format!("`{}{sig}`", short_name(&n.id)),
         None => format!("`{}`", short_name(&n.id)),
@@ -1185,7 +1196,7 @@ fn fn_line(n: &csd_ir::Node) -> String {
 
 /// One line for a type node: `struct `Name`` plus `{ field: Type, ... }` when member types are
 /// known, or a bare member list when only names are, or just the name when it has neither.
-fn type_line(n: &csd_ir::Node) -> String {
+fn type_line(n: &crate::ir::Node) -> String {
     let kind = node_kind_name(n.kind);
     let name = short_name(&n.id);
     let Some(fp) = &n.fingerprint else {
@@ -1775,8 +1786,10 @@ fn load_baseline(path: &str) -> Result<Graph> {
 /// Extract the current working tree as one head graph: the Rust module graph merged with the
 /// schema graph, so the schema view and schema lints see the same head both `diff` and `doc` use.
 fn extract_head(repo: &Path) -> Result<Graph> {
-    let mut head = csd_extract_rs::extract(repo).context("failed to extract head working tree")?;
-    let schema = csd_extract_db::extract_schema(repo).context("failed to extract head schema")?;
+    let mut head =
+        crate::extract_rs::extract(repo).context("failed to extract head working tree")?;
+    let schema =
+        crate::extract_db::extract_schema(repo).context("failed to extract head schema")?;
     merge_schema(&mut head, schema);
     Ok(head)
 }
@@ -1860,9 +1873,9 @@ fn base_graph(repo: &Path, base: &str) -> Result<Graph> {
     // Extract the module graph and the schema graph from the one base worktree, then merge, so the
     // schema view and the destructive_migration lint see both sides of the delta.
     let result = (|| {
-        let mut graph = csd_extract_rs::extract(&worktree)
+        let mut graph = crate::extract_rs::extract(&worktree)
             .with_context(|| format!("failed to extract {base:?}"))?;
-        let schema = csd_extract_db::extract_schema(&worktree)
+        let schema = crate::extract_db::extract_schema(&worktree)
             .with_context(|| format!("failed to extract {base:?} schema"))?;
         merge_schema(&mut graph, schema);
         Ok(graph)
@@ -2119,7 +2132,7 @@ deny = [\"layering\", \"cycles\"]
                 from: StableId::new("crate::x"),
                 to: StableId::new("crate::y"),
             },
-            Change::EdgeAdded(csd_ir::Edge {
+            Change::EdgeAdded(crate::ir::Edge {
                 from: StableId::new("crate::A"),
                 to: StableId::new("crate::B"),
                 kind: EdgeKind::Uses,
@@ -3042,11 +3055,11 @@ trailing noise
         assert_eq!(written, doc, "the -o file holds the whole report");
     }
 
-    fn cl_node(id: &str, kind: NodeKind) -> csd_ir::Node {
-        csd_ir::Node {
+    fn cl_node(id: &str, kind: NodeKind) -> crate::ir::Node {
+        crate::ir::Node {
             id: StableId::new(id),
             kind,
-            span: csd_ir::SourceSpan {
+            span: crate::ir::SourceSpan {
                 file: "src/lib.rs".into(),
                 start: 0,
                 end: 1,
@@ -3062,7 +3075,7 @@ trailing noise
             Change::Added(cl_node("crate::billing::Invoice", NodeKind::Struct)),
             Change::Removed(cl_node("crate::billing::legacy_charge", NodeKind::Fn)),
             Change::Added(cl_node("crate::payments::Card", NodeKind::Struct)),
-            Change::EdgeAdded(csd_ir::Edge {
+            Change::EdgeAdded(crate::ir::Edge {
                 from: StableId::new("crate::billing"),
                 to: StableId::new("crate::payments"),
                 kind: EdgeKind::Uses,
@@ -3128,7 +3141,7 @@ trailing noise
             "generated config should carry the detected glob:\n{toml}"
         );
         // The generated config parses as valid, so `csd init` never emits a broken file.
-        let config = csd_config::Config::parse(&toml).expect("generated config must be valid");
+        let config = crate::config::Config::parse(&toml).expect("generated config must be valid");
         // Regression (Phase-1 replay triage): the generated gate must have NO denying lint, so it
         // cannot produce a false red on a fresh repo. `cycles` is a warning - Rust module graphs
         // are naturally cyclic, so a new cycle is information, not a build failure. Deny power comes
@@ -3155,15 +3168,15 @@ trailing noise
     }
 
     /// A crate-root module node living under `crates/<name>/src/lib.rs`.
-    fn crate_mod(name: &str) -> csd_ir::Node {
+    fn crate_mod(name: &str) -> crate::ir::Node {
         let mut n = cl_node(name, NodeKind::Module);
         n.span.file = format!("crates/{name}/src/lib.rs");
         n
     }
 
     /// A module `Uses` edge from `from` to `to`.
-    fn uses_edge(from: &str, to: &str) -> csd_ir::Edge {
-        csd_ir::Edge {
+    fn uses_edge(from: &str, to: &str) -> crate::ir::Edge {
+        crate::ir::Edge {
             from: StableId::new(from),
             to: StableId::new(to),
             kind: EdgeKind::Uses,
@@ -3185,7 +3198,7 @@ trailing noise
         graph.normalize();
 
         let toml = init_config(&graph);
-        let config = csd_config::Config::parse(&toml).expect("inferred config must parse");
+        let config = crate::config::Config::parse(&toml).expect("inferred config must parse");
 
         // Top (most dependent) to bottom.
         assert_eq!(
@@ -3213,9 +3226,9 @@ trailing noise
         // so no layering finding may fire on the tree the config was generated from.
         let mut strict = config.clone();
         strict.lint.deny.push("layering".to_string());
-        strict.ratchet.mode = csd_config::RatchetMode::All;
+        strict.ratchet.mode = crate::config::RatchetMode::All;
         let changes: Vec<Change> = graph.edges.iter().cloned().map(Change::EdgeAdded).collect();
-        let findings = csd_lint::lint(&graph, &changes, &strict);
+        let findings = crate::lint::lint(&graph, &changes, &strict);
         let layering: Vec<_> = findings.iter().filter(|f| f.rule == "layering").collect();
         assert!(
             layering.is_empty(),
@@ -3235,7 +3248,7 @@ trailing noise
         ];
         graph.normalize();
         let toml = init_config(&graph);
-        let mut config = csd_config::Config::parse(&toml).unwrap();
+        let mut config = crate::config::Config::parse(&toml).unwrap();
         // Promote the inferred warning to a deny, as a team would once the layering reflects intent.
         config.lint.deny.push("layering".to_string());
 
@@ -3247,7 +3260,7 @@ trailing noise
         head.normalize();
         let changes = vec![Change::EdgeAdded(upward)];
 
-        let findings = csd_lint::lint(&head, &changes, &config);
+        let findings = crate::lint::lint(&head, &changes, &config);
         let layering: Vec<_> = findings.iter().filter(|f| f.rule == "layering").collect();
         assert_eq!(
             layering.len(),
@@ -3267,7 +3280,7 @@ trailing noise
         let mut graph = Graph::new();
         let mut order = cl_node("crate::billing::Order", NodeKind::Struct);
         order.span.file = "src/billing.rs".into();
-        order.fingerprint = Some(csd_ir::Fingerprint {
+        order.fingerprint = Some(crate::ir::Fingerprint {
             member_types: [("id", "u64"), ("total", "Money")]
                 .iter()
                 .map(|(m, t)| (m.to_string(), t.to_string()))

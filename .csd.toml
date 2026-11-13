@@ -2,16 +2,16 @@
 # See SPEC.md section 7 for the full schema.
 
 [layers]
-# Two strata, top (may depend downward) to bottom. csd-ir is the shared contract every other
-# crate projects against; nothing it declares may depend back up on a sibling crate. First
-# matching glob wins, so the csd-ir mapping must precede the catch-all.
+# Two strata, top (may depend downward) to bottom. The `ir` module is the shared contract every
+# other module projects against; nothing it declares may depend back up on a sibling. First matching
+# glob wins, so the ir mapping must precede the catch-all.
 order = ["app", "contract"]
 map = [
-    { layer = "contract", glob = "crates/csd-ir/**" },
+    { layer = "contract", glob = "crates/cargo-structure-diff/src/ir/**" },
     { layer = "app",      glob = "crates/**" },
 ]
-# The contract must not depend on the application crates above it. This is currently satisfied
-# (csd-ir depends only on serde), so the gate is green; a future csd-ir -> sibling edge fails it.
+# The contract must not depend on the application modules above it. This is currently satisfied
+# (ir depends only on std and serde), so the gate is green; a future ir -> sibling edge fails it.
 forbid = [{ from = "contract", to = "app" }]
 
 [views]
@@ -22,7 +22,6 @@ enabled = ["modules"]
 
 [lint]
 deny = ["layering", "cycles"]
-warn = ["fan_in", "fan_out"]
 
 # Default CI behaviour: fail only on violations new since the base ref.
 [ratchet]

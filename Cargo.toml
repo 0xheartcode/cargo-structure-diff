@@ -11,14 +11,9 @@ repository = "https://github.com/0xheartcode/cargo-structure-diff"
 authors = ["0xheartcode <0xheartcode@gmail.com>"]
 
 [workspace.dependencies]
-# shared internal crates
-csd-ir = { path = "crates/csd-ir", version = "0.0.1" }
-csd-diff = { path = "crates/csd-diff", version = "0.0.1" }
-csd-extract-rs = { path = "crates/csd-extract-rs", version = "0.0.1" }
-csd-extract-db = { path = "crates/csd-extract-db", version = "0.0.1" }
-csd-config = { path = "crates/csd-config", version = "0.0.1" }
-csd-render = { path = "crates/csd-render", version = "0.0.1" }
-csd-lint = { path = "crates/csd-lint", version = "0.0.1" }
+# The library crates were collapsed into the single `cargo-structure-diff` crate (one published
+# crate). The only internal dependency left is the test crates pointing at it, by path.
+cargo-structure-diff = { path = "crates/cargo-structure-diff" }
 
 # third-party, pinned at the workspace so every crate agrees
 anyhow = "1"

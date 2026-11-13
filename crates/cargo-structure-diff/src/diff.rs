@@ -1,4 +1,4 @@
-//! Diffing between two [`csd_ir::Graph`]s.
+//! Diffing between two [`crate::ir::Graph`]s.
 //!
 //! A flat, identity-keyed set diff over nodes and edges, followed by two move-detection passes.
 //!
@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use csd_ir::{similarity, Change, Edge, EdgeKind, Graph, Node, NodeKind, StableId};
+use crate::ir::{similarity, Change, Edge, EdgeKind, Graph, Node, NodeKind, StableId};
 
 /// A file rename reported by git (`git diff -M --name-status`). The harness feeds these in so the
 /// differ can recover module moves precisely: modules carry no fingerprint, so the similarity
@@ -704,7 +704,7 @@ fn detect_moves(ops: Vec<EditOp>) -> Vec<EditOp> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use csd_ir::{Fingerprint, NodeKind, SourceSpan};
+    use crate::ir::{Fingerprint, NodeKind, SourceSpan};
     use std::collections::BTreeSet;
 
     fn span(start: u32) -> SourceSpan {
