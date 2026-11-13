@@ -7,7 +7,13 @@ unproven in real daily use, so any release may change anything.
 
 Minimum supported Rust version (MSRV): **1.82**.
 
-## [0.0.1] - Unreleased
+## [0.0.2] - 2026-11-13
+
+### Fixed
+- Package the `README.md` so it renders on crates.io (the crate now symlinks the workspace README
+  and declares a `readme` field; v0.0.1's package shipped without one).
+
+## [0.0.1] - 2026-11-13
 
 First tagged release — early and not yet dogfooded on a real project. The pipeline is real end to end: extraction, diff with rename and move
 detection, six views, five output formats, architectural lints, a ratchet gate, and a PR-commenting
@@ -52,4 +58,5 @@ delete + add**.
 - The call graph has a dynamic-dispatch ceiling: `Arc<dyn Trait>` and generic call sites have no
   statically known callee and are rendered honestly rather than guessed.
 
+[0.0.2]: https://github.com/0xheartcode/cargo-structure-diff/releases/tag/v0.0.2
 [0.0.1]: https://github.com/0xheartcode/cargo-structure-diff/releases/tag/v0.0.1

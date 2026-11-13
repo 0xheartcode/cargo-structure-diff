@@ -25,7 +25,7 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "cargo-structure-diff"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "glob",
@@ -83,7 +83,7 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
 name = "csd-goldens"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "cargo-structure-diff",
  "tempfile",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "csd-harness"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "cargo-structure-diff",
