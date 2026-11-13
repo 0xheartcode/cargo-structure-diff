@@ -3,8 +3,9 @@
 > Extract a structural graph from a Rust codebase, diff it across two git refs, render the delta as
 > one annotated diagram, and fail CI when a change crosses an architectural boundary you declared.
 
-**Status:** v0.1.0, pre-1.0 and moving fast. The pipeline is real end to end; interfaces are not yet
-stable. Rust only for now.
+**Status:** v0.0.1, early and not yet dogfooded on a real project. The pipeline is real end to end
+and validated on replayed history (see below), but it has no production users yet and interfaces may
+change at any time. Rust only for now.
 
 ## The one number that matters
 

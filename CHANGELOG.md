@@ -1,15 +1,15 @@
 # Changelog
 
 All notable changes to this project are documented here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to follow
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html) from 0.1.0 onward. Interfaces are not
-yet stable before 1.0.
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html). This is a `0.0.x` release: early and
+unproven in real daily use, so any release may change anything.
 
 Minimum supported Rust version (MSRV): **1.82**.
 
-## [0.1.0] - Unreleased
+## [0.0.1] - Unreleased
 
-First tagged release. The pipeline is real end to end: extraction, diff with rename and move
+First tagged release — early and not yet dogfooded on a real project. The pipeline is real end to end: extraction, diff with rename and move
 detection, six views, five output formats, architectural lints, a ratchet gate, and a PR-commenting
 CI action. Validated by replaying 250 merged pull requests across ripgrep, bat, tokio, axum and
 nushell: **zero false red builds, zero non-deterministic results, zero renames mis-reported as
@@ -48,4 +48,4 @@ delete + add**.
 - The call graph has a dynamic-dispatch ceiling: `Arc<dyn Trait>` and generic call sites have no
   statically known callee and are rendered honestly rather than guessed.
 
-[0.1.0]: https://github.com/0xheartcode/cargo-structure-diff/releases/tag/v0.1.0
+[0.0.1]: https://github.com/0xheartcode/cargo-structure-diff/releases/tag/v0.0.1
