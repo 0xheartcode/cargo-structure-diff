@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use csd_diff::FileRename;
+use cargo_structure_diff::diff::FileRename;
 
 /// A single first-parent step: the pre-change commit and the commit that produced it.
 #[derive(Debug, Clone, PartialEq, Eq)]

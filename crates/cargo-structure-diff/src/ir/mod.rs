@@ -28,8 +28,9 @@ use std::collections::BTreeMap;
 /// Concrete derivation is deferred (backlog `ir`): it will combine a structural fingerprint with
 /// a path so that a moved-but-unchanged item keeps its id. For now it is an opaque string so the
 /// surrounding types can be built and tested.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct StableId(pub String);
 
 impl StableId {
@@ -45,8 +46,9 @@ impl StableId {
 }
 
 /// The kind of a node. Language-agnostic on purpose.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum NodeKind {
     /// A module / namespace / package.
     Module,
@@ -65,8 +67,9 @@ pub enum NodeKind {
 }
 
 /// The kind of an edge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum EdgeKind {
     /// Module references an item from another module.
     Uses,
@@ -83,8 +86,9 @@ pub enum EdgeKind {
 }
 
 /// A location in source, used to link nodes and edges back to diff hunks.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct SourceSpan {
     /// Repo-relative path.
     pub file: String,
@@ -95,8 +99,7 @@ pub struct SourceSpan {
 }
 
 /// A node in the structural graph.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Node {
     /// Identity that should survive rename/move.
     pub id: StableId,
@@ -113,8 +116,7 @@ pub struct Node {
 }
 
 /// An edge in the structural graph.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Edge {
     /// Source node id.
     pub from: StableId,
@@ -129,8 +131,7 @@ pub struct Edge {
 }
 
 /// A whole extracted graph for one git ref.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Graph {
     /// Nodes, kept sorted by id after [`Graph::normalize`].
     pub nodes: Vec<Node>,
@@ -156,8 +157,7 @@ impl Graph {
 }
 
 /// One element of a computed delta between two graphs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Change {
     /// A node present only in the head graph.
     Added(Node),
@@ -226,7 +226,6 @@ mod tests {
         assert_eq!(g, once);
     }
 
-    #[cfg(feature = "serde")]
     #[test]
     fn graph_survives_a_json_round_trip() {
         let mut g = Graph::new();

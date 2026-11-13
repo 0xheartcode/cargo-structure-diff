@@ -28,14 +28,16 @@ name = "cargo-structure-diff"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "csd-config",
- "csd-diff",
- "csd-extract-db",
- "csd-extract-rs",
- "csd-ir",
- "csd-lint",
- "csd-render",
+ "glob",
+ "layout-rs",
+ "rayon",
+ "serde",
  "serde_json",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "tree-sitter",
+ "tree-sitter-rust",
 ]
 
 [[package]]
@@ -80,52 +82,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
-name = "csd-config"
-version = "0.0.1"
-dependencies = [
- "glob",
- "serde",
- "thiserror",
- "toml",
-]
-
-[[package]]
-name = "csd-diff"
-version = "0.0.1"
-dependencies = [
- "csd-ir",
-]
-
-[[package]]
-name = "csd-extract-db"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "csd-ir",
- "tempfile",
- "tree-sitter",
- "tree-sitter-rust",
-]
-
-[[package]]
-name = "csd-extract-rs"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "csd-ir",
- "rayon",
- "tempfile",
- "tree-sitter",
- "tree-sitter-rust",
-]
-
-[[package]]
 name = "csd-goldens"
 version = "0.0.1"
 dependencies = [
- "csd-diff",
- "csd-extract-rs",
- "csd-ir",
+ "cargo-structure-diff",
  "tempfile",
 ]
 
@@ -135,38 +95,8 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "cargo-structure-diff",
- "csd-config",
- "csd-diff",
- "csd-extract-rs",
- "csd-ir",
- "csd-lint",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "csd-ir"
-version = "0.0.1"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "csd-lint"
-version = "0.0.1"
-dependencies = [
- "csd-config",
- "csd-ir",
-]
-
-[[package]]
-name = "csd-render"
-version = "0.0.1"
-dependencies = [
- "csd-ir",
- "glob",
- "layout-rs",
 ]
 
 [[package]]

@@ -4,9 +4,9 @@
 mod tests {
     use std::fs;
 
-    use csd_diff::{diff, DiffOptions};
-    use csd_extract_rs::extract;
-    use csd_ir::Change;
+    use cargo_structure_diff::diff::{diff, DiffOptions};
+    use cargo_structure_diff::extract_rs::extract;
+    use cargo_structure_diff::ir::Change;
 
     use tempfile::TempDir;
 
@@ -20,7 +20,7 @@ mod tests {
     }
 
     /// Extract a crate laid out from a single `src/lib.rs` body.
-    fn graph_of(lib_rs: &str) -> csd_ir::Graph {
+    fn graph_of(lib_rs: &str) -> cargo_structure_diff::ir::Graph {
         let dir = crate_dir(lib_rs);
         extract(dir.path()).unwrap()
     }

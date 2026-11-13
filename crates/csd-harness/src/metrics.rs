@@ -13,9 +13,9 @@
 //! gold set, since git gives no type-level rename ground truth.
 //!
 //! [`fingerprint_matches`] re-derives the accepted fingerprint matches together with their
-//! similarity score, which `csd_diff::diff` does not itself return, feeding the false-merge audit.
+//! similarity score, which `cargo_structure_diff::diff::diff` does not itself return, feeding the false-merge audit.
 
-use csd_ir::{similarity, Change, Node, StableId};
+use cargo_structure_diff::ir::{similarity, Change, Node, StableId};
 
 /// The rename-threshold sweep from SPEC.md section 6: shows how sensitive rename detection is to
 /// the acceptance threshold.
@@ -135,7 +135,7 @@ pub fn spurious_splits(changes: &[Change], min_score: f32, sample_limit: usize) 
     }
 }
 
-/// An accepted fingerprint match, carrying the score `csd_diff::diff` does not return.
+/// An accepted fingerprint match, carrying the score `cargo_structure_diff::diff::diff` does not return.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AcceptedMatch {
     /// Id of the base-side (removed) node.
@@ -150,7 +150,7 @@ pub struct AcceptedMatch {
 
 /// Re-derive the accepted fingerprint matches and their scores from a pure set-diff node split.
 ///
-/// This mirrors the greedy matcher in `csd_diff::detect_renames` (same candidate rule, same
+/// This mirrors the greedy matcher in `cargo_structure_diff::diff::detect_renames` (same candidate rule, same
 /// `score desc, removed id, added id` ordering, same one-to-one assignment) so the accepted pairs
 /// match what `diff` produced, while additionally keeping the similarity score. That score is how
 /// the harness recovers the false-merge audit input without modifying `csd-diff`.
@@ -228,7 +228,7 @@ fn parent(id: &StableId) -> StableId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use csd_ir::{Edge, EdgeKind, Fingerprint, NodeKind, SourceSpan};
+    use cargo_structure_diff::ir::{Edge, EdgeKind, Fingerprint, NodeKind, SourceSpan};
     use std::collections::{BTreeMap, BTreeSet};
 
     fn span() -> SourceSpan {

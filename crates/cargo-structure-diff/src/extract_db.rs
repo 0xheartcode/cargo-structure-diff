@@ -27,8 +27,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::ir::{Edge, EdgeKind, Graph, Node, NodeKind, SourceSpan, StableId};
 use anyhow::Result;
-use csd_ir::{Edge, EdgeKind, Graph, Node, NodeKind, SourceSpan, StableId};
 use tree_sitter::{Node as TsNode, Parser};
 
 /// Extract a schema-view graph from the Diesel `schema.rs` files under `root`.

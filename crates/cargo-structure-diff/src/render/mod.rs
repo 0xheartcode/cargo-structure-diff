@@ -29,7 +29,7 @@
 //!   skipped. The state view still applies its real-state-machine filter; `full` only disables the
 //!   neighbourhood prune.
 //! - `scope`: a list of path globs (`glob::Pattern`, e.g. `dir/**`) matched against
-//!   [`csd_ir::SourceSpan::file`]. Only in-scope nodes render. An edge that crosses the boundary
+//!   [`crate::ir::SourceSpan::file`]. Only in-scope nodes render. An edge that crosses the boundary
 //!   (one endpoint in scope, one out) draws its out-of-scope endpoint as a collapsed external
 //!   **stub**: a `context`-classed node whose label is suffixed ` (external)`, so the crossing arrow
 //!   is visible without expanding the far side. Edges wholly outside scope are dropped. Scope
@@ -41,7 +41,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use csd_ir::{Change, EdgeKind, Fingerprint, Graph, NodeKind, StableId};
+use crate::ir::{Change, EdgeKind, Fingerprint, Graph, NodeKind, StableId};
 
 mod boxes;
 mod svg;
@@ -164,7 +164,7 @@ impl Class {
 
 /// Render the module view of `head` with `changes` colour-encoded, as a Mermaid `flowchart LR`.
 ///
-/// `changes` is the delta from `csd_diff::diff`. Removed nodes and edges are recovered from the
+/// `changes` is the delta from `crate::diff::diff`. Removed nodes and edges are recovered from the
 /// delta, since they are absent from `head`. Only `Module` nodes and `Uses` edges participate.
 pub fn render_module_view(head: &Graph, changes: &[Change]) -> String {
     module_view(head, changes, &RenderOpts::default())
@@ -475,14 +475,14 @@ const RECT_REMOVED: &str = "254,242,242";
 /// depth is also bounded by [`MAX_CALL_DEPTH`].
 ///
 /// Participants are the type/module owning each fn, derived from the fn id by stripping the last
-/// `::segment` (`crate::Widget::run` -> `crate::Widget`; `crate::helper` -> `crate`). Ids are not
+/// `::segment` (`crate::render::Widget::run` -> `crate::render::Widget`; `crate::render::helper` -> `crate`). Ids are not
 /// valid Mermaid names, so each owner is declared once, in first-seen order, with a stable `p<i>`
-/// alias (`participant p0 as crate::Widget`). A message is `caller ->> callee : callee_fn_name`.
+/// alias (`participant p0 as crate::render::Widget`). A message is `caller ->> callee : callee_fn_name`.
 ///
 /// Delta colouring is taken straight from the delta's edge changes: a message whose `Calls` edge
 /// `(from, to, ordinal)` is a [`Change::EdgeAdded`] is wrapped in a green `rect rgb(...)`; a
 /// [`Change::EdgeRemoved`] `Calls` edge is shown as a message wrapped in a red `rect rgb(...)` with
-/// a ` (removed)` suffix. The precise reorder-as-move analysis lives in `csd_diff::call_tree_diff`;
+/// a ` (removed)` suffix. The precise reorder-as-move analysis lives in `crate::diff::call_tree_diff`;
 /// wiring it in is a later refinement, and this renderer deliberately takes no dependency on the
 /// differ, colouring only from `EdgeAdded`/`EdgeRemoved`.
 ///
@@ -774,7 +774,7 @@ fn walk_calls<'a>(
 use std::fmt::Write as _;
 
 /// The enum id owning a variant id: the id with its last `::segment` stripped
-/// (`crate::Status::Active` -> `crate::Status`).
+/// (`crate::render::Status::Active` -> `crate::render::Status`).
 fn enum_of(variant: &StableId) -> String {
     let s = variant.as_str();
     match s.rfind("::") {
@@ -2095,7 +2095,7 @@ fn svg_view(view: View, head: &Graph, changes: &[Change], opts: &RenderOpts) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use csd_ir::{Edge, EdgeKind, Fingerprint, Node, SourceSpan};
+    use crate::ir::{Edge, EdgeKind, Fingerprint, Node, SourceSpan};
 
     fn span() -> SourceSpan {
         SourceSpan {
@@ -2835,7 +2835,7 @@ mod tests {
 
     #[test]
     fn call_graph_two_modules_two_subgraphs_golden() {
-        // f (crate::a) calls g (crate::b): two boxes in two subgraphs plus an arrow. `full` renders
+        // f (crate::render::a) calls g (crate::render::b): two boxes in two subgraphs plus an arrow. `full` renders
         // both even without a delta.
         let head = Graph {
             nodes: vec![fn_node("crate::a::f"), fn_node("crate::b::g")],

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use csd_ir::Graph;
+use cargo_structure_diff::ir::Graph;
 
 use crate::corpus;
 
@@ -44,7 +44,7 @@ impl Cache {
 /// promoted into `cache`, and returned, skipping the worktree checkout entirely. On a full miss
 /// the commit is checked out into a detached worktree under the system temp dir, extracted,
 /// written to disk, and promoted into `cache`; the worktree is always removed before returning,
-/// so a failed extraction never leaks a worktree. Because [`csd_extract_rs::extract`] normalizes
+/// so a failed extraction never leaks a worktree. Because [`cargo_structure_diff::extract_rs::extract`] normalizes
 /// its graph, a cached graph equals a freshly extracted one.
 pub fn ir_for_sha(repo: &Path, sha: &str, cache: &mut Cache) -> Result<Graph> {
     if let Some(graph) = cache.graphs.get(sha) {
@@ -127,7 +127,7 @@ fn extract_at_sha(repo: &Path, sha: &str) -> Result<Graph> {
     .with_context(|| format!("failed to add worktree for {sha}"))?;
 
     // Extract with cleanup guaranteed: capture the result, tear the worktree down, then surface it.
-    let result = csd_extract_rs::extract(&worktree)
+    let result = cargo_structure_diff::extract_rs::extract(&worktree)
         .with_context(|| format!("failed to extract IR for {sha}"));
     cleanup(repo, &worktree);
     result
@@ -277,14 +277,14 @@ mod tests {
 
     /// A small synthetic graph exercising nodes, attrs, a fingerprint, and an edge.
     fn sample_graph() -> Graph {
-        use csd_ir::{EdgeKind, Fingerprint, NodeKind, SourceSpan, StableId};
+        use cargo_structure_diff::ir::{EdgeKind, Fingerprint, NodeKind, SourceSpan, StableId};
 
         let span = SourceSpan {
             file: "src/lib.rs".into(),
             start: 0,
             end: 1,
         };
-        let mut typed = csd_ir::Node {
+        let mut typed = cargo_structure_diff::ir::Node {
             id: StableId::new("crate::A"),
             kind: NodeKind::Struct,
             span: span.clone(),
@@ -295,7 +295,7 @@ mod tests {
             }),
         };
         typed.attrs.insert("vis".into(), "pub".into());
-        let plain = csd_ir::Node {
+        let plain = cargo_structure_diff::ir::Node {
             id: StableId::new("crate::B"),
             kind: NodeKind::Module,
             span: span.clone(),
@@ -304,7 +304,7 @@ mod tests {
         };
         let mut g = Graph::new();
         g.nodes = vec![typed, plain];
-        g.edges = vec![csd_ir::Edge {
+        g.edges = vec![cargo_structure_diff::ir::Edge {
             from: StableId::new("crate::A"),
             to: StableId::new("crate::B"),
             kind: EdgeKind::Uses,

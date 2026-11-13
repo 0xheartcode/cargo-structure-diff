@@ -19,8 +19,8 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use csd_diff::{diff, DiffOptions, FileRename};
-use csd_ir::{Change, Graph, Node};
+use cargo_structure_diff::diff::{diff, DiffOptions, FileRename};
+use cargo_structure_diff::ir::{Change, Graph, Node};
 
 use metrics::{
     classify_counts, false_merge_audit, fingerprint_matches, spurious_splits, AcceptedMatch,
@@ -422,7 +422,7 @@ fn render_markdown(input: RenderInput) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use csd_ir::{NodeKind, SourceSpan, StableId};
+    use cargo_structure_diff::ir::{NodeKind, SourceSpan, StableId};
     use std::collections::BTreeMap;
 
     fn counts(added: usize, removed: usize, moved: usize, modified: usize) -> Counts {

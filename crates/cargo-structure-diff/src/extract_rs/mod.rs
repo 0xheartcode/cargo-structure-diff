@@ -1,4 +1,4 @@
-//! Rust extraction: a crate root on disk to a [`csd_ir::Graph`].
+//! Rust extraction: a crate root on disk to a [`crate::ir::Graph`].
 //!
 //! M0 scope (backlog area `extract`): the module tree from `mod` declarations and file layout
 //! (`extract-modtree`), plus item nodes carrying member fingerprints (`extract-items`). Function
@@ -8,9 +8,9 @@
 //!
 //! - [`NodeKind::Module`] for every module: the crate root, file modules (`foo.rs`, `foo/mod.rs`),
 //!   inline `mod foo { .. }` blocks, and `#[path]`-redirected modules. Ids are crate-relative
-//!   paths like `crate::foo::bar`.
+//!   paths like `crate::extract_rs::foo::bar`.
 //! - [`NodeKind::Struct`] / [`NodeKind::Enum`] / [`NodeKind::Trait`] / [`NodeKind::Fn`] for the
-//!   corresponding items, each with a [`Fingerprint`] (see [`csd_ir::fingerprint`]).
+//!   corresponding items, each with a [`Fingerprint`] (see [`crate::ir::fingerprint`]).
 //! - [`NodeKind::Variant`] for each enum variant (the state-machine view of SPEC 3.4).
 //!
 //! Inherent and trait `impl` methods are emitted as [`NodeKind::Fn`] nodes under their Self type
@@ -31,7 +31,7 @@
 //! tree-sitter gives syntax, not name resolution (SPEC 3.1 amendment). The precision-first
 //! mini-resolver (backlog `extract-resolver`, id `bb67bbb`) turns a `use` target into an
 //! [`EdgeKind::Uses`] edge from the referencing module to the target module *only* when it is
-//! certain: explicit intra-crate paths (`crate::`, `self::`, `super::`), intra-crate `pub use`
+//! certain: explicit intra-crate paths (`crate::extract_rs::`, `self::`, `super::`), intra-crate `pub use`
 //! re-export chains, and (backlog `extract-crossrate`, id `422be96`) cross-crate paths whose first
 //! segment names a sibling workspace crate emitted by this extraction, which resolve to the deepest
 //! existing module along the path (else that crate's root) so the module view shows the workspace
@@ -53,8 +53,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::ir::{
+    doc_hash, Edge, EdgeKind, Fingerprint, Graph, Node, NodeKind, SourceSpan, StableId,
+};
 use anyhow::Result;
-use csd_ir::{doc_hash, Edge, EdgeKind, Fingerprint, Graph, Node, NodeKind, SourceSpan, StableId};
 use rayon::prelude::*;
 use tree_sitter::{Node as TsNode, Parser};
 
@@ -69,9 +71,9 @@ const WRAPPERS: [&str; 5] = ["Arc", "Box", "Rc", "Vec", "Option"];
 /// normalised so it is byte-stable.
 ///
 /// Workspace note (backlog `extract-workspace-ids`, id `7344e8d`): a single crate is projected
-/// under the `crate::` prefix. When more than one crate is discovered, each crate's ids are
+/// under the `crate::extract_rs::` prefix. When more than one crate is discovered, each crate's ids are
 /// namespaced by its crate name (`<crate>::module::Item`) so two crates no longer collide under a
-/// shared `crate::` prefix. Single-crate output is byte-for-byte unchanged.
+/// shared `crate::extract_rs::` prefix. Single-crate output is byte-for-byte unchanged.
 ///
 /// Parallelism (backlog `perf: parallel extraction with rayon`): the mod tree is discovered by
 /// fanning out one frontier at a time. Each frontier's files are parsed and extracted in parallel
@@ -251,7 +253,7 @@ struct FileCtx<'a> {
 struct Job {
     /// The file to parse.
     path: PathBuf,
-    /// The crate-relative module path the file's root maps to (e.g. `crate::foo`).
+    /// The crate-relative module path the file's root maps to (e.g. `crate::extract_rs::foo`).
     mod_path: String,
 }
 
@@ -312,7 +314,7 @@ struct RawCall {
 /// One candidate realization: an `impl Trait for Type` block. Both the type and trait names are
 /// resolved to local nodes in [`Extractor::finish`]; if either is external the candidate is dropped.
 struct RawImplements {
-    /// The `Self` type name/path exactly as written (bare or `crate::`/`self::`/`super::`).
+    /// The `Self` type name/path exactly as written (bare or `crate::extract_rs::`/`self::`/`super::`).
     type_path: String,
     /// The implemented trait name/path exactly as written.
     trait_path: String,
@@ -354,7 +356,7 @@ struct RawTransition {
 struct RawUse {
     /// The module that declared the `use`.
     module: String,
-    /// The `::`-joined target path, exactly as written (e.g. `crate::money::Money`).
+    /// The `::`-joined target path, exactly as written (e.g. `crate::extract_rs::money::Money`).
     path: String,
     /// Whether this is a glob (`use foo::*`). Globs are never resolved.
     glob: bool,
@@ -413,7 +415,7 @@ fn finish(all: FilePartial) -> Result<Graph> {
         .collect();
     let reexports = build_reexports(&all.uses);
     // Known workspace crate names: the single-segment module ids are the per-crate top-level
-    // module nodes (`csd_ir`, `csd_diff`, ..), i.e. the crate-name prefixes this extraction
+    // module nodes (`crate::ir`, `crate::diff`, ..), i.e. the crate-name prefixes this extraction
     // emitted. A `use` whose first segment names one is a sibling-crate reference.
     let crate_names: BTreeSet<String> = module_ids
         .iter()
@@ -1174,7 +1176,7 @@ fn join_path(prefix: &str, seg: &str) -> String {
     }
 }
 
-/// Rewrite an intra-crate `use` path (`crate::`/`self::`/`super::`) into an absolute id under the
+/// Rewrite an intra-crate `use` path (`crate::extract_rs::`/`self::`/`super::`) into an absolute id under the
 /// declaring module's crate prefix. Returns `None` for anything not certainly intra-crate
 /// (external crates, `std`, bare names): those are left unresolved on purpose.
 fn normalize_path(path: &str, module: &str) -> Option<String> {
@@ -1587,7 +1589,7 @@ fn collect_type_names(node: TsNode, src: &[u8], out: &mut Vec<String>) {
 }
 
 /// Collect the *path* of each reachable inner type of a field type, unwrapping [`WRAPPERS`] and
-/// references (mirrors [`collect_type_names`] but keeps the full path so `crate::`-qualified names
+/// references (mirrors [`collect_type_names`] but keeps the full path so `crate::extract_rs::`-qualified names
 /// stay resolvable). Primitives are skipped since they are never local.
 fn collect_assoc_paths(node: TsNode, src: &[u8], out: &mut Vec<String>) {
     match node.kind() {
@@ -1649,7 +1651,7 @@ fn type_path_text(node: TsNode, src: &[u8]) -> String {
 }
 
 /// Resolve a type/trait name written in `module` to an absolute node id, precision-first. A
-/// `crate::`/`self::`/`super::` path goes through [`normalize_path`]; a bare name binds to the
+/// `crate::extract_rs::`/`self::`/`super::` path goes through [`normalize_path`]; a bare name binds to the
 /// declaring module (`{module}::{name}`); any other scoped path is treated as external (`None`).
 fn resolve_local(path: &str, module: &str) -> Option<String> {
     let first = path.split("::").next().unwrap_or("");
@@ -1692,7 +1694,7 @@ fn walk_calls(
 }
 
 /// Resolve a `call_expression`'s callee, precision-first. A bare `foo()` binds to the caller's
-/// module; `crate::`/`self::`/`super::` paths normalise; `Self::assoc()` and `self.method()` bind
+/// module; `crate::extract_rs::`/`self::`/`super::` paths normalise; `Self::assoc()` and `self.method()` bind
 /// to the Self type. Any other scoped path or receiver stays unresolved (`None`) since the callee
 /// is not known statically (SPEC 3.3 ceiling).
 fn resolve_call(node: TsNode, module: &str, self_type: Option<&str>, src: &[u8]) -> Option<String> {
