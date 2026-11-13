@@ -19,8 +19,9 @@ red only when a change violates an architectural rule you declared. See
 ## 30-second quickstart
 
 ```sh
-# Install the binary (published as cargo-structure-diff; the binary is csd).
-cargo install cargo-structure-diff
+# Install the csd binary. Until the crate is published to crates.io, use a prebuilt binary from the
+# GitHub Releases page, or build from source:
+cargo install --git https://github.com/0xheartcode/cargo-structure-diff --bin csd --locked
 
 # See what a pull request changes structurally, against its base branch.
 csd diff --base main --show
@@ -34,6 +35,26 @@ csd diff --base main
 
 With no `.csd.toml`, `csd diff` is informational: it summarises the delta and warns on new module
 cycles, but never fails the build. It gains teeth once you declare layers (see the CI gate below).
+
+## What it posts on a pull request
+
+When a change crosses a boundary you declared, the gate fails the check and posts one sticky comment.
+The heading carries the verdict, a **Findings** list names each violation, and two collapsible
+sections hold the grouped changelog and a colour-coded Mermaid diagram (green added, red-dashed
+removed, amber changed) that GitHub renders inline. The findings list for a layering violation reads:
+
+```text
+## Structure gate: FAILED
+
+### Findings
+- [deny] layering: crate::domain::order (domain) must not depend on crate::infra::db (infra)
+```
+
+See the full rendered comment, diagram included, in
+[`docs/gallery/05-layering-violation.md`](docs/gallery/05-layering-violation.md). More worked
+examples live alongside it — a new module cycle (warned, build stays green), a large PR summarised
+cleanly, a non-structural PR (silent), and a rename shown as a move rather than delete + add — each
+the exact comment csd would post.
 
 ## What it is
 
@@ -125,8 +146,8 @@ not on pre-existing ones — the brownfield adoption unlock.
 
 Ships from one crate as two `[[bin]]` targets: `csd` (primary) and `cargo-structure-diff` (the cargo
 subcommand shim, `cargo structure-diff ...`). The `csd` name is taken on crates.io by an unrelated
-tool, so the crate is published as `cargo-structure-diff`; if the `csd` binary collides on your PATH,
-the reserved fallback is `strc`.
+tool, so the crate will be published as `cargo-structure-diff` (the name is free); if the `csd`
+binary collides on your PATH, the reserved fallback is `strc`.
 
 ## Development
 
