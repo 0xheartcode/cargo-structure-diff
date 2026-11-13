@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+# Symlinked to the workspace README so crates.io renders it (one source of truth; cargo
+# dereferences the symlink into the package).
+readme = "README.md"
 
 [[bin]]
 name = "csd"
