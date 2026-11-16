@@ -13,6 +13,8 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 csd="${CSD_BIN:-$root/target/debug/csd}"
+# Resolve to an absolute path: render_corpus cds into a worktree, where a relative CSD_BIN would miss.
+case "$csd" in /*) ;; *) csd="$(pwd)/$csd" ;; esac
 gate="$root/scripts/csd-structure-gate.sh"
 cache="${CSD_HARNESS_CACHE:-$HOME/.cache/csd-harness}"
 out="$root/docs/gallery"

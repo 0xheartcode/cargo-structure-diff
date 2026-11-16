@@ -7,6 +7,19 @@ unproven in real daily use, so any release may change anything.
 
 Minimum supported Rust version (MSRV): **1.82**.
 
+## [0.0.3] - Unreleased
+
+### Fixed
+- Gate comment degrades gracefully past GitHub's Mermaid cap: when a module-graph diagram would
+  exceed ~500 edges (which GitHub refuses to render, showing an error box), the comment now shows a
+  short note pointing at `--format svg` instead of an unrenderable diagram.
+- `csd doc -o -`, `csd files -o -`, and `csd snapshot -o -` now write to stdout, matching
+  `csd init -o -`, instead of creating a file literally named `-`.
+- README install instructions use `cargo install cargo-structure-diff` now that the crate is on
+  crates.io; the naming note no longer reads as unpublished.
+- `gen-gallery.sh` resolves a relative `CSD_BIN` to an absolute path so it still works after cd-ing
+  into a worktree; regenerated the gallery so the dense axum example renders on GitHub.
+
 ## [0.0.2] - 2026-11-13
 
 ### Fixed
@@ -58,5 +71,6 @@ delete + add**.
 - The call graph has a dynamic-dispatch ceiling: `Arc<dyn Trait>` and generic call sites have no
   statically known callee and are rendered honestly rather than guessed.
 
+[0.0.3]: https://github.com/0xheartcode/cargo-structure-diff/releases/tag/v0.0.3
 [0.0.2]: https://github.com/0xheartcode/cargo-structure-diff/releases/tag/v0.0.2
 [0.0.1]: https://github.com/0xheartcode/cargo-structure-diff/releases/tag/v0.0.1

@@ -3,7 +3,7 @@
 
 ### Findings
 
-- [warn] cycles: module cycle: ignore -> ignore::dir -> ignore::gitignore -> ignore::incremental -> ignore::overrides -> ignore::pathutil -> ignore::types -> ignore::walk
+- [warn] cycles: module cycle: ignore::dir -> ignore::gitignore -> ignore::incremental -> ignore::overrides -> ignore::pathutil -> ignore::types -> ignore::walk
 
 <details><summary>Changelog</summary>
 

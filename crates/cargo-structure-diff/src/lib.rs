@@ -596,9 +596,10 @@ fn run_snapshot(out: Option<&str>) -> Result<i32> {
     let repo = repo_root()?;
     let json = snapshot_json(&repo)?;
     match out {
+        // `-` means stdout, consistent with `doc`/`files`/`init`.
+        None | Some("-") => println!("{json}"),
         Some(path) => std::fs::write(path, &json)
             .with_context(|| format!("failed to write snapshot {path}"))?,
-        None => println!("{json}"),
     }
     Ok(0)
 }
@@ -1483,11 +1484,12 @@ fn run_doc(out: Option<&str>) -> Result<i32> {
 /// Write the rendered report to `out`, or stdout when `out` is `None`.
 fn emit_doc(doc: &str, out: Option<&str>) -> Result<()> {
     match out {
-        Some(path) => std::fs::write(path, doc).with_context(|| format!("failed to write {path}")),
-        None => {
+        // `-` means stdout, matching `csd init`; only a real path is written to a file.
+        None | Some("-") => {
             print!("{doc}");
             Ok(())
         }
+        Some(path) => std::fs::write(path, doc).with_context(|| format!("failed to write {path}")),
     }
 }
 
