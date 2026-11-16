@@ -97,7 +97,7 @@ four renderers.
    git head ---> extract ---> IR(head) ---/                          \--> lint ---> exit code
 ```
 
-The IR contract lives in `crates/csd-ir` (see that crate's `lib.rs`): `Node`, `Edge`, `Graph`,
+The IR contract lives in the `ir` module (`crates/cargo-structure-diff/src/ir/`): `Node`, `Edge`, `Graph`,
 `Change`, `StableId`, `SourceSpan`, `NodeKind`, `EdgeKind`. Determinism is a requirement, not a
 nicety: sorted collections everywhere so golden output is byte-stable.
 
