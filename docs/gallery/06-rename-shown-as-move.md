@@ -3,7 +3,7 @@
 
 <details><summary>Changelog</summary>
 
-# Structure changelog vs 185ce08c1857d0adfd2b271bd9a252b4d9efedfe
+# Structure changelog vs ea67744396aa867efa47153b458bfd8cc51be4ca
 
 ## crate::payments (modified)
 

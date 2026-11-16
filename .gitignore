@@ -12,3 +12,7 @@ Cargo.lock.orig
 
 # cargo-mutants artifacts
 mutants.out*/
+
+# stray Node artifacts (not a Node project)
+/node_modules/
+package-lock.json

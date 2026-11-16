@@ -7,7 +7,7 @@
 
 <details><summary>Changelog</summary>
 
-# Structure changelog vs 2c33842567031e7846ec11d30d7a96af524888c9
+# Structure changelog vs e9e92dcea7ca036b198f2d7929771371ce49a32d
 
 ## crate::domain::order
 

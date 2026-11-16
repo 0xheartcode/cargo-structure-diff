@@ -19,9 +19,10 @@ red only when a change violates an architectural rule you declared. See
 ## 30-second quickstart
 
 ```sh
-# Install the csd binary. Until the crate is published to crates.io, use a prebuilt binary from the
-# GitHub Releases page, or build from source:
-cargo install --git https://github.com/0xheartcode/cargo-structure-diff --bin csd --locked
+# Install the csd binary from crates.io (the crate is cargo-structure-diff; the binary is csd):
+cargo install cargo-structure-diff
+# ...or grab a prebuilt binary from the GitHub Releases page, or build from git:
+# cargo install --git https://github.com/0xheartcode/cargo-structure-diff --bin csd --locked
 
 # See what a pull request changes structurally, against its base branch.
 csd diff --base main --show
@@ -146,7 +147,7 @@ not on pre-existing ones — the brownfield adoption unlock.
 
 Ships from one crate as two `[[bin]]` targets: `csd` (primary) and `cargo-structure-diff` (the cargo
 subcommand shim, `cargo structure-diff ...`). The `csd` name is taken on crates.io by an unrelated
-tool, so the crate will be published as `cargo-structure-diff` (the name is free); if the `csd`
+tool, so the crate is published as `cargo-structure-diff`; if the `csd`
 binary collides on your PATH, the reserved fallback is `strc`.
 
 ## Development

@@ -69,6 +69,16 @@ diagram="$(awk '
     END { if (inblock) print "```" }
 ' "$diff_file")"
 
+# GitHub's Mermaid renderer refuses any diagram with 500+ edges (a security cap that cannot be raised
+# from inside the diagram), rendering it as an error box instead of a picture. When the delta is that
+# dense, drop the Mermaid block for a note pointing at a format GitHub does not cap. The gate verdict
+# is unchanged; only the diagram is swapped.
+edge_limit=490
+edge_count="$(printf '%s\n' "$diagram" | grep -cE '(--|-\.-|==)>' || true)"
+if [ "$edge_count" -gt "$edge_limit" ]; then
+    diagram="_Structure diagram omitted: ${edge_count} edges exceeds GitHub's Mermaid render limit (500). Run \`csd diff --base ${base} --show --format svg\` for the full graph._"
+fi
+
 # Assemble the full comment body.
 {
     echo "$marker"
