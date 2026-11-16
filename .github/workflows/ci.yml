@@ -1,8 +1,11 @@
 name: CI
 
 # fmt-check and clippy run once on Linux (they are platform-independent); the test suite runs on
-# Linux, macOS and Windows so golden output and path handling are verified on every target. Together
-# these mirror the local `just gate` recipe. cargo is called directly so no `just` install is needed.
+# Linux and Windows. Linux covers the Unix case (LF, forward-slash paths) and Windows covers the real
+# cross-platform divergence (CRLF, backslash paths), which is what the golden tests guard. macOS
+# behaves like Linux for this git + tree-sitter tool, so it adds little test signal while its arm64
+# runners are capacity-constrained and get cancelled; macOS is still compiled in the release workflow.
+# cargo is called directly so no `just` install is needed.
 
 on:
   push:
@@ -35,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
